@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <h2>{{ "Kite Token Saved" if success else "Kite Login Failed" }}</h2>
+    <p>{{ message }}</p>
+    <p><a class="button" href="/">Back to dashboard</a></p>
+  </section>
+{% endblock %}

@@ -1,0 +1,87 @@
+app:
+  name: "NSE/BSE Investment Signal Screener"
+  environment: "local"
+
+data:
+  provider: "zerodha"
+  source_timeframe: "1D"
+  scan_timeframe: "1W"
+  history_years: 10
+  update_mode: "incremental"
+  data_root_env: "DATA_ROOT"
+  readiness:
+    enabled: true
+    minimum_symbols_updated_percent: 80
+
+universe:
+  mode: "nse_all"
+  exchanges:
+    - "NSE"
+  instrument_types:
+    - "EQ"
+  prefer_exchange: "NSE"
+  include_bse_only: true
+  deduplicate_by_isin: false
+  max_symbols: null
+  allow_symbols: []
+  block_symbols: []
+  restrict_to_metadata_symbols: true
+  metadata_file: "config/symbol_metadata.csv"
+  filters:
+    industries: []
+    min_market_cap_cr: null
+    max_market_cap_cr: null
+  market_cap_source:
+    type: "nse_excel"
+    local_path: "data/nse_stock_list_2025.xlsx"
+    market_cap_divisor: 100
+    url: "https://nsearchives.nseindia.com//web/mediaattachment/2026-01/Average_MCAP_July2025ToDecember2025_20260102201101.xlsx"
+    local_file: "Average_MCAP_July2025ToDecember2025_20260102201101.xlsx"
+  market_cap_buckets:
+    small_max_cr: 5000
+    mid_max_cr: 20000
+
+strategy:
+  name: "weekly_buy_sell"
+  sensitivity: 3
+  fvg_lookback: 5
+  breakout_price: "close"
+  prevent_repeated_direction: true
+  signal_on_confirmed_candle: true
+  weekly_anchor: "W-FRI"
+  weekly_label: "period_end"
+  use_completed_weeks_only: true
+
+filters:
+  enabled: true
+  signal:
+    direction: "BUY"
+    latest_only: true
+    max_signal_age_bars: 1
+  price:
+    enabled: false
+    min: 50
+    max: 5000
+  liquidity:
+    enabled: false
+    min_avg_volume_20: 200000
+    min_avg_traded_value_20: 10000000
+  trend:
+    enabled: false
+    require_close_above_ema_50: false
+    require_close_above_ema_200: false
+
+notifications:
+  enabled: true
+  channel: "telegram"
+  send_when_no_matches: true
+  include_dashboard_link: true
+  dashboard_url: ""
+  telegram:
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+
+schedule:
+  timezone: "Asia/Kolkata"
+  railway_cron_utc: "30 12 * * 1-5"
+  human_time: "6:00 PM IST Monday-Friday"

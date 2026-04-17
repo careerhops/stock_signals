@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name or "Investment Screener" }}</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">End-of-day investment screener</p>
+      <h1>{{ app_name or "Investment Screener" }}</h1>
+    </div>
+    <nav class="topnav">
+      <a href="/{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Dashboard</a>
+      <a href="/stocks{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Stocks</a>
+      <a href="/big-bull-deals{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Big Bull Deals</a>
+      <a href="/login{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Kite Login</a>
+    </nav>
+  </header>
+  <main class="page">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

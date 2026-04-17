@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel compact">
+    <div class="panel-heading">
+      <h2>Kite Daily Login</h2>
+      <p>Use this once per day before the evening scan. Zerodha requires the official login and TOTP flow; the app saves the access token after login.</p>
+    </div>
+
+    <div class="login-status">
+      <span>Status</span>
+      <strong>{{ "Token saved" if token_status.exists else "Token missing" }}</strong>
+      {% if token_status.generated_at %}
+        <p>Generated at {{ token_status.generated_at }}</p>
+      {% endif %}
+    </div>
+
+    <a class="button" href="/auth/kite/login">Login with Kite</a>
+  </section>
+
+  <section class="panel">
+    <h2>Daily Flow</h2>
+    <ul class="plain-list">
+      <li>Open this tab once per day.</li>
+      <li>Click Login with Kite.</li>
+      <li>Complete Zerodha login and TOTP.</li>
+      <li>The app stores the token in <strong>DATA_ROOT/secrets/kite_access_token.json</strong>.</li>
+      <li>The evening scanner uses the saved token automatically.</li>
+    </ul>
+  </section>
+{% endblock %}

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel compact">
+    <p>
+      <a class="table-link" href="/{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Back to dashboard</a>
+    </p>
+    <h2>{{ exchange }}:{{ symbol }}</h2>
+    <p>
+      Timeframe: {{ scan_timeframe }}.
+      Latest signal: <strong>{{ latest_summary.signal }}</strong>
+      {% if latest_summary.date %} on {{ latest_summary.date }}{% endif %}
+      {% if latest_summary.close %} at close {{ latest_summary.close }}{% endif %}.
+    </p>
+  </section>
+
+  <section class="panel chart-panel">
+    {{ chart_html | safe }}
+  </section>
+
+  <section class="panel">
+    <h2>How To Read This Chart</h2>
+    <ul class="plain-list">
+      <li>The black line is the weekly close price.</li>
+      <li>The faint red dotted line is the structural ceiling from the PineScript logic.</li>
+      <li>The faint green dotted line is the structural floor from the PineScript logic.</li>
+      <li>Green triangle markers show final BUY signals.</li>
+      <li>Red triangle markers show final SELL signals.</li>
+      <li>Vertical green dashed lines highlight the dates where BUY signals were generated.</li>
+      <li>Green and red circle markers show demand and supply zone points from the script.</li>
+    </ul>
+  </section>
+{% endblock %}

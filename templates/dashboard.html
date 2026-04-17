@@ -1,0 +1,368 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Run Screener</h2>
+      <p>Filter the NSE universe first, then run the weekly strategy to find current BUY candidates.</p>
+    </div>
+
+    <form action="/run-screener" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+
+      <label>
+        Search Stock
+        <input type="search"
+               name="stock_search"
+               value="{{ stock_search }}"
+               placeholder="Symbol or company, e.g. TCS">
+      </label>
+
+      <label>
+        Market Cap Bucket
+        <select name="market_cap_bucket">
+          <option value="">All</option>
+          {% for bucket in ["Large Cap", "Mid Cap", "Small Cap"] %}
+            <option value="{{ bucket }}" {% if selected_market_cap_bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Min Market Cap (₹ Cr)
+        <input type="number"
+               name="min_market_cap_cr"
+               value="{{ selected_min_market_cap }}"
+               placeholder="{{ market_cap_bounds.min or 'Min' }}">
+      </label>
+
+      <label>
+        Max Market Cap (₹ Cr)
+        <input type="number"
+               name="max_market_cap_cr"
+               value="{{ selected_max_market_cap }}"
+               placeholder="{{ market_cap_bounds.max or 'Max' }}">
+      </label>
+
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Weekly BUY Screener</button>
+        <a class="table-link" href="/{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+      </div>
+    </form>
+
+    {% if active_filter_summary %}
+      <p class="filter-summary">Active screener filters: {{ active_filter_summary }}</p>
+    {% endif %}
+
+    {% if scan_job %}
+      <div class="scan-progress" id="scan-progress" data-job-id="{{ scan_job }}">
+        <div class="scan-progress-header">
+          <strong id="scan-progress-title">Screener is running</strong>
+          <span id="scan-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="scan-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="scan-progress-detail">Preparing the filtered NSE universe...</p>
+      </div>
+    {% endif %}
+
+    {% if scan_ran %}
+      <p class="success-note">Screener completed. Scanned {{ symbols_scanned }} stocks and found {{ filtered_count }} BUY matches.</p>
+    {% endif %}
+
+    {% if scan_error %}
+      <p class="warning-note">Screener failed: {{ scan_error }}</p>
+    {% endif %}
+
+    {% if not has_metadata %}
+      <p class="warning-note">Market-cap filters need NSE market-cap metadata. Open the Stocks tab and click Fetch NSE Market Caps.</p>
+    {% endif %}
+  </section>
+
+  {% if scan_job %}
+    <script>
+      const progressBox = document.getElementById("scan-progress");
+      const progressTitle = document.getElementById("scan-progress-title");
+      const progressPercent = document.getElementById("scan-progress-percent");
+      const progressFill = document.getElementById("scan-progress-fill");
+      const progressDetail = document.getElementById("scan-progress-detail");
+
+      async function pollScanProgress() {
+        if (!progressBox) return;
+        const jobId = progressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            progressTitle.textContent = "Screener status unavailable";
+            progressDetail.textContent = status.error || "Could not find the scan job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          progressFill.style.width = `${percent}%`;
+          progressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || ""}:${status.current_symbol}` : "";
+          progressTitle.textContent = status.status === "queued" ? "Screener queued" : "Screener is running";
+          progressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} stocks${current}`;
+
+          if (status.status === "completed") {
+            progressTitle.textContent = "Screener completed";
+            progressFill.style.width = "100%";
+            progressPercent.textContent = "100%";
+            progressDetail.textContent = "Loading matching BUY stocks...";
+            window.location.href = status.redirect_url || "/";
+            return;
+          }
+
+          if (status.status === "failed") {
+            progressTitle.textContent = "Screener failed";
+            progressDetail.textContent = status.error || "The scan could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          progressTitle.textContent = "Waiting for screener";
+          progressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollScanProgress, 1000);
+      }
+
+      pollScanProgress();
+    </script>
+  {% endif %}
+
+  <section class="summary-grid">
+    <div class="metric">
+      <span>BUY candidates</span>
+      <strong>{{ filtered_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>Scanned stocks</span>
+      <strong>{{ scan_details_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>Raw signals</span>
+      <strong>{{ raw_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>Kite token</span>
+      <strong>{{ "Saved" if token_status.exists else "Missing" }}</strong>
+    </div>
+  </section>
+
+  <section class="trading-layout">
+    <div class="chart-workspace">
+      <div class="workspace-header">
+        <div>
+          <p class="eyebrow">Selected result</p>
+          <h2>{{ selected_exchange }}:{{ selected_symbol }}</h2>
+          <p>
+            Latest signal:
+            <strong>{{ latest_summary.signal }}</strong>
+            {% if latest_summary.date %} on {{ latest_summary.date }}{% endif %}
+            {% if latest_summary.close %} at close {{ latest_summary.close }}{% endif %}
+          </p>
+        </div>
+        <div class="token-pill">
+          Weekly analysis
+        </div>
+      </div>
+
+      <div class="chart-frame">
+        {% if chart_html %}
+          {{ chart_html | safe }}
+        {% else %}
+          <p class="empty">{{ chart_message }}</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <aside class="symbol-panel">
+      <div class="panel-heading">
+        <h2>Filtered Stocks</h2>
+        <p>Stocks from the latest run that matched the filters and weekly BUY signal.</p>
+      </div>
+      <div class="symbol-list">
+        {% for row in filtered_symbols %}
+          <a class="symbol-row {% if row.get('exchange') == selected_exchange and (row.get('symbol') or row.get('tradingsymbol')) == selected_symbol %}active{% endif %}"
+             href="/?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol') or row.get('tradingsymbol', '') }}{{ filter_link_suffix }}">
+            <span>
+              <strong>{{ row.get("symbol") or row.get("tradingsymbol", "") }}</strong>
+              <small>{{ row.get("exchange", "") }} · {{ row.get("name", "") }}</small>
+              <small>₹ Cr {{ row.get("market_cap_cr", "") }} · {{ row.get("date", "") }}</small>
+            </span>
+            <em class="{{ row.get('signal', '')|lower }}">{{ row.get("signal", "BUY") }}</em>
+          </a>
+        {% else %}
+          <p class="empty">No BUY candidates yet. Choose filters and run the screener.</p>
+        {% endfor %}
+      </div>
+    </aside>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Weekly BUY Signals</h2>
+      <p>Stocks that passed the selected universe filters and current strategy rules.</p>
+    </div>
+
+    {% if filtered %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Market Cap (₹ Cr)</th>
+              <th>Bucket</th>
+              <th>Signal</th>
+              <th>Close</th>
+              <th>Volume</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in filtered %}
+              <tr>
+                <td>{{ row.get("date", "") }}</td>
+                <td>{{ row.get("exchange", "") }}</td>
+                <td>
+                  <a class="table-link" href="/?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol') or row.get('tradingsymbol', '') }}{{ filter_link_suffix }}">
+                    {{ row.get("symbol") or row.get("tradingsymbol", "") }}
+                  </a>
+                </td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("market_cap_cr", "") }}</td>
+                <td>{{ row.get("market_cap_bucket", "") }}</td>
+                <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("close", "") }}</td>
+                <td>{{ row.get("volume", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No BUY signals are available yet.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Scan Audit</h2>
+      <p>Every stock attempted in the latest run, including stocks that did not pass the weekly BUY filter.</p>
+    </div>
+
+    {% if scan_details %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Market Cap (₹ Cr)</th>
+              <th>Bucket</th>
+              <th>Fetch</th>
+              <th>Daily Rows</th>
+              <th>Strategy Rows</th>
+              <th>Raw Signals</th>
+              <th>Latest Signal</th>
+              <th>Latest Signal Date</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in scan_details %}
+              <tr>
+                <td>{{ row.get("exchange", "") }}</td>
+                <td>
+                  <a class="table-link" href="/?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol') or row.get('tradingsymbol', '') }}{{ filter_link_suffix }}">
+                    {{ row.get("symbol") or row.get("tradingsymbol", "") }}
+                  </a>
+                </td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("market_cap_cr", "") }}</td>
+                <td>{{ row.get("market_cap_bucket", "") }}</td>
+                <td>{{ row.get("fetch_status", "") }}</td>
+                <td>{{ row.get("daily_rows", "") }}</td>
+                <td>{{ row.get("strategy_rows", "") }}</td>
+                <td>{{ row.get("raw_signal_count", "") }}</td>
+                <td>{{ row.get("latest_signal", "") }}</td>
+                <td>{{ row.get("latest_signal_date", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No scan audit is available yet.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel bottom-signals">
+    <div class="panel-heading">
+      <h2>All Buy And Sell Signals</h2>
+      <p>Complete raw signal history generated by the strategy for the filtered stock universe.</p>
+    </div>
+
+    {% if all_signals %}
+      <div class="table-wrap signal-history">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Market Cap (₹ Cr)</th>
+              <th>Bucket</th>
+              <th>Signal</th>
+              <th>Close</th>
+              <th>Upper Level</th>
+              <th>Lower Level</th>
+              <th>FVG Bull Recent</th>
+              <th>FVG Bear Recent</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in all_signals %}
+              <tr>
+                <td>{{ row.get("date", "") }}</td>
+                <td>{{ row.get("exchange", "") }}</td>
+                <td>
+                  <a class="table-link" href="/?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol') or row.get('tradingsymbol', '') }}{{ filter_link_suffix }}">
+                    {{ row.get("symbol") or row.get("tradingsymbol", "") }}
+                  </a>
+                </td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("market_cap_cr", "") }}</td>
+                <td>{{ row.get("market_cap_bucket", "") }}</td>
+                <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("close", "") }}</td>
+                <td>{{ row.get("upper_level", "") }}</td>
+                <td>{{ row.get("lower_level", "") }}</td>
+                <td>{{ row.get("fvg_bull_recent", "") }}</td>
+                <td>{{ row.get("fvg_bear_recent", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No raw buy/sell signals are available yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

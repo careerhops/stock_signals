@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Big Bull Deals</h2>
+      <p>Large BUY/SELL activity by prominent investors, based on imported bulk/block deal or disclosure data.</p>
+    </div>
+
+    <p class="warning-note">
+      Source: NSE Large Deals. The data is stored in Supabase table <strong>nse_large_deals</strong>.
+      Kite does not provide investor bulk/block deal data.
+    </p>
+
+    <form action="/big-bull-deals/fetch" method="post" class="action-row">
+      <button class="button" type="submit">Fetch NSE Large Deals</button>
+      <span>Fetches the latest NSE Large Deals page data. Supabase stores each NSE deal date only once.</span>
+    </form>
+
+    {% if request.query_params.get("refreshed") %}
+      <p class="success-note">
+        Fetched {{ request.query_params.get("fetched", "0") }} rows from NSE.
+        Stored {{ request.query_params.get("rows", "0") }} new rows.
+        {% if request.query_params.get("skipped_existing_dates") != "0" %}
+          Existing deal date already stored, so write was skipped.
+        {% endif %}
+      </p>
+    {% endif %}
+
+    {% if request.query_params.get("fetch_error") %}
+      <p class="warning-note">Fetch failed: {{ request.query_params.get("fetch_error") }}</p>
+    {% endif %}
+
+    <form action="/big-bull-deals" method="get" class="filter-panel compact-filters">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+
+      <label>
+        Action
+        <select name="action">
+          <option value="">All</option>
+          <option value="BUY" {% if action == "BUY" %}selected{% endif %}>BUY</option>
+          <option value="SELL" {% if action == "SELL" %}selected{% endif %}>SELL</option>
+        </select>
+      </label>
+
+      <label>
+        Investor / Client Name
+        <select name="investor">
+          <option value="">All investors</option>
+          {% for option in investor_options %}
+            <option value="{{ option }}" {% if option == investor %}selected{% endif %}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        From
+        <input type="date" name="from_date" value="{{ from_date }}">
+      </label>
+
+      <label>
+        To
+        <input type="date" name="to_date" value="{{ to_date }}">
+      </label>
+
+      <label>
+        Symbol
+        <input type="search" name="symbol" value="{{ symbol }}" placeholder="Symbol">
+      </label>
+
+      <div class="filter-actions">
+        <button class="button" type="submit">Apply Filters</button>
+        <a class="table-link" href="/big-bull-deals{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+      </div>
+    </form>
+
+    <div class="summary-grid">
+      <div class="metric">
+        <span>Deals</span>
+        <strong>{{ deal_count }}</strong>
+      </div>
+    </div>
+
+    {% if deals %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Investor</th>
+              <th>Deal Type</th>
+              <th>Action</th>
+              <th>Quantity</th>
+              <th>Price</th>
+              <th>Value (₹ Cr)</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in deals %}
+              <tr>
+                <td>{{ row.get("deal_date", row.get("date", "")) }}</td>
+                <td>{{ row.get("exchange", "") }}</td>
+                <td>{{ row.get("symbol", "") }}</td>
+                <td>{{ row.get("client_name", row.get("investor", "")) }}</td>
+                <td>{{ row.get("deal_type", row.get("category", "")) }}</td>
+                <td><span class="signal {{ row.get('action', '')|lower }}">{{ row.get("action", "") }}</span></td>
+                <td>{{ row.get("quantity", "") }}</td>
+                <td>{{ row.get("price", "") }}</td>
+                <td>{{ row.get("value_cr", "") }}</td>
+                <td>{{ row.get("source", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No big-bull deal data is loaded yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

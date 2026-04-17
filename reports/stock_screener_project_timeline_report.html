@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>NSE/BSE Signal Screener Project Timeline Report</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 22mm 18mm;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      color: #1f2933;
+      line-height: 1.45;
+      font-size: 12px;
+      margin: 0;
+      background: #ffffff;
+    }
+
+    h1, h2, h3 {
+      color: #111827;
+      margin: 0 0 8px;
+      line-height: 1.18;
+    }
+
+    h1 {
+      font-size: 28px;
+      margin-top: 18px;
+    }
+
+    h2 {
+      font-size: 18px;
+      margin-top: 28px;
+      border-bottom: 1px solid #d7dde5;
+      padding-bottom: 6px;
+    }
+
+    h3 {
+      font-size: 14px;
+      margin-top: 16px;
+    }
+
+    p {
+      margin: 0 0 9px;
+    }
+
+    ul {
+      margin: 6px 0 12px 20px;
+      padding: 0;
+    }
+
+    li {
+      margin: 3px 0;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 10px 0 18px;
+      page-break-inside: avoid;
+    }
+
+    th, td {
+      border: 1px solid #d7dde5;
+      padding: 7px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef2f7;
+      color: #111827;
+      font-weight: 700;
+    }
+
+    .cover {
+      min-height: 720px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      page-break-after: always;
+    }
+
+    .subtitle {
+      font-size: 16px;
+      color: #4b5563;
+      margin-top: 10px;
+    }
+
+    .meta {
+      margin-top: 28px;
+      padding: 14px;
+      background: #f7f9fc;
+      border: 1px solid #d7dde5;
+    }
+
+    .callout {
+      margin: 12px 0 16px;
+      padding: 12px;
+      background: #f8fafc;
+      border-left: 4px solid #2563eb;
+    }
+
+    .success {
+      border-left-color: #059669;
+      background: #f0fdf4;
+    }
+
+    .warning {
+      border-left-color: #d97706;
+      background: #fffbeb;
+    }
+
+    .small {
+      color: #4b5563;
+      font-size: 11px;
+    }
+
+    .page-break {
+      page-break-before: always;
+    }
+
+    .code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 11px;
+      background: #f3f4f6;
+      border: 1px solid #d7dde5;
+      padding: 10px;
+      white-space: pre-wrap;
+      margin: 10px 0 16px;
+    }
+  </style>
+</head>
+<body>
+  <section class="cover">
+    <p class="small">Prepared for cofounder discussion</p>
+    <h1>NSE/BSE Signal Screener</h1>
+    <p class="subtitle">Project timeline, implementation plan, effort estimate, operating cost, and ownership split</p>
+    <div class="meta">
+      <p><strong>Prepared on:</strong> 16 April 2026</p>
+      <p><strong>Proposed first version:</strong> Local end-of-day investment screener using Zerodha Kite Connect, Python, DuckDB/Parquet, Streamlit, and Telegram alerts.</p>
+      <p><strong>Primary objective:</strong> Replicate the existing TradingView PineScript signal logic and run it across NSE/BSE stocks automatically after market close for investment watchlist generation.</p>
+    </div>
+  </section>
+
+  <h2>1. Executive Summary</h2>
+  <p>
+    The goal is to build a private investment screener that replaces manual TradingView chart checks.
+    The current PineScript indicator will be translated into Python and run across a large NSE/BSE stock universe.
+    The scanner will update after market close, apply configurable filters, produce a shortlist, and send an alert through Telegram initially.
+  </p>
+  <div class="callout success">
+    <p><strong>Recommendation:</strong> Build version 1 as a local Python application first, running from VSCode on the MacBook Air. Use Zerodha Kite Connect for market data, DuckDB/Parquet for local storage, Streamlit for UI, and Telegram for alerts.</p>
+  </div>
+  <p>
+    The first production-ready version should focus only on end-of-day daily and weekly signals for investment decisions. Intraday trading, live tick processing, and order placement are explicitly out of scope.
+  </p>
+
+  <h2>2. Product Scope</h2>
+  <table>
+    <tr>
+      <th>Area</th>
+      <th>Version 1 Scope</th>
+      <th>Later Scope</th>
+    </tr>
+    <tr>
+      <td>Signal engine</td>
+      <td>Translate current PineScript into Python and match TradingView behavior.</td>
+      <td>Support multiple strategies and profiles.</td>
+    </tr>
+    <tr>
+      <td>Timeframe</td>
+      <td>Daily source candles, weekly scan timeframe by default. Daily scan configurable.</td>
+      <td>Multi-timeframe investment confirmation, such as monthly trend plus weekly signal.</td>
+    </tr>
+    <tr>
+      <td>Universe</td>
+      <td>NSE equities plus BSE-only equities. Prefer NSE duplicates where possible.</td>
+      <td>Sector lists, custom watchlists, indices, F&O stocks.</td>
+    </tr>
+    <tr>
+      <td>UI</td>
+      <td>Streamlit dashboard with signal table, filters, CSV export, and stock chart.</td>
+      <td>FastAPI plus React/Next.js if multi-user production UI is needed.</td>
+    </tr>
+    <tr>
+      <td>Notifications</td>
+      <td>Telegram alert after daily scan.</td>
+      <td>WhatsApp Cloud API, email reports, Google Sheets export.</td>
+    </tr>
+    <tr>
+      <td>Execution</td>
+      <td>No auto-order placement. The system is for screening and investment research only.</td>
+      <td>Portfolio notes, watchlist tracking, and manual decision support.</td>
+    </tr>
+  </table>
+
+  <h2>3. Key Assumptions</h2>
+  <ul>
+    <li>The application is for private/internal use, not a public market data product.</li>
+    <li>Zerodha Kite Connect paid API will be used for instrument master and historical candles.</li>
+    <li>The scanner will run after market close, targeted around 6:00 PM IST.</li>
+    <li>Version 1 will run on a MacBook Air with 8 GB RAM.</li>
+    <li>The initial strategy is the existing TradingView PineScript named "Weekly Buy Sell".</li>
+    <li>All strategy and filter parameters must be configurable through YAML files.</li>
+    <li>Telegram is the default alert channel because it is faster and simpler than WhatsApp for MVP.</li>
+    <li>Intraday trading, tick streaming, and automated order execution are not part of the product plan.</li>
+  </ul>
+
+  <h2>4. Proposed Technical Architecture</h2>
+  <div class="code">Zerodha Kite Connect
+      |
+      v
+Instrument Master + Historical OHLCV
+      |
+      v
+Local Storage: Parquet + DuckDB
+      |
+      v
+Daily-to-Weekly Resampling
+      |
+      v
+Python Strategy Engine
+      |
+      v
+Filter Engine
+      |
+      v
+Streamlit Dashboard + CSV Export
+      |
+      v
+Telegram Alert</div>
+
+  <table>
+    <tr>
+      <th>Layer</th>
+      <th>Tool</th>
+      <th>Reason</th>
+    </tr>
+    <tr>
+      <td>Market data</td>
+      <td>Zerodha Kite Connect</td>
+      <td>Available Indian broker API with historical candles and instrument master.</td>
+    </tr>
+    <tr>
+      <td>Language</td>
+      <td>Python</td>
+      <td>Best fit for strategy logic, data processing, and dashboards.</td>
+    </tr>
+    <tr>
+      <td>Data processing</td>
+      <td>Polars or Pandas</td>
+      <td>Polars preferred for speed; Pandas acceptable for MVP simplicity.</td>
+    </tr>
+    <tr>
+      <td>Storage</td>
+      <td>Parquet + DuckDB</td>
+      <td>Fast local analytical storage without database server setup.</td>
+    </tr>
+    <tr>
+      <td>UI</td>
+      <td>Streamlit</td>
+      <td>Fastest way to create a useful Python dashboard.</td>
+    </tr>
+    <tr>
+      <td>Charts</td>
+      <td>Plotly</td>
+      <td>Candlestick charts and interactive visual inspection.</td>
+    </tr>
+    <tr>
+      <td>Scheduling</td>
+      <td>Manual first, then cron/macOS launchd</td>
+      <td>Simple daily job after market close.</td>
+    </tr>
+    <tr>
+      <td>Alerts</td>
+      <td>Telegram Bot API</td>
+      <td>Low-friction internal alerts, free, quick to implement.</td>
+    </tr>
+  </table>
+
+  <h2>5. Strategy To Be Implemented</h2>
+  <p>The current PineScript logic will be implemented exactly first. Filters and enhancements will be separate from the raw signal engine.</p>
+  <table>
+    <tr>
+      <th>Component</th>
+      <th>Current Logic</th>
+      <th>Configurable?</th>
+    </tr>
+    <tr>
+      <td>Structure sensitivity</td>
+      <td>Highest high and lowest low of prior N candles.</td>
+      <td>Yes, default 3.</td>
+    </tr>
+    <tr>
+      <td>Breakout rule</td>
+      <td>Buy when close crosses above prior structure high. Sell when close crosses below prior structure low.</td>
+      <td>Yes, default close-based.</td>
+    </tr>
+    <tr>
+      <td>FVG rule</td>
+      <td>Bullish FVG when current low is greater than high from two candles ago. Bearish FVG when current high is less than low from two candles ago.</td>
+      <td>Yes, FVG lookback default 5.</td>
+    </tr>
+    <tr>
+      <td>Signal confirmation</td>
+      <td>Breakout plus recent FVG.</td>
+      <td>Yes.</td>
+    </tr>
+    <tr>
+      <td>Repeated signal prevention</td>
+      <td>A new buy is blocked after a buy until a sell occurs, and vice versa.</td>
+      <td>Yes, default enabled.</td>
+    </tr>
+    <tr>
+      <td>Demand/supply zones</td>
+      <td>Demand uses min(current low, prior low). Supply uses max(current high, prior high).</td>
+      <td>Yes.</td>
+    </tr>
+  </table>
+
+  <h2>6. Config-Driven Design</h2>
+  <p>All important values should be adjustable without code changes. The first configuration file should be <strong>config/settings.yaml</strong>.</p>
+  <div class="code">data:
+  provider: "zerodha"
+  source_timeframe: "1D"
+  scan_timeframe: "1W"
+  history_years: 10
+  update_mode: "incremental"
+
+strategy:
+  sensitivity: 3
+  fvg_lookback: 5
+  breakout_price: "close"
+  prevent_repeated_direction: true
+  signal_on_confirmed_candle: true
+
+universe:
+  exchanges: ["NSE", "BSE"]
+  prefer_exchange: "NSE"
+  include_bse_only: true
+  deduplicate_by_isin: true
+
+filters:
+  enabled: true
+  signal:
+    direction: "BUY"
+    latest_only: true
+    max_signal_age_bars: 1
+  price:
+    enabled: false
+    min: 50
+    max: 5000
+  liquidity:
+    enabled: false
+    min_avg_volume_20: 200000
+    min_avg_traded_value_20: 10000000
+
+schedule:
+  enabled: true
+  timezone: "Asia/Kolkata"
+  run_time: "18:00"
+  run_days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+
+notifications:
+  enabled: true
+  channel: "telegram"
+  send_only_when_matches_found: false
+  notify_on_failure: true</div>
+
+  <h2>7. Daily Evening Job</h2>
+  <p>The scanner should run after the market closes and after data is likely available from the provider. Recommended start time is 6:00 PM IST.</p>
+  <table>
+    <tr>
+      <th>Step</th>
+      <th>Action</th>
+      <th>Expected Time</th>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>Load config and validate schedule.</td>
+      <td>Seconds</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Check Kite token and fail fast if login is required.</td>
+      <td>Seconds</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Fetch/update instrument master if needed.</td>
+      <td>1-3 minutes</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>Fetch latest daily candle updates for the stock universe.</td>
+      <td>10-70 minutes depending on stock count and rate limits.</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>Run data readiness checks.</td>
+      <td>Seconds to 2 minutes</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>Resample daily candles into weekly candles if scan timeframe is weekly.</td>
+      <td>1-5 minutes</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>Run strategy and filters.</td>
+      <td>1-10 minutes depending on universe size.</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>Save results and send Telegram alert.</td>
+      <td>Seconds</td>
+    </tr>
+  </table>
+
+  <h2>8. Expected Performance On MacBook Air 8 GB RAM</h2>
+  <p>The main bottleneck is API fetching, not computation. Calculation can be kept efficient by processing stock data in batches and storing candles locally.</p>
+  <table>
+    <tr>
+      <th>Universe Size</th>
+      <th>Estimated Daily Update Time</th>
+      <th>Estimated Scan Compute Time</th>
+      <th>Estimated Total Daily Runtime</th>
+    </tr>
+    <tr>
+      <td>500 stocks</td>
+      <td>3-7 minutes</td>
+      <td>Under 1 minute</td>
+      <td>5-10 minutes</td>
+    </tr>
+    <tr>
+      <td>1,000 stocks</td>
+      <td>6-10 minutes</td>
+      <td>Under 1-3 minutes</td>
+      <td>10-15 minutes</td>
+    </tr>
+    <tr>
+      <td>2,500 stocks</td>
+      <td>15-25 minutes</td>
+      <td>2-5 minutes</td>
+      <td>20-35 minutes</td>
+    </tr>
+    <tr>
+      <td>5,000 stocks</td>
+      <td>30-50 minutes</td>
+      <td>5-10 minutes</td>
+      <td>40-70 minutes</td>
+    </tr>
+  </table>
+  <div class="callout warning">
+    <p><strong>Important:</strong> Initial historical backfill can take longer, potentially 1-3 hours for thousands of stocks. This is expected and should not happen every day. Daily runs must use incremental updates.</p>
+  </div>
+
+  <h2>9. Timeline And Effort Estimate</h2>
+  <p>Effort is shown in person-days. Calendar duration assumes part-time review cycles and manual TradingView validation.</p>
+  <table>
+    <tr>
+      <th>Phase</th>
+      <th>Calendar Duration</th>
+      <th>Effort</th>
+      <th>Owner</th>
+      <th>Deliverable</th>
+    </tr>
+    <tr>
+      <td>0. Setup and access</td>
+      <td>0.5-1 day</td>
+      <td>0.5-1 person-day</td>
+      <td>Founder</td>
+      <td>Kite Connect subscription, API app, local .env, project setup.</td>
+    </tr>
+    <tr>
+      <td>1. Strategy translation</td>
+      <td>1-2 days</td>
+      <td>1.5-2.5 person-days</td>
+      <td>Codex/developer</td>
+      <td>Python implementation of PineScript strategy with configurable sensitivity and FVG lookback.</td>
+    </tr>
+    <tr>
+      <td>2. Data provider integration</td>
+      <td>2-3 days</td>
+      <td>2-4 person-days</td>
+      <td>Codex/developer + Founder for credentials</td>
+      <td>Zerodha instrument master and historical candle fetcher.</td>
+    </tr>
+    <tr>
+      <td>3. Local storage and resampling</td>
+      <td>1-2 days</td>
+      <td>1.5-3 person-days</td>
+      <td>Codex/developer</td>
+      <td>Parquet/DuckDB storage and daily-to-weekly candle builder.</td>
+    </tr>
+    <tr>
+      <td>4. Full scanner runner</td>
+      <td>2-3 days</td>
+      <td>2-4 person-days</td>
+      <td>Codex/developer</td>
+      <td>Batch scanner across selected universe, signal output, scan logs.</td>
+    </tr>
+    <tr>
+      <td>5. TradingView validation</td>
+      <td>3-5 days</td>
+      <td>2-4 person-days developer + 1-2 person-days founder</td>
+      <td>Both</td>
+      <td>Validation report comparing sample stocks against TradingView.</td>
+    </tr>
+    <tr>
+      <td>6. Streamlit dashboard</td>
+      <td>2-3 days</td>
+      <td>2-4 person-days</td>
+      <td>Codex/developer</td>
+      <td>Signal table, filters, chart view, CSV export.</td>
+    </tr>
+    <tr>
+      <td>7. Filter engine</td>
+      <td>2-4 days</td>
+      <td>2-5 person-days</td>
+      <td>Both</td>
+      <td>Configurable price, liquidity, trend, and signal-age filters.</td>
+    </tr>
+    <tr>
+      <td>8. Notifications and scheduler</td>
+      <td>1-3 days</td>
+      <td>1.5-3 person-days</td>
+      <td>Codex/developer</td>
+      <td>Daily 6 PM IST job and Telegram success/failure alerts.</td>
+    </tr>
+    <tr>
+      <td>9. Hardening and documentation</td>
+      <td>2-4 days</td>
+      <td>2-4 person-days</td>
+      <td>Codex/developer</td>
+      <td>README, runbook, error handling, backup guidance.</td>
+    </tr>
+  </table>
+
+  <h3>Timeline Summary</h3>
+  <table>
+    <tr>
+      <th>Release</th>
+      <th>Target Duration</th>
+      <th>Total Effort</th>
+      <th>What It Includes</th>
+    </tr>
+    <tr>
+      <td>Prototype</td>
+      <td>1 week</td>
+      <td>5-8 person-days</td>
+      <td>Strategy translation, sample stock data, basic CSV output.</td>
+    </tr>
+    <tr>
+      <td>MVP</td>
+      <td>2-3 weeks</td>
+      <td>14-22 person-days</td>
+      <td>Kite data, local storage, full scanner, basic dashboard, validation sample.</td>
+    </tr>
+    <tr>
+      <td>Usable V1</td>
+      <td>4-6 weeks</td>
+      <td>24-38 person-days</td>
+      <td>Config filters, daily schedule, Telegram alerts, documentation, stronger validation.</td>
+    </tr>
+    <tr>
+      <td>Production upgrade</td>
+      <td>Additional 2-4 weeks</td>
+      <td>12-25 person-days</td>
+      <td>VPS deployment, backups, remote dashboard, WhatsApp, and investment watchlist history.</td>
+    </tr>
+  </table>
+
+  <h2>10. Cost Estimate</h2>
+  <h3>Monthly Operating Cost</h3>
+  <table>
+    <tr>
+      <th>Item</th>
+      <th>Required For MVP?</th>
+      <th>Estimated Cost</th>
+      <th>Notes</th>
+    </tr>
+    <tr>
+      <td>Zerodha Kite Connect paid API</td>
+      <td>Yes</td>
+      <td>INR 500/month, approximately INR 590/month if 18% GST is charged separately</td>
+      <td>Required for historical candle data access. Live data is not required for the planned investment screener.</td>
+    </tr>
+    <tr>
+      <td>Local hosting on MacBook</td>
+      <td>Yes for MVP</td>
+      <td>INR 0/month</td>
+      <td>MacBook must be awake for scheduled jobs.</td>
+    </tr>
+    <tr>
+      <td>Telegram alerts</td>
+      <td>Yes</td>
+      <td>INR 0/month</td>
+      <td>Bot API is free for this use case.</td>
+    </tr>
+    <tr>
+      <td>VPS/cloud server</td>
+      <td>No, recommended later</td>
+      <td>INR 500-1,500/month</td>
+      <td>Useful for reliable scheduled execution and remote dashboard access.</td>
+    </tr>
+    <tr>
+      <td>Domain name</td>
+      <td>No</td>
+      <td>INR 800-1,200/year</td>
+      <td>Only needed if hosting dashboard publicly/private web URL.</td>
+    </tr>
+    <tr>
+      <td>WhatsApp Cloud API</td>
+      <td>No</td>
+      <td>Variable</td>
+      <td>Requires WhatsApp Business setup and may involve conversation/message charges.</td>
+    </tr>
+    <tr>
+      <td>Paid fundamentals/data vendor</td>
+      <td>No</td>
+      <td>Variable</td>
+      <td>Consider later only if filters require fundamentals, sector data, market cap, or corporate action adjusted datasets beyond what the broker data provides.</td>
+    </tr>
+  </table>
+
+  <h3>Expected Cost By Stage</h3>
+  <table>
+    <tr>
+      <th>Stage</th>
+      <th>Monthly Cost</th>
+      <th>One-Time Cost</th>
+    </tr>
+    <tr>
+      <td>Local MVP</td>
+      <td>INR 500-590</td>
+      <td>Internal development effort only.</td>
+    </tr>
+    <tr>
+      <td>Local V1 with Telegram</td>
+      <td>INR 500-590</td>
+      <td>Internal development effort only.</td>
+    </tr>
+    <tr>
+      <td>VPS-hosted V1</td>
+      <td>INR 1,000-2,100</td>
+      <td>Server setup and deployment effort.</td>
+    </tr>
+    <tr>
+      <td>WhatsApp-enabled version</td>
+      <td>INR 1,000-2,100 plus WhatsApp charges</td>
+      <td>WhatsApp Business setup and integration effort.</td>
+    </tr>
+  </table>
+
+  <h2>11. Responsibilities</h2>
+  <h3>Founder Responsibilities</h3>
+  <ul>
+    <li>Subscribe to Zerodha Kite Connect and create the API app.</li>
+    <li>Provide API credentials locally through a .env file, not through chat.</li>
+    <li>Run setup and scanner commands from VSCode.</li>
+    <li>Share terminal output or screenshots when issues occur.</li>
+    <li>Validate a sample of signals against TradingView.</li>
+    <li>Define filter rules such as price range, liquidity threshold, trend confirmation, and exchange preference.</li>
+    <li>Decide whether the app should remain local or move to a VPS after MVP.</li>
+  </ul>
+
+  <h3>Codex/Developer Responsibilities</h3>
+  <ul>
+    <li>Create project structure and configuration files.</li>
+    <li>Translate PineScript logic into Python.</li>
+    <li>Create data provider integration for Kite Connect.</li>
+    <li>Create candle storage and weekly resampling logic.</li>
+    <li>Create scanner runner and signal output pipeline.</li>
+    <li>Create filter engine with YAML-driven rules.</li>
+    <li>Create Streamlit dashboard and CSV export.</li>
+    <li>Add Telegram notification integration.</li>
+    <li>Add daily scheduler guidance and operational runbook.</li>
+    <li>Help debug signal mismatches and data issues.</li>
+  </ul>
+
+  <h2>12. Milestones And Acceptance Criteria</h2>
+  <table>
+    <tr>
+      <th>Milestone</th>
+      <th>Acceptance Criteria</th>
+    </tr>
+    <tr>
+      <td>M1: Strategy engine</td>
+      <td>Python strategy produces buy/sell columns from OHLCV data and supports sensitivity/timeframe/lookback config.</td>
+    </tr>
+    <tr>
+      <td>M2: Data ingestion</td>
+      <td>App downloads instrument master and daily candles for a sample stock list without manual file edits.</td>
+    </tr>
+    <tr>
+      <td>M3: Scanner</td>
+      <td>Scanner runs on at least 500 stocks and outputs a signal file.</td>
+    </tr>
+    <tr>
+      <td>M4: Validation</td>
+      <td>Sample signals are compared with TradingView and mismatches are explained or fixed.</td>
+    </tr>
+    <tr>
+      <td>M5: Dashboard</td>
+      <td>Streamlit shows latest signals, filtered list, chart, and CSV export.</td>
+    </tr>
+    <tr>
+      <td>M6: Daily alert</td>
+      <td>Daily job produces a Telegram success/failure message and includes matching stock list when available.</td>
+    </tr>
+  </table>
+
+  <h2>13. Risk Register</h2>
+  <table>
+    <tr>
+      <th>Risk</th>
+      <th>Impact</th>
+      <th>Mitigation</th>
+    </tr>
+    <tr>
+      <td>TradingView signal mismatch</td>
+      <td>High</td>
+      <td>Validate candles, weekly resampling, crossover logic, and adjusted/unadjusted price differences.</td>
+    </tr>
+    <tr>
+      <td>Kite API rate limits</td>
+      <td>Medium</td>
+      <td>Backfill once, use incremental updates, batch carefully, avoid unnecessary repeated downloads.</td>
+    </tr>
+    <tr>
+      <td>Kite token/session failure</td>
+      <td>Medium</td>
+      <td>Add token check before job and send Telegram alert when login is required.</td>
+    </tr>
+    <tr>
+      <td>MacBook sleeps during job</td>
+      <td>Medium</td>
+      <td>Use manual run first or keep device awake. Move to VPS for reliability.</td>
+    </tr>
+    <tr>
+      <td>Duplicate NSE/BSE listings</td>
+      <td>Low</td>
+      <td>Prefer NSE and include BSE-only stocks. Add ISIN mapping when available.</td>
+    </tr>
+    <tr>
+      <td>Noisy signal list</td>
+      <td>Medium</td>
+      <td>Add volume, price, trend, and signal-age filters.</td>
+    </tr>
+    <tr>
+      <td>WhatsApp setup complexity</td>
+      <td>Low for MVP</td>
+      <td>Use Telegram first. Add WhatsApp only after the end-of-day scanner is stable.</td>
+    </tr>
+  </table>
+
+  <h2>14. Recommended Next Steps</h2>
+  <table>
+    <tr>
+      <th>Order</th>
+      <th>Action</th>
+      <th>Owner</th>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>Confirm Zerodha Kite Connect subscription and API app access.</td>
+      <td>Founder</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Create project scaffold with config-driven architecture.</td>
+      <td>Codex/developer</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Implement PineScript strategy in Python.</td>
+      <td>Codex/developer</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>Fetch candles for 50-100 test stocks and validate signals.</td>
+      <td>Both</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>Scale scanner to 500, then 1,000, then full universe.</td>
+      <td>Codex/developer</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>Add Streamlit dashboard and export.</td>
+      <td>Codex/developer</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>Add daily 6 PM IST run and Telegram alerts.</td>
+      <td>Codex/developer</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>Evaluate VPS hosting after 1-2 weeks of local daily use.</td>
+      <td>Founder</td>
+    </tr>
+  </table>
+
+  <h2>15. Final Recommendation</h2>
+  <p>
+    Proceed with a local, config-driven end-of-day daily/weekly investment screener first. The MacBook Air with 8 GB RAM is sufficient for version 1 if we process in batches and store data locally.
+    The most important first milestone is not speed; it is signal correctness against TradingView.
+  </p>
+  <div class="callout success">
+    <p><strong>Build order:</strong> Strategy match first, full scanner second, dashboard third, filters fourth, daily alerts fifth, VPS deployment only after the local workflow is reliable.</p>
+  </div>
+</body>
+</html>

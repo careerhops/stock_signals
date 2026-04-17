@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Stock Universe</h2>
+      <p>All stocks currently loaded from Kite instruments and filtered by the configured exchange/instrument type.</p>
+    </div>
+
+    <form action="/stocks/fetch" method="post" class="action-row">
+      <button class="button" type="submit">Fetch Latest Stock List</button>
+      <span>This downloads the latest Kite instrument master and updates this table.</span>
+    </form>
+
+    <form action="/stocks/fetch-market-caps" method="post" class="action-row">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <button class="button secondary" type="submit">Fetch NSE Market Caps</button>
+      <span>This downloads the NSE average market-cap Excel archive and updates market-cap metadata for the full list.</span>
+    </form>
+
+    {% if request.query_params.get("refreshed") %}
+      <p class="success-note">Stock list refreshed successfully.</p>
+    {% endif %}
+
+    {% if request.query_params.get("market_caps_refreshed") %}
+      <p class="success-note">Market-cap metadata refreshed for {{ request.query_params.get("market_cap_rows", "0") }} symbols.</p>
+    {% endif %}
+
+    {% if request.query_params.get("market_cap_error") %}
+      <p class="warning-note">Market-cap fetch failed: {{ request.query_params.get("market_cap_error") }}</p>
+    {% endif %}
+
+    <form action="/stocks" method="get" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+
+      <label>
+        Search
+        <input type="search" name="search" value="{{ search }}" placeholder="Symbol or company name">
+      </label>
+
+      <label>
+        Industry / Category
+        <select name="industry" multiple size="6">
+          {% for industry in industry_options %}
+            <option value="{{ industry }}" {% if industry in selected_industries %}selected{% endif %}>{{ industry }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Market Cap Bucket
+        <select name="market_cap_bucket">
+          <option value="">All</option>
+          {% for bucket in market_cap_bucket_options %}
+            <option value="{{ bucket }}" {% if selected_market_cap_bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Min Market Cap (₹ Cr)
+        <span class="range-value" id="min_market_cap_value">
+          {{ selected_min_market_cap or market_cap_bounds.min or 0 }}
+        </span>
+        <input type="range"
+               id="min_market_cap_slider"
+               min="{{ market_cap_bounds.min or 0 }}"
+               max="{{ market_cap_bounds.max or 1000000 }}"
+               step="100"
+               value="{{ selected_min_market_cap or market_cap_bounds.min or 0 }}"
+               {% if not has_market_cap_metadata %}disabled{% endif %}>
+        <input id="min_market_cap_input" type="number" name="min_market_cap_cr" value="{{ selected_min_market_cap }}" placeholder="Min">
+      </label>
+
+      <label>
+        Max Market Cap (₹ Cr)
+        <span class="range-value" id="max_market_cap_value">
+          {{ selected_max_market_cap or market_cap_bounds.max or 1000000 }}
+        </span>
+        <input type="range"
+               id="max_market_cap_slider"
+               min="{{ market_cap_bounds.min or 0 }}"
+               max="{{ market_cap_bounds.max or 1000000 }}"
+               step="100"
+               value="{{ selected_max_market_cap or market_cap_bounds.max or 1000000 }}"
+               {% if not has_market_cap_metadata %}disabled{% endif %}>
+        <input id="max_market_cap_input" type="number" name="max_market_cap_cr" value="{{ selected_max_market_cap }}" placeholder="Max">
+      </label>
+
+      <div class="filter-actions">
+        <button class="button" type="submit">Apply Filters</button>
+        <a class="table-link" href="/stocks{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+      </div>
+    </form>
+
+    {% if not has_market_cap_metadata %}
+      <p class="warning-note">Industry and market-cap filters need metadata. Click Fetch NSE Market Caps to create <strong>data/instruments/symbol_metadata.csv</strong> from the NSE Excel archive.</p>
+    {% endif %}
+
+    {% if market_cap_filter_requested and not has_market_cap_metadata %}
+      <p class="warning-note">Market-cap filters were selected, but the market-cap metadata file is not loaded yet. Fetch NSE Market Caps first, then apply this filter again.</p>
+    {% endif %}
+
+    <div class="summary-grid">
+      <div class="metric">
+        <span>{{ "Matching stocks" if active_stock_filters else "Total stocks" }}</span>
+        <strong>{{ stock_count }}</strong>
+      </div>
+    </div>
+
+    {% if stocks %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Instrument Type</th>
+              <th>Segment</th>
+              <th>Industry</th>
+              <th>Market Cap (₹ Cr)</th>
+              <th>Bucket</th>
+              <th>Watchlist</th>
+              <th>Instrument Token</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in stocks %}
+              <tr>
+                <td>{{ row.get("exchange", "") }}</td>
+                <td>{{ row.get("tradingsymbol", "") }}</td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("instrument_type", "") }}</td>
+                <td>{{ row.get("segment", "") }}</td>
+                <td>{{ row.get("industry", "") }}</td>
+                <td>{{ row.get("market_cap_cr", "") }}</td>
+                <td>{{ row.get("market_cap_bucket", "") }}</td>
+                <td>
+                  {% if row.get("is_watchlisted") %}
+                    <form action="/watchlist/remove/{{ row.get('exchange', '') }}/{{ row.get('tradingsymbol', '') }}" method="post">
+                      <button class="mini-button muted" type="submit">Remove</button>
+                    </form>
+                  {% else %}
+                    <form action="/watchlist/add/{{ row.get('exchange', '') }}/{{ row.get('tradingsymbol', '') }}" method="post">
+                      <button class="mini-button" type="submit">Add</button>
+                    </form>
+                  {% endif %}
+                </td>
+                <td>{{ row.get("instrument_token", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      {% if active_stock_filters %}
+        <p class="empty">No stocks match the selected filters.</p>
+      {% else %}
+        <p class="empty">No stock list is available yet. Click Fetch Latest Stock List to download Kite instruments.</p>
+      {% endif %}
+    {% endif %}
+  </section>
+
+  <script>
+    function bindMarketCapSlider(sliderId, inputId, valueId) {
+      const slider = document.getElementById(sliderId);
+      const input = document.getElementById(inputId);
+      const value = document.getElementById(valueId);
+      if (!slider || !input || !value) return;
+
+      const syncValue = (nextValue) => {
+        value.textContent = nextValue || "";
+      };
+
+      slider.addEventListener("input", () => {
+        input.value = slider.value;
+        syncValue(slider.value);
+      });
+
+      input.addEventListener("input", () => {
+        if (input.value !== "") {
+          slider.value = input.value;
+          syncValue(input.value);
+        }
+      });
+    }
+
+    bindMarketCapSlider("min_market_cap_slider", "min_market_cap_input", "min_market_cap_value");
+    bindMarketCapSlider("max_market_cap_slider", "max_market_cap_input", "max_market_cap_value");
+  </script>
+{% endblock %}
