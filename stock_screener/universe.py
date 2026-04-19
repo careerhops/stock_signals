@@ -4,6 +4,8 @@ from typing import Any
 
 import pandas as pd
 
+from stock_screener.symbols import normalize_nse_symbol
+
 
 def _load_metadata(path: str | None) -> pd.DataFrame:
     if not path:
@@ -19,6 +21,7 @@ def _load_metadata(path: str | None) -> pd.DataFrame:
 
     metadata = metadata.copy()
     metadata["symbol"] = metadata["symbol"].astype(str).str.upper()
+    metadata["metadata_symbol_key"] = metadata["symbol"].apply(normalize_nse_symbol)
     return metadata
 
 
@@ -47,12 +50,17 @@ def _apply_metadata_filters(frame: pd.DataFrame, universe_cfg: dict[str, Any]) -
         return frame.iloc[0:0].copy()
 
     merged = frame.copy()
-    merged["symbol_key"] = merged["tradingsymbol"].astype(str).str.upper()
+    merged["symbol_key"] = merged["tradingsymbol"].apply(normalize_nse_symbol)
     merge_type = "inner" if restrict_to_metadata_symbols else "left"
-    merged = merged.merge(metadata, left_on="symbol_key", right_on="symbol", how=merge_type, suffixes=("", "_metadata"))
+    merged = merged.merge(metadata, left_on="symbol_key", right_on="metadata_symbol_key", how=merge_type, suffixes=("", "_metadata"))
 
     if stock_search:
-        exact_symbol_match = merged["tradingsymbol"].astype(str).str.upper() == stock_search
+        search_key = normalize_nse_symbol(stock_search)
+        exact_symbol_match = (
+            (merged["tradingsymbol"].astype(str).str.upper() == stock_search)
+            | (merged["symbol_key"] == search_key)
+            | (merged["symbol"].astype(str).str.upper() == search_key)
+        )
         if exact_symbol_match.any():
             merged = merged[exact_symbol_match]
         else:
@@ -78,7 +86,7 @@ def _apply_metadata_filters(frame: pd.DataFrame, universe_cfg: dict[str, Any]) -
         merged["market_cap_cr"] = pd.to_numeric(merged["market_cap_cr"], errors="coerce")
         merged = merged[merged["market_cap_cr"] <= float(max_market_cap)]
 
-    return merged.drop(columns=["symbol_key"], errors="ignore")
+    return merged.drop(columns=["symbol_key", "metadata_symbol_key"], errors="ignore")
 
 
 def build_universe(instruments: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:

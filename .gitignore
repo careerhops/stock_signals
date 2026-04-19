@@ -7,3 +7,4 @@ data/
 reports/*.pdf
 reports/*.txt
 docs/*
+data/secrets/*

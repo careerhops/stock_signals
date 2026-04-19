@@ -26,8 +26,11 @@ from stock_screener.data.nse_market_cap import (
 from stock_screener.data.storage import Storage
 from stock_screener.data.supabase_store import SupabaseStore
 from stock_screener.jobs.daily_scan import run_daily_scan
+from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
+from stock_screener.signal_qa import build_signal_quality_report, strategy_rows_for_display
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
+from stock_screener.symbols import normalize_nse_symbol
 from stock_screener.jobs.large_deals import (
     default_last_7_days_range,
     fetch_and_store_current_large_deals,
@@ -115,9 +118,9 @@ def _enrich_with_symbol_metadata(frame: pd.DataFrame, metadata: pd.DataFrame, sy
 
     enriched = frame.copy()
     metadata_for_merge = metadata.copy()
-    metadata_for_merge["metadata_symbol_key"] = metadata_for_merge["symbol"].astype(str).str.upper()
+    metadata_for_merge["metadata_symbol_key"] = metadata_for_merge["symbol"].apply(normalize_nse_symbol)
     metadata_for_merge = metadata_for_merge.drop(columns=["symbol"], errors="ignore")
-    enriched["symbol_key"] = enriched[symbol_column].astype(str).str.upper()
+    enriched["symbol_key"] = enriched[symbol_column].apply(normalize_nse_symbol)
     enriched = enriched.merge(metadata_for_merge, left_on="symbol_key", right_on="metadata_symbol_key", how="left")
     return enriched.drop(columns=["symbol_key", "metadata_symbol_key"], errors="ignore")
 
@@ -130,6 +133,10 @@ def _request_float(request: Request, name: str) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def _request_bool(request: Request, name: str) -> bool:
+    return request.query_params.get(name, "").strip().lower() in {"1", "true", "on", "yes"}
 
 
 def _optional_float(value: str) -> float | None:
@@ -162,6 +169,68 @@ def _apply_market_cap_filters(
         filtered = filtered[pd.to_numeric(filtered["market_cap_cr"], errors="coerce") <= max_market_cap]
 
     return filtered
+
+
+def _truthy_series(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
+
+
+def _apply_signal_quality_filters(
+    frame: pd.DataFrame,
+    require_volume_confirmation: bool,
+    require_trend_confirmation: bool,
+    return_metric: str,
+    min_pair_return: float | None,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    filtered = frame.copy()
+    if require_volume_confirmation:
+        if "volume_confirmation" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        filtered = filtered[_truthy_series(filtered["volume_confirmation"])]
+
+    if require_trend_confirmation:
+        if "trend_confirmation" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        filtered = filtered[_truthy_series(filtered["trend_confirmation"])]
+
+    if min_pair_return is not None:
+        metric_column = (
+            "prior_pair_return_last_1_pct"
+            if return_metric == "last_1"
+            else "median_pair_return_last_3_pct"
+        )
+        if metric_column not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        filtered = filtered[pd.to_numeric(filtered[metric_column], errors="coerce") >= min_pair_return]
+
+    return filtered
+
+
+def _signal_quality_filter_warning(
+    frame: pd.DataFrame,
+    require_volume_confirmation: bool,
+    require_trend_confirmation: bool,
+    min_pair_return: float | None,
+) -> str:
+    missing_columns = []
+    if require_volume_confirmation and "volume_confirmation" not in frame.columns:
+        missing_columns.append("volume confirmation")
+    if require_trend_confirmation and "trend_confirmation" not in frame.columns:
+        missing_columns.append("trend confirmation")
+    if min_pair_return is not None and not {
+        "prior_pair_return_last_1_pct",
+        "median_pair_return_last_3_pct",
+    }.intersection(frame.columns):
+        missing_columns.append("BUY-to-SELL return history")
+    if not missing_columns:
+        return ""
+    return (
+        "Signal quality columns are missing from the saved BUY list. "
+        "Run the Weekly BUY Screener once more so these new fields are written."
+    )
 
 
 def _apply_stock_search(frame: pd.DataFrame, stock_search: str) -> pd.DataFrame:
@@ -207,11 +276,83 @@ def _row_symbol(row: pd.Series) -> str:
 
 def _dashboard_link_suffix(request: Request) -> str:
     params = []
-    for name in ("token", "stock_search", "market_cap_bucket", "min_market_cap_cr", "max_market_cap_cr"):
+    for name in (
+        "token",
+        "stock_search",
+        "market_cap_bucket",
+        "min_market_cap_cr",
+        "max_market_cap_cr",
+        "require_volume_confirmation",
+        "require_trend_confirmation",
+        "return_metric",
+        "min_pair_return_pct",
+    ):
         value = request.query_params.get(name, "").strip()
         if value:
             params.append(f"{name}={quote(value)}")
     return ("&" + "&".join(params)) if params else ""
+
+
+def _dashboard_filter_query(
+    token: str = "",
+    stock_search: str = "",
+    market_cap_bucket: str = "",
+    min_market_cap_cr: str = "",
+    max_market_cap_cr: str = "",
+    require_volume_confirmation: bool = False,
+    require_trend_confirmation: bool = False,
+    return_metric: str = "",
+    min_pair_return_pct: str = "",
+) -> str:
+    params = []
+    if token:
+        params.append(f"token={quote(token)}")
+    if stock_search:
+        params.append(f"stock_search={quote(stock_search)}")
+    if market_cap_bucket:
+        params.append(f"market_cap_bucket={quote(market_cap_bucket)}")
+    if min_market_cap_cr:
+        params.append(f"min_market_cap_cr={quote(min_market_cap_cr)}")
+    if max_market_cap_cr:
+        params.append(f"max_market_cap_cr={quote(max_market_cap_cr)}")
+    if require_volume_confirmation:
+        params.append("require_volume_confirmation=1")
+    if require_trend_confirmation:
+        params.append("require_trend_confirmation=1")
+    if return_metric:
+        params.append(f"return_metric={quote(return_metric)}")
+    if min_pair_return_pct:
+        params.append(f"min_pair_return_pct={quote(min_pair_return_pct)}")
+    return "&".join(params)
+
+
+def _buy_signal_filter_summary(
+    stock_search: str,
+    market_cap_bucket: str,
+    min_market_cap_text: str,
+    max_market_cap_text: str,
+    require_volume_confirmation: bool = False,
+    require_trend_confirmation: bool = False,
+    return_metric: str = "",
+    min_pair_return_text: str = "",
+) -> str:
+    filters = []
+    if stock_search:
+        filters.append(f"Search: {stock_search}")
+    if market_cap_bucket:
+        filters.append(f"Market cap bucket: {market_cap_bucket}")
+    if min_market_cap_text:
+        filters.append(f"Min market cap: {min_market_cap_text} Cr")
+    if max_market_cap_text:
+        filters.append(f"Max market cap: {max_market_cap_text} Cr")
+    if require_volume_confirmation:
+        filters.append("Volume confirmation: Yes")
+    if require_trend_confirmation:
+        filters.append("Trend confirmation: Yes")
+    if min_pair_return_text:
+        metric_label = "Last completed BUY-SELL return" if return_metric == "last_1" else "Median last 3 BUY-SELL returns"
+        filters.append(f"{metric_label} >= {min_pair_return_text}%")
+    return "; ".join(filters) if filters else "None"
 
 
 def _manual_screener_config(
@@ -241,6 +382,104 @@ def _manual_screener_config(
 
     config.setdefault("notifications", {})["enabled"] = False
     return config
+
+
+def _load_visible_buy_signals(
+    config: dict[str, Any],
+    storage: Storage,
+    stock_search: str,
+    min_market_cap: float | None,
+    max_market_cap: float | None,
+    market_cap_bucket: str,
+    require_volume_confirmation: bool = False,
+    require_trend_confirmation: bool = False,
+    return_metric: str = "",
+    min_pair_return: float | None = None,
+) -> pd.DataFrame:
+    metadata = _combined_symbol_metadata(config, storage)
+    filtered = storage.load_signals("latest_filtered.csv")
+    filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
+    filtered = _apply_market_cap_filters(filtered, min_market_cap, max_market_cap, market_cap_bucket)
+    filtered = _apply_stock_search(filtered, stock_search)
+    filtered = _apply_signal_quality_filters(
+        filtered,
+        require_volume_confirmation,
+        require_trend_confirmation,
+        return_metric,
+        min_pair_return,
+    )
+
+    if not filtered.empty and "date" in filtered.columns:
+        filtered = filtered.copy()
+        filtered["date_sort"] = pd.to_datetime(filtered["date"], errors="coerce")
+        sort_columns = ["date_sort"]
+        sort_ascending = [False]
+        symbol_column = _symbol_column(filtered)
+        if symbol_column:
+            sort_columns.append(symbol_column)
+            sort_ascending.append(True)
+        filtered = filtered.sort_values(sort_columns, ascending=sort_ascending).drop(columns=["date_sort"], errors="ignore")
+    return filtered.reset_index(drop=True)
+
+
+def _signal_qa_candidates(
+    filtered: pd.DataFrame,
+    scan_details: pd.DataFrame,
+    instruments: pd.DataFrame,
+    symbol_search: str,
+) -> pd.DataFrame:
+    candidate_frames = []
+    for source_priority, frame in enumerate((scan_details, filtered, instruments)):
+        if frame.empty:
+            continue
+        candidate = frame.copy()
+        if "symbol" not in candidate.columns and "tradingsymbol" in candidate.columns:
+            candidate["symbol"] = candidate["tradingsymbol"]
+        candidate["qa_source_priority"] = source_priority
+        candidate_frames.append(candidate)
+
+    if not candidate_frames:
+        return pd.DataFrame()
+
+    candidates = pd.concat(candidate_frames, ignore_index=True, sort=False)
+    if candidates.empty:
+        return candidates
+
+    candidates = candidates.drop_duplicates(subset=[column for column in ("exchange", "symbol") if column in candidates.columns])
+    candidates = _apply_stock_search(candidates, symbol_search)
+
+    if not candidates.empty:
+        sort_columns = [column for column in ("qa_source_priority", "exchange", "symbol") if column in candidates.columns]
+        if sort_columns:
+            candidates = candidates.sort_values(sort_columns)
+    return candidates.drop(columns=["qa_source_priority"], errors="ignore").reset_index(drop=True)
+
+
+def _selected_signal_qa_symbol(
+    request: Request,
+    filtered: pd.DataFrame,
+    candidates: pd.DataFrame,
+    symbol_search: str,
+) -> tuple[str, str]:
+    selected_exchange = request.query_params.get("exchange", "").strip()
+    selected_symbol = request.query_params.get("symbol", "").strip()
+
+    if selected_exchange and selected_symbol:
+        return selected_exchange, selected_symbol
+
+    if symbol_search and not candidates.empty:
+        first = candidates.iloc[0]
+        return str(first.get("exchange", "")), _row_symbol(first)
+
+    if not filtered.empty:
+        first = filtered.iloc[0]
+        return str(first.get("exchange", "")), _row_symbol(first)
+
+    if not candidates.empty:
+        first = candidates.iloc[0]
+        return str(first.get("exchange", "")), _row_symbol(first)
+
+    return "", ""
 
 
 def _scan_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
@@ -394,6 +633,66 @@ def _load_big_bull_deals(data_root: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def _large_deal_markers(deals: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    if deals.empty or "symbol" not in deals.columns:
+        return {}
+
+    frame = deals.copy()
+    frame["symbol_key"] = frame["symbol"].apply(normalize_nse_symbol)
+    markers: dict[str, dict[str, Any]] = {}
+
+    for symbol_key, group in frame.groupby("symbol_key", dropna=True):
+        actions = group["action"].astype(str).str.upper() if "action" in group.columns else pd.Series(dtype=str)
+        buy_count = int((actions == "BUY").sum())
+        sell_count = int((actions == "SELL").sum())
+        latest_date = ""
+        if "deal_date" in group.columns:
+            latest_date_value = pd.to_datetime(group["deal_date"], errors="coerce").max()
+            latest_date = str(latest_date_value.date()) if pd.notna(latest_date_value) else ""
+        elif "date" in group.columns:
+            latest_date_value = pd.to_datetime(group["date"], errors="coerce").max()
+            latest_date = str(latest_date_value.date()) if pd.notna(latest_date_value) else ""
+
+        summary_parts = []
+        if buy_count:
+            summary_parts.append(f"{buy_count} BUY")
+        if sell_count:
+            summary_parts.append(f"{sell_count} SELL")
+        if not summary_parts:
+            summary_parts.append(f"{len(group)} deal")
+
+        markers[str(symbol_key)] = {
+            "has_large_deal": True,
+            "large_deal_count": int(len(group)),
+            "large_deal_buy_count": buy_count,
+            "large_deal_sell_count": sell_count,
+            "large_deal_latest_date": latest_date,
+            "large_deal_summary": ", ".join(summary_parts),
+        }
+    return markers
+
+
+def _apply_large_deal_markers(frame: pd.DataFrame, deals: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    marked = frame.copy()
+    markers = _large_deal_markers(deals)
+    symbol_column = _symbol_column(marked)
+    if not markers or not symbol_column:
+        marked["has_large_deal"] = False
+        marked["large_deal_summary"] = ""
+        marked["large_deal_latest_date"] = ""
+        return marked
+
+    keys = marked[symbol_column].apply(normalize_nse_symbol)
+    marked["has_large_deal"] = keys.map(lambda key: bool(markers.get(key, {}).get("has_large_deal", False)))
+    marked["large_deal_summary"] = keys.map(lambda key: markers.get(key, {}).get("large_deal_summary", ""))
+    marked["large_deal_latest_date"] = keys.map(lambda key: markers.get(key, {}).get("large_deal_latest_date", ""))
+    marked["large_deal_count"] = keys.map(lambda key: markers.get(key, {}).get("large_deal_count", 0))
+    return marked
+
+
 def _fetch_and_store_big_bull_deals() -> RedirectResponse:
     try:
         result = fetch_and_store_current_large_deals()
@@ -447,6 +746,12 @@ def dashboard(request: Request) -> HTMLResponse:
     selected_market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
     min_market_cap = _request_float(request, "min_market_cap_cr")
     max_market_cap = _request_float(request, "max_market_cap_cr")
+    require_volume_confirmation = _request_bool(request, "require_volume_confirmation")
+    require_trend_confirmation = _request_bool(request, "require_trend_confirmation")
+    selected_return_metric = request.query_params.get("return_metric", "median_3").strip() or "median_3"
+    if selected_return_metric not in {"last_1", "median_3"}:
+        selected_return_metric = "median_3"
+    min_pair_return = _request_float(request, "min_pair_return_pct")
     filter_link_suffix = _dashboard_link_suffix(request)
     active_filter_parts = []
     if stock_search:
@@ -457,6 +762,13 @@ def dashboard(request: Request) -> HTMLResponse:
         active_filter_parts.append(f"Min market cap: {request.query_params.get('min_market_cap_cr')} Cr")
     if max_market_cap is not None:
         active_filter_parts.append(f"Max market cap: {request.query_params.get('max_market_cap_cr')} Cr")
+    if require_volume_confirmation:
+        active_filter_parts.append("Volume confirmed")
+    if require_trend_confirmation:
+        active_filter_parts.append("Trend confirmed")
+    if min_pair_return is not None:
+        metric_label = "last pair return" if selected_return_metric == "last_1" else "median last 3 pair return"
+        active_filter_parts.append(f"{metric_label} >= {request.query_params.get('min_pair_return_pct')}%")
 
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     raw = _enrich_with_symbol_metadata(raw, metadata, "symbol")
@@ -469,6 +781,22 @@ def dashboard(request: Request) -> HTMLResponse:
     filtered = _apply_stock_search(filtered, stock_search)
     raw = _apply_stock_search(raw, stock_search)
     scan_details = _apply_stock_search(scan_details, stock_search)
+
+    signal_quality_warning = _signal_quality_filter_warning(
+        filtered,
+        require_volume_confirmation,
+        require_trend_confirmation,
+        min_pair_return,
+    )
+    filtered = _apply_signal_quality_filters(
+        filtered,
+        require_volume_confirmation,
+        require_trend_confirmation,
+        selected_return_metric,
+        min_pair_return,
+    )
+    large_deals = _load_big_bull_deals(data_root)
+    filtered = _apply_large_deal_markers(filtered, large_deals)
 
     market_cap_bounds = {"min": "", "max": ""}
     if not metadata.empty and "market_cap_cr" in metadata.columns and metadata["market_cap_cr"].notna().any():
@@ -561,11 +889,25 @@ def dashboard(request: Request) -> HTMLResponse:
             "selected_market_cap_bucket": selected_market_cap_bucket,
             "selected_min_market_cap": request.query_params.get("min_market_cap_cr", ""),
             "selected_max_market_cap": request.query_params.get("max_market_cap_cr", ""),
+            "require_volume_confirmation": require_volume_confirmation,
+            "require_trend_confirmation": require_trend_confirmation,
+            "selected_return_metric": selected_return_metric,
+            "selected_min_pair_return": request.query_params.get("min_pair_return_pct", ""),
+            "signal_quality_warning": signal_quality_warning,
+            "base_filter_query": _dashboard_filter_query(
+                token=request.query_params.get("token", ""),
+                stock_search=stock_search,
+                market_cap_bucket=selected_market_cap_bucket,
+                min_market_cap_cr=request.query_params.get("min_market_cap_cr", ""),
+                max_market_cap_cr=request.query_params.get("max_market_cap_cr", ""),
+            ),
             "market_cap_bounds": market_cap_bounds,
             "has_metadata": not metadata.empty,
             "scan_ran": request.query_params.get("scan_ran", ""),
             "scan_error": request.query_params.get("scan_error", ""),
             "scan_job": request.query_params.get("scan_job", ""),
+            "telegram_sent": request.query_params.get("telegram_sent", ""),
+            "telegram_error": request.query_params.get("telegram_error", ""),
             "symbols_scanned": request.query_params.get("symbols_scanned", ""),
             "active_filter_summary": " · ".join(active_filter_parts),
         },
@@ -632,6 +974,161 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
     except Exception as exc:
         redirect_url = _scan_error_url(exc, query_suffix)
     return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.post("/telegram/send-buy-signals")
+async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    storage = Storage(data_root)
+    form = await request.form()
+    _ensure_market_cap_metadata(config, storage)
+
+    dashboard_token = str(form.get("token", "")).strip()
+    stock_search = str(form.get("stock_search", "")).strip()
+    market_cap_bucket = str(form.get("market_cap_bucket", "")).strip()
+    min_market_cap_text = str(form.get("min_market_cap_cr", "")).strip()
+    max_market_cap_text = str(form.get("max_market_cap_cr", "")).strip()
+    require_volume_confirmation = str(form.get("require_volume_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    require_trend_confirmation = str(form.get("require_trend_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    return_metric = str(form.get("return_metric", "median_3")).strip() or "median_3"
+    if return_metric not in {"last_1", "median_3"}:
+        return_metric = "median_3"
+    min_pair_return_text = str(form.get("min_pair_return_pct", "")).strip()
+    min_market_cap = _optional_float(min_market_cap_text)
+    max_market_cap = _optional_float(max_market_cap_text)
+    min_pair_return = _optional_float(min_pair_return_text)
+
+    filter_query = _dashboard_filter_query(
+        token=dashboard_token,
+        stock_search=stock_search,
+        market_cap_bucket=market_cap_bucket,
+        min_market_cap_cr=min_market_cap_text,
+        max_market_cap_cr=max_market_cap_text,
+        require_volume_confirmation=require_volume_confirmation,
+        require_trend_confirmation=require_trend_confirmation,
+        return_metric=return_metric if min_pair_return_text else "",
+        min_pair_return_pct=min_pair_return_text,
+    )
+
+    try:
+        visible_buy_signals = _load_visible_buy_signals(
+            config,
+            storage,
+            stock_search,
+            min_market_cap,
+            max_market_cap,
+            market_cap_bucket,
+            require_volume_confirmation,
+            require_trend_confirmation,
+            return_metric,
+            min_pair_return,
+        )
+        if visible_buy_signals.empty:
+            raise RuntimeError("No weekly BUY signals are available to send.")
+
+        visible_buy_signals = _apply_large_deal_markers(
+            visible_buy_signals,
+            _load_big_bull_deals(data_root),
+        )
+        filters_text = _buy_signal_filter_summary(
+            stock_search,
+            market_cap_bucket,
+            min_market_cap_text,
+            max_market_cap_text,
+            require_volume_confirmation,
+            require_trend_confirmation,
+            return_metric,
+            min_pair_return_text,
+        )
+        send_buy_signal_list_to_telegram(config, visible_buy_signals, filters_text=filters_text)
+        status_query = "telegram_sent=1"
+    except Exception as exc:
+        status_query = f"telegram_error={quote(str(exc)[:500])}"
+
+    redirect_query = "&".join([part for part in (status_query, filter_query) if part])
+    return RedirectResponse(f"/?{redirect_query}", status_code=303)
+
+
+@app.get("/signal-qa", response_class=HTMLResponse)
+def signal_qa_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    data_root = get_data_root(config)
+    storage = Storage(data_root)
+    _ensure_market_cap_metadata(config, storage)
+
+    filtered = storage.load_signals("latest_filtered.csv")
+    raw = storage.load_signals("latest_raw_signals.csv")
+    scan_details = storage.load_signals("latest_scan_details.csv")
+    instruments = storage.load_instruments()
+    metadata = _combined_symbol_metadata(config, storage)
+
+    filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
+    raw = _enrich_with_symbol_metadata(raw, metadata, "symbol")
+    scan_details = _enrich_with_symbol_metadata(scan_details, metadata, "symbol")
+
+    report = build_signal_quality_report(raw, filtered, scan_details)
+    symbol_search = request.query_params.get("symbol_search", "").strip()
+    candidates = _signal_qa_candidates(filtered, scan_details, instruments, symbol_search)
+    selected_exchange, selected_symbol = _selected_signal_qa_symbol(request, filtered, candidates, symbol_search)
+
+    chart_html = ""
+    latest_summary = {"signal": "NONE", "date": "", "close": ""}
+    strategy_rows = pd.DataFrame()
+    signal_rows = pd.DataFrame()
+    qa_message = "Choose a stock to inspect signal generation."
+
+    if selected_exchange and selected_symbol:
+        daily = storage.load_candles(selected_exchange, selected_symbol, "1D")
+        if daily.empty:
+            qa_message = f"No local OHLC candles found for {selected_exchange}:{selected_symbol}."
+        else:
+            scan_timeframe = config.get("data", {}).get("scan_timeframe", "1W")
+            strategy_cfg = config.get("strategy", {})
+            weekly_anchor = strategy_cfg.get("weekly_anchor", "W-FRI")
+            use_completed_weeks_only = bool(strategy_cfg.get("use_completed_weeks_only", True))
+            strategy_input = daily
+            if scan_timeframe == "1W":
+                strategy_input = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
+
+            strategy_output = run_weekly_buy_sell(strategy_input, config)
+            chart_html = build_signal_chart(strategy_output, selected_exchange, selected_symbol, height=480)
+            latest_summary = latest_signal_summary(strategy_output)
+            strategy_rows = strategy_rows_for_display(strategy_output, limit=120)
+            signal_rows = strategy_rows[strategy_rows["signal"].isin(["BUY", "SELL"])].copy()
+            qa_message = ""
+
+    return templates.TemplateResponse(
+        "signal_qa.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "report": report,
+            "checks": report["checks"],
+            "issues": report["issues"][:200],
+            "symbol_search": symbol_search,
+            "candidates": _records(candidates.head(200)),
+            "candidate_count": len(candidates),
+            "selected_exchange": selected_exchange,
+            "selected_symbol": selected_symbol,
+            "latest_summary": latest_summary,
+            "chart_html": chart_html,
+            "qa_message": qa_message,
+            "strategy_rows": _records(strategy_rows),
+            "signal_rows": _records(signal_rows),
+            "raw_count": len(raw),
+            "filtered_count": len(filtered),
+            "scan_details_count": len(scan_details),
+        },
+    )
 
 
 @app.post("/watchlist/add/{exchange}/{symbol}")
@@ -768,10 +1265,12 @@ def stocks_page(request: Request) -> HTMLResponse:
 
         if not metadata.empty:
             stocks = stocks.copy()
-            stocks["symbol_key"] = stocks["tradingsymbol"].astype(str).str.upper()
+            metadata_for_merge = metadata.copy()
+            metadata_for_merge["metadata_symbol_key"] = metadata_for_merge["symbol"].apply(normalize_nse_symbol)
+            stocks["symbol_key"] = stocks["tradingsymbol"].apply(normalize_nse_symbol)
             merge_type = "inner" if restrict_to_metadata_symbols else "left"
-            stocks = stocks.merge(metadata, left_on="symbol_key", right_on="symbol", how=merge_type)
-            stocks = stocks.drop(columns=["symbol_key", "symbol"], errors="ignore")
+            stocks = stocks.merge(metadata_for_merge, left_on="symbol_key", right_on="metadata_symbol_key", how=merge_type)
+            stocks = stocks.drop(columns=["symbol_key", "metadata_symbol_key", "symbol"], errors="ignore")
         elif restrict_to_metadata_symbols:
             stocks = stocks.iloc[0:0].copy()
 

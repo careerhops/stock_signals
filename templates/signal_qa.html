@@ -1,0 +1,250 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Signal QA</h2>
+      <p>Audit the latest run and inspect exactly why BUY and SELL signals were generated from real Kite OHLC data.</p>
+    </div>
+
+    <div class="summary-grid">
+      <div class="metric">
+        <span>Raw signals</span>
+        <strong>{{ raw_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>Filtered BUY signals</span>
+        <strong>{{ filtered_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>Scanned stocks</span>
+        <strong>{{ scan_details_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>QA issues</span>
+        <strong>{{ report.summary.issue_count }}</strong>
+      </div>
+    </div>
+
+    <div class="qa-check-grid">
+      {% for check in checks %}
+        <div class="qa-check {{ check.status|lower }}">
+          <strong>{{ check.status }}</strong>
+          <span>{{ check.name }}</span>
+          <small>{{ check.details }} · Failures: {{ check.failures }}</small>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Inspect A Stock</h2>
+      <p>Search any loaded stock and see the weekly candles, structure levels, FVG state, and final signal decision.</p>
+    </div>
+
+    <form action="/signal-qa" method="get" class="filter-panel compact-filters">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <label>
+        Search Symbol Or Name
+        <input type="search" name="symbol_search" value="{{ symbol_search }}" placeholder="E2E, JIOFIN, TCS">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Search</button>
+        <a class="table-link" href="/signal-qa{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+      </div>
+    </form>
+
+    {% if candidates %}
+      <p class="filter-summary">Showing {{ candidates|length }} of {{ candidate_count }} matching stocks.</p>
+      <div class="symbol-list qa-candidate-list">
+        {% for row in candidates %}
+          <a class="symbol-row {% if row.get('exchange') == selected_exchange and row.get('symbol') == selected_symbol %}active{% endif %}"
+             href="/signal-qa?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol', '') }}{% if symbol_search %}&symbol_search={{ symbol_search }}{% endif %}{% if dashboard_token %}&token={{ dashboard_token }}{% endif %}">
+            <span>
+              <strong>{{ row.get("symbol", "") }}</strong>
+              <small>{{ row.get("exchange", "") }} · {{ row.get("name", row.get("company_name", "")) }}</small>
+              <small>Latest: {{ row.get("latest_signal", row.get("signal", "NONE")) }} {{ row.get("latest_signal_date", row.get("date", "")) }}</small>
+            </span>
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="empty">No matching stocks found in the latest local data.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="workspace-header qa-stock-header">
+      <div>
+        <p class="eyebrow">Selected stock</p>
+        <h2>{{ selected_exchange }}:{{ selected_symbol }}</h2>
+        <p>
+          Latest signal:
+          <strong>{{ latest_summary.signal }}</strong>
+          {% if latest_summary.date %} on {{ latest_summary.date }}{% endif %}
+          {% if latest_summary.close %} at close {{ latest_summary.close }}{% endif %}
+        </p>
+      </div>
+      <div class="token-pill">Weekly strategy trace</div>
+    </div>
+
+    <div class="chart-frame qa-chart-frame">
+      {% if chart_html %}
+        {{ chart_html | safe }}
+      {% else %}
+        <p class="empty">{{ qa_message }}</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Generated BUY/SELL Signals</h2>
+      <p>Only final BUY and SELL rows for the selected stock.</p>
+    </div>
+
+    {% if signal_rows %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Signal</th>
+              <th>Close</th>
+              <th>Upper Level</th>
+              <th>Lower Level</th>
+              <th>FVG Bull Recent</th>
+              <th>FVG Bear Recent</th>
+              <th>Volume Confirmed</th>
+              <th>Trend Confirmed</th>
+              <th>Prior Pair Return</th>
+              <th>Median Last 3 Pairs</th>
+              <th>Why Signal Was Generated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in signal_rows %}
+              <tr>
+                <td>{{ row.get("date", "") }}</td>
+                <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("close", "") }}</td>
+                <td>{{ row.get("upper_level", "") }}</td>
+                <td>{{ row.get("lower_level", "") }}</td>
+                <td>{{ row.get("fvg_bull_recent", "") }}</td>
+                <td>{{ row.get("fvg_bear_recent", "") }}</td>
+                <td>{{ row.get("volume_confirmation", "") }}</td>
+                <td>{{ row.get("trend_confirmation", "") }}</td>
+                <td>{{ row.get("prior_pair_return_last_1_pct") or "NA" }}</td>
+                <td>{{ row.get("median_pair_return_last_3_pct") or "NA" }}</td>
+                <td>{{ row.get("explanation", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No final BUY or SELL signals were generated for this stock in local data.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Weekly Decision Trace</h2>
+      <p>Recent weekly rows with every PineScript-equivalent condition used by the strategy.</p>
+    </div>
+
+    {% if strategy_rows %}
+      <div class="table-wrap signal-history">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Close</th>
+              <th>Upper</th>
+              <th>Lower</th>
+              <th>Bull Break</th>
+              <th>Bear Break</th>
+              <th>FVG Bull</th>
+              <th>FVG Bear</th>
+              <th>FVG Bull Recent</th>
+              <th>FVG Bear Recent</th>
+              <th>Volume Confirmed</th>
+              <th>Trend Confirmed</th>
+              <th>Prior Pair Return</th>
+              <th>Median Last 3 Pairs</th>
+              <th>Raw BUY</th>
+              <th>Raw SELL</th>
+              <th>Final Signal</th>
+              <th>Explanation</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in strategy_rows %}
+              <tr>
+                <td>{{ row.get("date", "") }}</td>
+                <td>{{ row.get("close", "") }}</td>
+                <td>{{ row.get("upper_level", "") }}</td>
+                <td>{{ row.get("lower_level", "") }}</td>
+                <td>{{ row.get("bull_break", "") }}</td>
+                <td>{{ row.get("bear_break", "") }}</td>
+                <td>{{ row.get("fvg_bull", "") }}</td>
+                <td>{{ row.get("fvg_bear", "") }}</td>
+                <td>{{ row.get("fvg_bull_recent", "") }}</td>
+                <td>{{ row.get("fvg_bear_recent", "") }}</td>
+                <td>{{ row.get("volume_confirmation", "") }}</td>
+                <td>{{ row.get("trend_confirmation", "") }}</td>
+                <td>{{ row.get("prior_pair_return_last_1_pct") or "NA" }}</td>
+                <td>{{ row.get("median_pair_return_last_3_pct") or "NA" }}</td>
+                <td>{{ row.get("buy_signal", "") }}</td>
+                <td>{{ row.get("sell_signal", "") }}</td>
+                <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("explanation", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No weekly decision trace is available for this stock.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Run Issues</h2>
+      <p>These are consistency problems found across the latest full screener run.</p>
+    </div>
+
+    {% if issues %}
+      <div class="table-wrap signal-history">
+        <table>
+          <thead>
+            <tr>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Date</th>
+              <th>Signal</th>
+              <th>Problem</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in issues %}
+              <tr>
+                <td>{{ row.get("exchange", "") }}</td>
+                <td>{{ row.get("symbol", "") }}</td>
+                <td>{{ row.get("date", "") }}</td>
+                <td>{{ row.get("signal", "") }}</td>
+                <td>{{ row.get("problem", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="success-note">No signal consistency issues were found in the latest run.</p>
+    {% endif %}
+  </section>
+{% endblock %}

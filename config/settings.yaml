@@ -6,7 +6,7 @@ data:
   provider: "zerodha"
   source_timeframe: "1D"
   scan_timeframe: "1W"
-  history_years: 3
+  history_years: 5
   update_mode: "incremental"
   data_root_env: "DATA_ROOT"
   readiness:
@@ -51,6 +51,9 @@ strategy:
   weekly_anchor: "W-FRI"
   weekly_label: "period_end"
   use_completed_weeks_only: true
+  volume_confirmation_lookback: 20
+  volume_confirmation_multiplier: 1.25
+  pair_return_lookback_weeks: 104
 
 filters:
   enabled: true

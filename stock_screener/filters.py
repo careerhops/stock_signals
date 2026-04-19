@@ -14,6 +14,7 @@ def apply_filters(signals: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame
 
     signal_cfg = filters_cfg.get("signal", {})
     frame = frame[frame["signal"].isin(["BUY", "SELL"])]
+    all_signal_dates = pd.to_datetime(frame["date"], errors="coerce") if not frame.empty else pd.Series(dtype="datetime64[ns]")
 
     if signal_cfg.get("latest_only", True) and not frame.empty:
         frame = frame.copy()
@@ -30,6 +31,17 @@ def apply_filters(signals: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame
     direction = str(signal_cfg.get("direction", "BUY")).upper()
     if direction in {"BUY", "SELL"}:
         frame = frame[frame["signal"] == direction]
+
+    max_signal_age_bars = signal_cfg.get("max_signal_age_bars")
+    if max_signal_age_bars is not None and not frame.empty and not all_signal_dates.empty:
+        max_signal_date = all_signal_dates.max()
+        max_age = max(int(max_signal_age_bars), 1)
+        scan_timeframe = str(config.get("data", {}).get("scan_timeframe", "1W")).upper()
+        if scan_timeframe == "1W":
+            min_allowed_date = max_signal_date - pd.Timedelta(weeks=max_age - 1)
+        else:
+            min_allowed_date = max_signal_date - pd.Timedelta(days=max_age - 1)
+        frame = frame[pd.to_datetime(frame["date"], errors="coerce") >= min_allowed_date]
 
     price_cfg = filters_cfg.get("price", {})
     if price_cfg.get("enabled", False):

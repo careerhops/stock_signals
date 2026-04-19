@@ -330,6 +330,22 @@ th {
   z-index: 1;
 }
 
+.sort-button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 800;
+  padding: 0;
+  text-align: left;
+}
+
+.sort-button:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
 tbody tr {
   transition: background 120ms ease;
 }
@@ -357,6 +373,28 @@ tbody tr:hover {
 .signal.sell {
   background: var(--sell);
   box-shadow: 0 3px 8px rgba(198, 61, 98, 0.18);
+}
+
+.signal.none {
+  background: #7a8b96;
+  box-shadow: none;
+}
+
+.deal-marker {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #b8d5f4;
+  border-radius: 8px;
+  background: var(--sky-soft);
+  color: #2f6ea7;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  padding: 4px 7px;
+}
+
+.muted-text {
+  color: var(--muted);
 }
 
 .empty {
@@ -429,6 +467,38 @@ tbody tr:hover {
 
 .action-row span {
   color: var(--muted);
+}
+
+.telegram-action {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.telegram-action span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.signal-quality-filters {
+  margin-bottom: 14px;
+}
+
+.checkbox-field {
+  align-items: center;
+  color: var(--text);
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.checkbox-field input {
+  width: auto;
 }
 
 .inline-field {
@@ -588,6 +658,65 @@ tbody tr:hover {
 
 .chart-panel {
   padding: 8px;
+}
+
+.qa-check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.qa-check {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 13px;
+}
+
+.qa-check strong,
+.qa-check span,
+.qa-check small {
+  display: block;
+}
+
+.qa-check strong {
+  margin-bottom: 6px;
+}
+
+.qa-check.pass strong {
+  color: var(--buy);
+}
+
+.qa-check.fail {
+  border-color: #efb3c0;
+  background: var(--rose-soft);
+}
+
+.qa-check.fail strong {
+  color: var(--sell);
+}
+
+.qa-check small {
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.qa-candidate-list {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px;
+}
+
+.qa-stock-header {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 14px;
+}
+
+.qa-chart-frame {
+  min-height: 480px;
 }
 
 .plain-list {

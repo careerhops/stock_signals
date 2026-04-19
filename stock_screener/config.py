@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 
 def load_config(path: str | Path = "config/settings.yaml") -> dict[str, Any]:
-    load_dotenv()
+    load_dotenv(override=True)
     config_path = Path(path)
     if not config_path.exists():
       raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -34,4 +34,3 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-

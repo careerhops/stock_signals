@@ -20,6 +20,51 @@ def _add_signal_highlight(fig: go.Figure, signal_date: pd.Timestamp, color: str)
     )
 
 
+def _yes_no(value: Any) -> str:
+    return "OK" if bool(value) else "NO"
+
+
+def _check_mark(value: Any) -> str:
+    return "Y" if bool(value) else "N"
+
+
+def _format_float(value: Any, decimals: int = 2, suffix: str = "") -> str:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "NA"
+    return f"{float(numeric):.{decimals}f}{suffix}"
+
+
+def _buy_quality_text(row: pd.Series) -> str:
+    return (
+        "BUY"
+        f"<br>Vol {_check_mark(row.get('volume_confirmation', False))}"
+        f" Trend {_check_mark(row.get('trend_confirmation', False))}"
+        f"<br>Med1 {_format_float(row.get('prior_pair_return_last_1_pct'), 1, '%')}"
+        f" Med3 {_format_float(row.get('median_pair_return_last_3_pct'), 1, '%')}"
+    )
+
+
+def _sell_quality_text(row: pd.Series) -> str:
+    return f"SELL<br>Pair {_format_float(row.get('sell_pair_return_pct'), 1, '%')}"
+
+
+def _quality_customdata(rows: pd.DataFrame) -> list[list[str]]:
+    customdata: list[list[str]] = []
+    for _, row in rows.iterrows():
+        customdata.append(
+            [
+                _yes_no(row.get("volume_confirmation", False)),
+                _format_float(row.get("volume_confirmation_ratio"), 2, "x"),
+                _yes_no(row.get("trend_confirmation", False)),
+                _format_float(row.get("prior_pair_return_last_1_pct"), 2, "%"),
+                _format_float(row.get("median_pair_return_last_3_pct"), 2, "%"),
+                _format_float(row.get("sell_pair_return_pct"), 2, "%"),
+            ]
+        )
+    return customdata
+
+
 def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str, height: int = 620) -> str:
     if strategy_output.empty:
         fig = go.Figure()
@@ -50,6 +95,18 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
             hovertemplate="Date: %{x|%d %b %Y}<br>Close: %{y:.2f}<extra></extra>",
         )
     )
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["close"],
+            mode="lines",
+            name="Right Price Axis",
+            line={"color": "rgba(0,0,0,0)", "width": 0},
+            hoverinfo="skip",
+            showlegend=False,
+            yaxis="y2",
+        )
+    )
 
     fig.add_trace(
         go.Scatter(
@@ -71,6 +128,28 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
         )
     )
 
+    if "ema_20" in frame.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=frame["date"],
+                y=frame["ema_20"],
+                mode="lines",
+                name="20-week EMA",
+                line={"color": "rgba(79, 142, 207, 0.72)", "width": 1.4},
+            )
+        )
+
+    if "ema_50" in frame.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=frame["date"],
+                y=frame["ema_50"],
+                mode="lines",
+                name="50-week EMA",
+                line={"color": "rgba(122, 139, 150, 0.72)", "width": 1.4},
+            )
+        )
+
     if not buy_rows.empty:
         fig.add_trace(
             go.Scatter(
@@ -78,15 +157,24 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
                 y=buy_rows["close"],
                 mode="markers+text",
                 name="BUY",
-                text=["BUY"] * len(buy_rows),
+                text=[_buy_quality_text(row) for _, row in buy_rows.iterrows()],
                 textposition="bottom center",
-                textfont={"color": "#047857", "size": 15, "family": "Arial Black, Arial, sans-serif"},
+                textfont={"color": "#047857", "size": 12, "family": "Arial, sans-serif"},
                 marker={
                     "symbol": "triangle-up",
                     "size": 24,
                     "color": "#00b879",
                     "line": {"color": "#004d35", "width": 3},
                 },
+                customdata=_quality_customdata(buy_rows),
+                hovertemplate=(
+                    "Date: %{x|%d %b %Y}<br>"
+                    "Close: %{y:.2f}<br>"
+                    "Volume confirmation: %{customdata[0]} (%{customdata[1]})<br>"
+                    "Trend confirmation: %{customdata[2]}<br>"
+                    "Prior BUY-SELL return: %{customdata[3]}<br>"
+                    "Median last 3 BUY-SELL returns: %{customdata[4]}<extra></extra>"
+                ),
             )
         )
 
@@ -111,15 +199,21 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
                 y=sell_rows["close"],
                 mode="markers+text",
                 name="SELL",
-                text=["SELL"] * len(sell_rows),
+                text=[_sell_quality_text(row) for _, row in sell_rows.iterrows()],
                 textposition="top center",
-                textfont={"color": "#be123c", "size": 15, "family": "Arial Black, Arial, sans-serif"},
+                textfont={"color": "#be123c", "size": 12, "family": "Arial, sans-serif"},
                 marker={
                     "symbol": "triangle-down",
                     "size": 24,
                     "color": "#ff0055",
                     "line": {"color": "#6f0027", "width": 3},
                 },
+                customdata=_quality_customdata(sell_rows),
+                hovertemplate=(
+                    "Date: %{x|%d %b %Y}<br>"
+                    "Close: %{y:.2f}<br>"
+                    "Completed BUY-SELL return: %{customdata[5]}<extra></extra>"
+                ),
             )
         )
 
@@ -168,9 +262,17 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
         title=f"{exchange}:{symbol} Weekly Buy/Sell Signal Chart",
         xaxis_title="Date",
         yaxis_title="Price",
+        yaxis2={
+            "title": "Price",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+            "tickformat": ".2f",
+            "matches": "y",
+        },
         hovermode="x unified",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-        margin={"l": 50, "r": 28, "t": 80, "b": 44},
+        margin={"l": 50, "r": 28, "t": 92, "b": 44},
         height=height,
         width=chart_width,
         paper_bgcolor="#ffffff",
