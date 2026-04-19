@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>BUY-to-SELL Backtest</h2>
+      <p>Measures every completed BUY signal followed by the next SELL signal using locally stored weekly OHLC data.</p>
+    </div>
+
+    <form action="/backtest/run{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}" method="post" class="action-row">
+      <button class="button" type="submit">Run Backtest Report</button>
+      {% if workbook_exists %}
+        <a class="button secondary" href="/backtest/report">Download Excel Report</a>
+      {% endif %}
+      <span>Closed trades are counted only when a BUY has a later SELL.</span>
+    </form>
+
+    {% if backtest_ran %}
+      <p class="success-note">Backtest completed. The latest Excel report is ready.</p>
+    {% endif %}
+
+    {% if backtest_error %}
+      <p class="warning-note">Backtest failed: {{ backtest_error }}</p>
+    {% endif %}
+  </section>
+
+  {% if summary %}
+    <section class="summary-grid">
+      <div class="metric">
+        <span>Symbols processed</span>
+        <strong>{{ summary.get("symbols_processed", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Closed trades</span>
+        <strong>{{ summary.get("closed_trades", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Winning trades</span>
+        <strong>{{ summary.get("winning_trades", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Losing trades</span>
+        <strong>{{ summary.get("losing_trades", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Win rate</span>
+        <strong>{{ "%.2f"|format(summary.get("win_rate_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Average return</span>
+        <strong>{{ "%.2f"|format(summary.get("avg_return_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Median return</span>
+        <strong>{{ "%.2f"|format(summary.get("median_return_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Open BUY positions</span>
+        <strong>{{ summary.get("open_positions", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Went up before SELL</span>
+        <strong>{{ "%.2f"|format(summary.get("went_up_before_sell_rate_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Avg max gain before SELL</span>
+        <strong>{{ "%.2f"|format(summary.get("avg_max_gain_before_sell_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Hit 10% before SELL</span>
+        <strong>{{ "%.2f"|format(summary.get("hit_10pct_before_sell_rate_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Hit 15% before SELL</span>
+        <strong>{{ "%.2f"|format(summary.get("hit_15pct_before_sell_rate_pct", 0)) }}%</strong>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Stock-Level Accuracy</h2>
+        <p>Top 100 stocks by closed trade count and how often price moved higher after BUY before SELL.</p>
+      </div>
+
+      {% if stock_stats %}
+        <div class="table-wrap signal-history">
+          <table>
+            <thead>
+              <tr>
+                <th>Exchange</th>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>Closed Trades</th>
+                <th>Wins</th>
+                <th>Losses</th>
+                <th>Win Rate %</th>
+                <th>Avg Return %</th>
+                <th>Median Return %</th>
+                <th>Best %</th>
+                <th>Worst %</th>
+                <th>Went Up %</th>
+                <th>Avg Max Gain %</th>
+                <th>Median Max Gain %</th>
+                <th>Hit 5% %</th>
+                <th>Hit 10% %</th>
+                <th>Hit 15% %</th>
+                <th>Hit 20% %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in stock_stats %}
+                <tr>
+                  <td>{{ row.get("exchange", "") }}</td>
+                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("closed_trades", "") }}</td>
+                  <td>{{ row.get("wins", "") }}</td>
+                  <td>{{ row.get("losses", "") }}</td>
+                  <td>{{ "%.2f"|format(row.get("win_rate_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("avg_return_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("median_return_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("best_return_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("worst_return_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("went_up_before_sell_rate_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("avg_max_gain_before_sell_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("median_max_gain_before_sell_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("hit_5pct_before_sell_rate_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("hit_10pct_before_sell_rate_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("hit_15pct_before_sell_rate_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("hit_20pct_before_sell_rate_pct", 0)) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="empty">No stock-level backtest rows are available yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Recent Closed Trades</h2>
+        <p>First 100 closed BUY-to-SELL trades from the latest report.</p>
+      </div>
+
+      {% if trades %}
+        <div class="table-wrap signal-history">
+          <table>
+            <thead>
+              <tr>
+                <th>Exchange</th>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>BUY Date</th>
+                <th>BUY Close</th>
+                <th>SELL Date</th>
+                <th>SELL Close</th>
+                <th>Return %</th>
+                <th>Max High Before SELL</th>
+                <th>Max Gain Before SELL %</th>
+                <th>Max Gain Date</th>
+                <th>Outcome</th>
+                <th>Holding Weeks</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in trades %}
+                <tr>
+                  <td>{{ row.get("exchange", "") }}</td>
+                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("buy_date", "") }}</td>
+                  <td>{{ row.get("buy_close", "") }}</td>
+                  <td>{{ row.get("sell_date", "") }}</td>
+                  <td>{{ row.get("sell_close", "") }}</td>
+                  <td>{{ "%.2f"|format(row.get("return_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("max_high_before_sell", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("max_gain_before_sell_pct", 0)) }}</td>
+                  <td>{{ row.get("max_gain_date", "") }}</td>
+                  <td>{{ row.get("outcome", "") }}</td>
+                  <td>{{ row.get("holding_weeks", "") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="empty">No closed trade rows are available yet.</p>
+      {% endif %}
+    </section>
+  {% else %}
+    <section class="panel">
+      <p class="empty">No backtest report has been generated yet. Click Run Backtest Report.</p>
+    </section>
+  {% endif %}
+{% endblock %}

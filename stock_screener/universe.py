@@ -119,11 +119,27 @@ def build_universe(instruments: pd.DataFrame, config: dict[str, Any]) -> pd.Data
         frame = frame[frame["segment"].astype(str).str.upper() != "INDICES"]
 
     if "tradingsymbol" in frame.columns:
+        frame["tradingsymbol"] = frame["tradingsymbol"].fillna("").astype(str).str.strip()
+        frame = frame[frame["tradingsymbol"] != ""]
         frame = frame[~frame["tradingsymbol"].isin(block_symbols)]
         if allow_symbols:
             frame = frame[frame["tradingsymbol"].isin(allow_symbols)]
 
+    if "name" in frame.columns:
+        frame["name"] = frame["name"].fillna("").astype(str).str.strip()
+    else:
+        frame["name"] = ""
+
     frame = _apply_metadata_filters(frame, universe_cfg)
+    if "name" in frame.columns:
+        name = frame["name"].fillna("").astype(str).str.strip()
+        if "company_name" in frame.columns:
+            company_name = frame["company_name"].fillna("").astype(str).str.strip()
+            name = name.mask(name == "", company_name)
+        if "tradingsymbol" in frame.columns:
+            symbol = frame["tradingsymbol"].fillna("").astype(str).str.strip()
+            name = name.mask(name == "", symbol)
+        frame["name"] = name
     frame = frame.sort_values(["exchange", "tradingsymbol"])
 
     if max_symbols:

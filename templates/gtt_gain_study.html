@@ -1,0 +1,602 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>GTT Gain Study</h2>
+      <p>Measures the highest daily price reached between every weekly BUY signal and its next weekly SELL signal across the latest Kite NSE instruments universe.</p>
+    </div>
+
+    <form action="/gtt-gain-study/run{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}" method="post" class="action-row">
+      <button class="button" type="submit">Run GTT Gain Study</button>
+      {% if workbook_exists %}
+        <a class="button secondary" href="/gtt-gain-study/report">Download Excel Report</a>
+      {% endif %}
+      <span>Uses daily Kite highs strictly between BUY date and SELL date.</span>
+    </form>
+
+    <form action="/gtt-gain-study" method="get" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      {% if open_buy_regime_only %}
+        <input type="hidden" name="open_buy_regime_only" value="1">
+      {% endif %}
+      {% if dashboard_buy_only %}
+        <input type="hidden" name="dashboard_buy_only" value="1">
+      {% endif %}
+      {% if fresh_weekly_buy_only %}
+        <input type="hidden" name="fresh_weekly_buy_only" value="1">
+      {% endif %}
+      {% if trend_only %}
+        <input type="hidden" name="trend_only" value="1">
+      {% endif %}
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company name">
+      </label>
+      <label>
+        Market Cap Bucket
+        <select name="market_cap_bucket">
+          <option value="">All</option>
+          {% for bucket in ["Large Cap", "Mid Cap", "Small Cap"] %}
+            <option value="{{ bucket }}" {% if selected_market_cap_bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Min Market Cap (₹ Cr)
+        <input type="number" name="min_market_cap_cr" value="{{ selected_min_market_cap }}" placeholder="Min">
+      </label>
+      <label>
+        Max Market Cap (₹ Cr)
+        <input type="number" name="max_market_cap_cr" value="{{ selected_max_market_cap }}" placeholder="Max">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply Screener Filters</button>
+        <a class="table-link" href="/gtt-gain-study{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+      </div>
+    </form>
+
+    <p class="filter-summary">Active GTT filters: {{ active_gtt_filter_summary }}</p>
+
+    {% if study_ran %}
+      <p class="success-note">GTT Gain Study completed. The latest Excel report is ready.</p>
+    {% endif %}
+
+    {% if study_error %}
+      <p class="warning-note">GTT Gain Study failed: {{ study_error }}</p>
+    {% endif %}
+
+    {% if gtt_filter_warning %}
+      <p class="warning-note">{{ gtt_filter_warning }}</p>
+    {% endif %}
+
+    {% if telegram_sent %}
+      <p class="success-note">GTT filtered stock list was sent to Telegram.</p>
+    {% endif %}
+
+    {% if telegram_error %}
+      <p class="warning-note">Telegram send failed: {{ telegram_error }}</p>
+    {% endif %}
+
+    {% if gtt_job %}
+      <div class="scan-progress" id="gtt-progress" data-job-id="{{ gtt_job }}">
+        <div class="scan-progress-header">
+          <strong id="gtt-progress-title">GTT Gain Study is running</strong>
+          <span id="gtt-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="gtt-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="gtt-progress-detail">Preparing the latest Kite NSE instruments universe...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if gtt_job %}
+    <script>
+      const gttProgressBox = document.getElementById("gtt-progress");
+      const gttProgressTitle = document.getElementById("gtt-progress-title");
+      const gttProgressPercent = document.getElementById("gtt-progress-percent");
+      const gttProgressFill = document.getElementById("gtt-progress-fill");
+      const gttProgressDetail = document.getElementById("gtt-progress-detail");
+
+      async function pollGttProgress() {
+        if (!gttProgressBox) return;
+        const jobId = gttProgressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            gttProgressTitle.textContent = "GTT status unavailable";
+            gttProgressDetail.textContent = status.error || "Could not find the GTT job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          gttProgressFill.style.width = `${percent}%`;
+          gttProgressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          gttProgressTitle.textContent = status.status === "queued" ? "GTT Gain Study queued" : "GTT Gain Study is running";
+          gttProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} stocks${current}`;
+
+          if (status.status === "completed") {
+            gttProgressTitle.textContent = "GTT Gain Study completed";
+            gttProgressFill.style.width = "100%";
+            gttProgressPercent.textContent = "100%";
+            gttProgressDetail.textContent = "Loading latest GTT results...";
+            window.location.href = status.redirect_url || "/gtt-gain-study";
+            return;
+          }
+
+          if (status.status === "failed") {
+            gttProgressTitle.textContent = "GTT Gain Study failed";
+            gttProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          gttProgressTitle.textContent = "Waiting for GTT Gain Study";
+          gttProgressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollGttProgress, 1000);
+      }
+
+      pollGttProgress();
+    </script>
+  {% endif %}
+
+  {% if summary %}
+    <section class="summary-grid">
+      <div class="metric">
+        <span>NSE symbols processed</span>
+        <strong>{{ summary.get("symbols_processed", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Closed pairs</span>
+        <strong>{{ summary.get("closed_pairs", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Valid daily pairs</span>
+        <strong>{{ summary.get("valid_pairs", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Median max gain</span>
+        <strong>{{ "%.2f"|format(summary.get("overall_median_max_gain_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Average max gain</span>
+        <strong>{{ "%.2f"|format(summary.get("overall_avg_max_gain_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Went above BUY</span>
+        <strong>{{ "%.2f"|format(summary.get("went_above_buy_price_rate_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Hit 10%</span>
+        <strong>{{ "%.2f"|format(summary.get("hit_10pct_rate_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Hit 20%</span>
+        <strong>{{ "%.2f"|format(summary.get("hit_20pct_rate_pct", 0)) }}%</strong>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Universe Audit</h2>
+        <p>
+          The Home screener and GTT page now use the same latest Kite NSE instruments list as the stock universe.
+          Only rows with a valid symbol and company name are included; cached symbols outside this list are ignored.
+        </p>
+      </div>
+
+      <section class="summary-grid audit-grid">
+        <div class="metric">
+          <span>Dashboard scanned symbols</span>
+          <strong>{{ universe_audit.get("dashboard_scanned_symbols", 0) }}</strong>
+        </div>
+        <div class="metric">
+          <span>Home filtered BUY symbols</span>
+          <strong>{{ universe_audit.get("home_filtered_buy_symbols", 0) }}</strong>
+        </div>
+        <div class="metric">
+          <span>Latest Kite NSE universe</span>
+          <strong>{{ universe_audit.get("latest_nse_universe_symbols", 0) }}</strong>
+        </div>
+        <div class="metric">
+          <span>GTT rows in latest universe</span>
+          <strong>{{ universe_audit.get("gtt_rows_in_latest_universe", 0) }}</strong>
+        </div>
+        <div class="metric">
+          <span>GTT open BUY regime</span>
+          <strong>{{ universe_audit.get("gtt_open_buy_regime_symbols", 0) }}</strong>
+        </div>
+        <div class="metric">
+          <span>GTT fresh weekly BUY</span>
+          <strong>{{ universe_audit.get("gtt_fresh_weekly_buy_symbols", 0) }}</strong>
+        </div>
+      </section>
+
+      <div class="audit-samples">
+        <div>
+          <h3>Ignored cached symbols outside Kite list</h3>
+          {% if universe_audit.get("excluded_cached_sample") %}
+            <p>{{ universe_audit.get("excluded_cached_sample")|join(", ") }}</p>
+          {% else %}
+            <p class="empty">No difference found.</p>
+          {% endif %}
+        </div>
+        <div>
+          <h3>Kite symbols missing saved GTT rows</h3>
+          {% if universe_audit.get("missing_gtt_rows_sample") %}
+            <p>{{ universe_audit.get("missing_gtt_rows_sample")|join(", ") }}</p>
+          {% else %}
+            <p class="empty">No difference found.</p>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Stock GTT Stats</h2>
+        <p>
+          Showing {{ stock_stats_count }} of {{ stock_stats_before_filter_count }} stocks after filters.
+          {% if open_buy_regime_only %} Filter: open BUY regime.{% endif %}
+          {% if dashboard_buy_only %} Filter: dashboard BUY signals only.{% endif %}
+          {% if fresh_weekly_buy_only %} Filter: fresh weekly BUY only.{% endif %}
+          {% if trend_only %} Filter: close is above 20W EMA and 20W EMA is above 50W EMA.{% endif %}
+          Low sample means fewer than 3 valid historical pairs.
+        </p>
+        <section class="summary-grid audit-grid">
+          <div class="metric">
+            <span>Stocks considered after all filters</span>
+            <strong>{{ stock_stats_count }}</strong>
+          </div>
+          <div class="metric">
+            <span>After screener filters</span>
+            <strong>{{ stock_stats_after_screener_filter_count }}</strong>
+          </div>
+          <div class="metric">
+            <span>Latest Kite NSE universe</span>
+            <strong>{{ universe_audit.get("latest_nse_universe_symbols", 0) }}</strong>
+          </div>
+        </section>
+        <form action="/gtt-gain-study" method="get" class="filter-form signal-quality-filters">
+          {% if dashboard_token %}
+            <input type="hidden" name="token" value="{{ dashboard_token }}">
+          {% endif %}
+          {% if stock_search %}
+            <input type="hidden" name="stock_search" value="{{ stock_search }}">
+          {% endif %}
+          {% if selected_market_cap_bucket %}
+            <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
+          {% endif %}
+          {% if selected_min_market_cap %}
+            <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
+          {% endif %}
+          {% if selected_max_market_cap %}
+            <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+          {% endif %}
+          <label class="checkbox-field">
+            <input type="checkbox" name="open_buy_regime_only" value="1" {% if open_buy_regime_only %}checked{% endif %}>
+            <span class="checkbox-copy">
+              <strong>Open BUY regime</strong>
+              <small>The latest historical BUY/SELL signal is BUY, even if the BUY was not generated this week.</small>
+            </span>
+          </label>
+          <label class="checkbox-field">
+            <input type="checkbox" name="dashboard_buy_only" value="1" {% if dashboard_buy_only %}checked{% endif %}>
+            <span class="checkbox-copy">
+              <strong>Dashboard BUY signals only</strong>
+              <small>Matches the Home screener BUY list from latest_filtered.csv.</small>
+            </span>
+          </label>
+          <label class="checkbox-field">
+            <input type="checkbox" name="fresh_weekly_buy_only" value="1" {% if fresh_weekly_buy_only %}checked{% endif %}>
+            <span class="checkbox-copy">
+              <strong>Fresh weekly BUY only</strong>
+              <small>Only stocks where the latest GTT weekly candle generated a BUY.</small>
+            </span>
+          </label>
+          <label class="checkbox-field">
+            <input type="checkbox" name="trend_only" value="1" {% if trend_only %}checked{% endif %}>
+            <span class="checkbox-copy">
+              <strong>Close &gt; 20W EMA and 20W EMA &gt; 50W EMA</strong>
+            </span>
+          </label>
+          <button class="button secondary" type="submit">Apply GTT Filters</button>
+        </form>
+      </div>
+
+      {% if stock_stats %}
+        <form action="/telegram/send-gtt-list" method="post" class="telegram-action">
+          {% if dashboard_token %}
+            <input type="hidden" name="token" value="{{ dashboard_token }}">
+          {% endif %}
+          <input type="hidden" name="stock_search" value="{{ stock_search }}">
+          <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
+          <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
+          <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+          {% if open_buy_regime_only %}
+            <input type="hidden" name="open_buy_regime_only" value="1">
+          {% endif %}
+          {% if dashboard_buy_only %}
+            <input type="hidden" name="dashboard_buy_only" value="1">
+          {% endif %}
+          {% if fresh_weekly_buy_only %}
+            <input type="hidden" name="fresh_weekly_buy_only" value="1">
+          {% endif %}
+          {% if trend_only %}
+            <input type="hidden" name="trend_only" value="1">
+          {% endif %}
+          <button class="button secondary" type="submit">Send GTT Filtered List To Telegram</button>
+          <span>{{ stock_stats_count }} stocks will be sent. Long lists include a short chat summary plus a CSV file.</span>
+        </form>
+
+        <div class="table-wrap signal-history">
+	          <table>
+	            <thead>
+	              <tr>
+	                <th>
+	                  <label class="table-checkbox">
+	                    <input type="checkbox" id="gtt-select-all-symbols" checked>
+	                    Include
+	                  </label>
+	                </th>
+	                <th>Symbol</th>
+                <th>Name</th>
+                <th>Closed Pairs</th>
+                <th>Valid Pairs</th>
+                <th>Low Sample</th>
+                <th>Went Above BUY %</th>
+                <th>Median Max Gain %</th>
+                <th>Avg Max Gain %</th>
+                <th>Best Max Gain %</th>
+                <th>Hit 5%</th>
+                <th>Hit 10%</th>
+                <th>Hit 15%</th>
+                <th>Hit 20%</th>
+                <th>Hit 25%</th>
+                <th>Hit 30%</th>
+                <th>Conservative GTT %</th>
+                <th>Moderate GTT %</th>
+              </tr>
+            </thead>
+	            <tbody>
+	              {% for row in stock_stats %}
+	                <tr>
+	                  <td>
+	                    <input class="gtt-symbol-checkbox" type="checkbox" value="{{ row.get("symbol", "") }}" checked>
+	                  </td>
+	                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("closed_pairs", "") }}</td>
+                  <td>{{ row.get("valid_pairs", "") }}</td>
+                  <td>{{ row.get("low_sample", "") }}</td>
+                  <td>{{ row.get("went_above_buy_price_rate_pct", "")|number }}</td>
+                  <td>{{ row.get("median_max_gain_pct", "")|number }}</td>
+                  <td>{{ row.get("avg_max_gain_pct", "")|number }}</td>
+                  <td>{{ row.get("best_max_gain_pct", "")|number }}</td>
+                  <td>{{ row.get("hit_5pct_rate_pct", "")|number }}</td>
+                  <td>{{ row.get("hit_10pct_rate_pct", "")|number }}</td>
+                  <td>{{ row.get("hit_15pct_rate_pct", "")|number }}</td>
+                  <td>{{ row.get("hit_20pct_rate_pct", "")|number }}</td>
+                  <td>{{ row.get("hit_25pct_rate_pct", "")|number }}</td>
+                  <td>{{ row.get("hit_30pct_rate_pct", "")|number }}</td>
+                  <td>{{ row.get("suggested_conservative_gtt_pct", "")|number }}</td>
+                  <td>{{ row.get("suggested_moderate_gtt_pct", "")|number }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="copy-symbols-panel">
+          <div class="copy-symbols-heading">
+	            <div>
+	              <h3>Filtered Symbols For TradingView</h3>
+	              <p><span id="gtt-selected-symbol-count">{{ stock_stats_count }}</span> selected from {{ stock_stats_count }} stocks currently passing the GTT filters.</p>
+	            </div>
+	            <div class="copy-symbols-actions">
+	              <button class="button secondary" type="button" id="gtt-check-all-symbols">Select All</button>
+	              <button class="button secondary" type="button" id="gtt-clear-all-symbols">Clear All</button>
+	              <button class="button secondary" type="button" data-copy-target="gtt-symbols-csv">Copy Symbols</button>
+	            </div>
+	          </div>
+          <textarea id="gtt-symbols-csv" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+        </div>
+      {% else %}
+        <p class="empty">No stock-level GTT rows are available yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Pair Details</h2>
+        <p>Every closed BUY-to-SELL pair with the highest daily high found strictly between the signal dates.</p>
+      </div>
+
+      {% if pair_details %}
+        <div class="table-wrap signal-history">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>BUY Date</th>
+                <th>BUY Close</th>
+                <th>SELL Date</th>
+                <th>SELL Close</th>
+                <th>Close Return %</th>
+                <th>Highest Daily High</th>
+                <th>Highest Date</th>
+                <th>Max Gain %</th>
+                <th>Hit 10%</th>
+                <th>Hit 20%</th>
+                <th>Valid</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in pair_details %}
+                <tr>
+                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("buy_date", "") }}</td>
+                  <td>{{ row.get("buy_close", "")|number }}</td>
+                  <td>{{ row.get("sell_date", "") }}</td>
+                  <td>{{ row.get("sell_close", "")|number }}</td>
+                  <td>{{ row.get("buy_to_sell_return_pct", "")|number }}</td>
+                  <td>{{ row.get("highest_price_between_buy_sell", "")|number }}</td>
+                  <td>{{ row.get("highest_price_date", "") }}</td>
+                  <td>{{ row.get("max_gain_pct", "")|number }}</td>
+                  <td>{{ row.get("hit_10pct", "") }}</td>
+                  <td>{{ row.get("hit_20pct", "") }}</td>
+                  <td>{{ row.get("valid_daily_window", "") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="empty">No pair-level rows are available yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Open BUY Positions</h2>
+        <p>Informational only. These rows are not included in historical closed-pair medians.</p>
+      </div>
+
+      {% if open_positions %}
+        <div class="table-wrap signal-history">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>BUY Date</th>
+                <th>BUY Close</th>
+                <th>Latest Date</th>
+                <th>Latest Close</th>
+                <th>Highest Since BUY</th>
+                <th>Highest Date</th>
+                <th>Open Max Gain %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in open_positions %}
+                <tr>
+                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("buy_date", "") }}</td>
+                  <td>{{ row.get("buy_close", "")|number }}</td>
+                  <td>{{ row.get("latest_date", "") }}</td>
+                  <td>{{ row.get("latest_close", "")|number }}</td>
+                  <td>{{ row.get("highest_price_since_buy", "")|number }}</td>
+                  <td>{{ row.get("highest_price_date", "") }}</td>
+                  <td>{{ row.get("open_max_gain_pct", "")|number }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="empty">No open BUY positions are available in the latest GTT study.</p>
+      {% endif %}
+    </section>
+  {% else %}
+    <section class="panel">
+      <p class="empty">No GTT Gain Study has been generated yet. Click Run GTT Gain Study.</p>
+    </section>
+  {% endif %}
+  <script>
+    const gttSymbolCheckboxes = Array.from(document.querySelectorAll(".gtt-symbol-checkbox"));
+    const gttSymbolsTextarea = document.getElementById("gtt-symbols-csv");
+    const gttSelectedCount = document.getElementById("gtt-selected-symbol-count");
+    const gttSelectAll = document.getElementById("gtt-select-all-symbols");
+    const gttCheckAll = document.getElementById("gtt-check-all-symbols");
+    const gttClearAll = document.getElementById("gtt-clear-all-symbols");
+
+    function updateGttSymbolsTextarea() {
+      if (!gttSymbolsTextarea) return;
+      const selectedSymbols = gttSymbolCheckboxes
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => String(checkbox.value || "").trim().toUpperCase())
+        .filter(Boolean);
+      gttSymbolsTextarea.value = Array.from(new Set(selectedSymbols)).join(",");
+      if (gttSelectedCount) {
+        gttSelectedCount.textContent = selectedSymbols.length;
+      }
+      if (gttSelectAll) {
+        gttSelectAll.checked = selectedSymbols.length === gttSymbolCheckboxes.length;
+        gttSelectAll.indeterminate = selectedSymbols.length > 0 && selectedSymbols.length < gttSymbolCheckboxes.length;
+      }
+    }
+
+    gttSymbolCheckboxes.forEach((checkbox) => {
+      checkbox.addEventListener("change", updateGttSymbolsTextarea);
+    });
+
+    if (gttSelectAll) {
+      gttSelectAll.addEventListener("change", () => {
+        gttSymbolCheckboxes.forEach((checkbox) => {
+          checkbox.checked = gttSelectAll.checked;
+        });
+        updateGttSymbolsTextarea();
+      });
+    }
+
+    if (gttCheckAll) {
+      gttCheckAll.addEventListener("click", () => {
+        gttSymbolCheckboxes.forEach((checkbox) => {
+          checkbox.checked = true;
+        });
+        updateGttSymbolsTextarea();
+      });
+    }
+
+    if (gttClearAll) {
+      gttClearAll.addEventListener("click", () => {
+        gttSymbolCheckboxes.forEach((checkbox) => {
+          checkbox.checked = false;
+        });
+        updateGttSymbolsTextarea();
+      });
+    }
+
+    updateGttSymbolsTextarea();
+
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const target = document.getElementById(button.dataset.copyTarget);
+        if (!target) return;
+        target.select();
+        target.setSelectionRange(0, target.value.length);
+        try {
+          await navigator.clipboard.writeText(target.value);
+          button.textContent = "Copied";
+          window.setTimeout(() => {
+            button.textContent = "Copy Symbols";
+          }, 1600);
+        } catch (error) {
+          document.execCommand("copy");
+          button.textContent = "Copied";
+          window.setTimeout(() => {
+            button.textContent = "Copy Symbols";
+          }, 1600);
+        }
+      });
+    });
+  </script>
+{% endblock %}

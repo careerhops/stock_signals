@@ -52,6 +52,35 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(universe["tradingsymbol"].tolist(), ["E2E-BE"])
         self.assertEqual(universe["symbol"].tolist(), ["E2E"])
 
+    def test_blank_kite_name_uses_symbol_as_display_name_without_dropping_symbol(self) -> None:
+        instruments = pd.DataFrame(
+            [
+                {
+                    "instrument_token": 1,
+                    "exchange": "NSE",
+                    "tradingsymbol": "VALID",
+                    "name": "",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                }
+            ]
+        )
+
+        universe = build_universe(
+            instruments,
+            {
+                "universe": {
+                    "mode": "nse_all",
+                    "instrument_types": ["EQ"],
+                    "restrict_to_metadata_symbols": False,
+                    "filters": {},
+                }
+            },
+        )
+
+        self.assertEqual(universe["tradingsymbol"].tolist(), ["VALID"])
+        self.assertEqual(universe["name"].tolist(), ["VALID"])
+
 
 if __name__ == "__main__":
     unittest.main()

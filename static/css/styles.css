@@ -330,6 +330,33 @@ th {
   z-index: 1;
 }
 
+th.sortable-header {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+th.sortable-header::after {
+  content: " ↕";
+  color: var(--muted);
+  font-size: 11px;
+}
+
+th.sortable-header[aria-sort="ascending"]::after {
+  content: " ↑";
+  color: var(--accent);
+}
+
+th.sortable-header[aria-sort="descending"]::after {
+  content: " ↓";
+  color: var(--accent);
+}
+
+th.sortable-header:focus {
+  outline: 2px solid #b8eadb;
+  outline-offset: -2px;
+}
+
 .sort-button {
   background: transparent;
   border: 0;
@@ -488,7 +515,7 @@ tbody tr:hover {
 }
 
 .checkbox-field {
-  align-items: center;
+  align-items: flex-start;
   color: var(--text);
   display: flex;
   flex-direction: row;
@@ -498,6 +525,104 @@ tbody tr:hover {
 }
 
 .checkbox-field input {
+  margin-top: 3px;
+  width: auto;
+}
+
+.checkbox-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.checkbox-copy strong {
+  color: var(--text);
+}
+
+.checkbox-copy small {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.audit-grid {
+  margin-bottom: 16px;
+}
+
+.audit-samples {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.audit-samples h3 {
+  color: var(--text);
+  font-size: 15px;
+  margin-bottom: 8px;
+}
+
+.audit-samples p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.copy-symbols-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  margin-top: 16px;
+  padding: 14px;
+}
+
+.copy-symbols-heading {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.copy-symbols-heading h3 {
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+
+.copy-symbols-heading p {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+}
+
+.copy-symbols-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.copy-symbols-panel textarea {
+  background: #ffffff;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--text);
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  min-height: 96px;
+  padding: 10px;
+  resize: vertical;
+  width: 100%;
+}
+
+.table-checkbox {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.gtt-symbol-checkbox,
+.table-checkbox input {
   width: auto;
 }
 

@@ -16,6 +16,8 @@
       <a href="/{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Dashboard</a>
       <a href="/stocks{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Stocks</a>
       <a href="/signal-qa{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Signal QA</a>
+      <a href="/backtest{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Backtest</a>
+      <a href="/gtt-gain-study{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">GTT Study</a>
       <a href="/big-bull-deals{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Big Bull Deals</a>
       <a href="/login{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Kite Login</a>
     </nav>
@@ -23,5 +25,6 @@
   <main class="page">
     {% block content %}{% endblock %}
   </main>
+  <script src="/static/js/table_sort.js"></script>
 </body>
 </html>

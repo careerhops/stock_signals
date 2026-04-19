@@ -26,7 +26,7 @@ universe:
   allow_symbols: []
   block_symbols: []
   restrict_to_metadata_symbols: true
-  metadata_file: "config/symbol_metadata.csv"
+  metadata_file: "data/instruments/symbol_metadata.csv"
   filters:
     industries: []
     min_market_cap_cr: null

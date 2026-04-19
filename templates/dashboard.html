@@ -53,7 +53,10 @@
     </form>
 
     {% if active_filter_summary %}
-      <p class="filter-summary">Active screener filters: {{ active_filter_summary }}</p>
+      <p class="filter-summary">
+        Active screener filters: {{ active_filter_summary }}
+        <a class="table-link" href="/gtt-gain-study{% if full_filter_query %}?{{ full_filter_query }}{% endif %}">Open GTT with these filters</a>
+      </p>
     {% endif %}
 
     {% if scan_job %}

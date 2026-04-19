@@ -133,6 +133,72 @@ def buy_signals_to_csv_bytes(filtered: pd.DataFrame) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
+def build_gtt_stock_list_message(
+    filtered: pd.DataFrame,
+    inline_limit: int | None = None,
+    filters_text: str = "",
+) -> str:
+    lines = [
+        "GTT Gain Study Filtered Stocks",
+        f"Total stocks: {len(filtered)}",
+    ]
+    if filters_text:
+        lines.append(f"Filters: {filters_text}")
+    lines.append("")
+
+    if filtered.empty:
+        lines.append("No GTT stocks match the selected filters.")
+        return "\n".join(lines)
+
+    display_frame = filtered.reset_index(drop=True)
+    if inline_limit is not None:
+        display_frame = display_frame.head(inline_limit)
+
+    for index, row in display_frame.iterrows():
+        symbol = row.get("symbol") or row.get("tradingsymbol") or ""
+        exchange = row.get("exchange") or "NSE"
+        stock_name = row.get("company_name") or row.get("name") or ""
+        valid_pairs = row.get("valid_pairs", "")
+        median_gain = row.get("median_max_gain_pct", "")
+        hit_10 = row.get("hit_10pct_rate_pct", "")
+        conservative = row.get("suggested_conservative_gtt_pct", "")
+        lines.append(
+            f"{index + 1}. {exchange}:{symbol} | {stock_name} | "
+            f"Valid pairs: {valid_pairs} | Median max gain: {median_gain}% | "
+            f"Hit 10%: {hit_10}% | Conservative GTT: {conservative}%"
+        )
+
+    if inline_limit is not None and len(filtered) > inline_limit:
+        lines.extend(["", f"Showing top {inline_limit}. Full list is attached as CSV."])
+
+    return "\n".join(lines)
+
+
+def gtt_stock_list_to_csv_bytes(filtered: pd.DataFrame) -> bytes:
+    export = pd.DataFrame()
+    export["exchange"] = filtered.get("exchange", "")
+    export["symbol"] = filtered.get("symbol", filtered.get("tradingsymbol", ""))
+    export["stock_name"] = filtered.get("company_name", filtered.get("name", ""))
+    export["market_cap_cr"] = filtered.get("market_cap_cr", "")
+    export["market_cap_bucket"] = filtered.get("market_cap_bucket", "")
+    export["latest_signal"] = filtered.get("latest_signal", "")
+    export["latest_signal_date"] = filtered.get("latest_signal_date", "")
+    export["latest_week_signal"] = filtered.get("latest_week_signal", "")
+    export["valid_pairs"] = filtered.get("valid_pairs", "")
+    export["median_max_gain_pct"] = filtered.get("median_max_gain_pct", "")
+    export["avg_max_gain_pct"] = filtered.get("avg_max_gain_pct", "")
+    export["best_max_gain_pct"] = filtered.get("best_max_gain_pct", "")
+    export["hit_10pct_rate_pct"] = filtered.get("hit_10pct_rate_pct", "")
+    export["hit_20pct_rate_pct"] = filtered.get("hit_20pct_rate_pct", "")
+    export["suggested_conservative_gtt_pct"] = filtered.get("suggested_conservative_gtt_pct", "")
+    export["suggested_moderate_gtt_pct"] = filtered.get("suggested_moderate_gtt_pct", "")
+
+    buffer = StringIO()
+    export = export.where(pd.notna(export), "NA")
+    export.to_csv(buffer, index=False)
+    return buffer.getvalue().encode("utf-8")
+
+
 def send_telegram_document(
     config: dict[str, Any],
     file_bytes: bytes,
@@ -189,6 +255,33 @@ def send_buy_signal_list_to_telegram(
             config,
             csv_bytes,
             "weekly_buy_signals.csv",
+            caption,
+            required=True,
+        )
+
+
+def send_gtt_stock_list_to_telegram(
+    config: dict[str, Any],
+    filtered: pd.DataFrame,
+    inline_limit: int = 10,
+    filters_text: str = "",
+) -> None:
+    message = build_gtt_stock_list_message(
+        filtered,
+        inline_limit=inline_limit if len(filtered) > inline_limit else None,
+        filters_text=filters_text,
+    )
+    send_telegram_message(config, message, required=True)
+
+    if len(filtered) > inline_limit:
+        csv_bytes = gtt_stock_list_to_csv_bytes(filtered)
+        caption = f"Full GTT filtered stock list: {len(filtered)} stocks"
+        if filters_text:
+            caption = f"{caption}\nFilters: {filters_text}"
+        send_telegram_document(
+            config,
+            csv_bytes,
+            "gtt_filtered_stocks.csv",
             caption,
             required=True,
         )
