@@ -160,12 +160,16 @@ def build_gtt_stock_list_message(
         stock_name = row.get("company_name") or row.get("name") or ""
         valid_pairs = row.get("valid_pairs", "")
         median_gain = row.get("median_max_gain_pct", "")
+        median_days_to_peak = row.get("median_days_to_peak", "")
+        peak_speed_bucket = row.get("peak_speed_bucket", "")
         hit_10 = row.get("hit_10pct_rate_pct", "")
         conservative = row.get("suggested_conservative_gtt_pct", "")
+        technical_rating = row.get("weekly_technical_rating_status", "")
         lines.append(
             f"{index + 1}. {exchange}:{symbol} | {stock_name} | "
             f"Valid pairs: {valid_pairs} | Median max gain: {median_gain}% | "
-            f"Hit 10%: {hit_10}% | Conservative GTT: {conservative}%"
+            f"Median days to peak: {median_days_to_peak} ({peak_speed_bucket}) | Weekly tech: {technical_rating} | Hit 10%: {hit_10}% | "
+            f"Conservative GTT: {conservative}%"
         )
 
     if inline_limit is not None and len(filtered) > inline_limit:
@@ -184,10 +188,17 @@ def gtt_stock_list_to_csv_bytes(filtered: pd.DataFrame) -> bytes:
     export["latest_signal"] = filtered.get("latest_signal", "")
     export["latest_signal_date"] = filtered.get("latest_signal_date", "")
     export["latest_week_signal"] = filtered.get("latest_week_signal", "")
+    export["weekly_technical_rating"] = filtered.get("weekly_technical_rating", "")
+    export["weekly_technical_rating_status"] = filtered.get("weekly_technical_rating_status", "")
+    export["volume_confirmation"] = filtered.get("volume_confirmation", "")
+    export["volume_confirmation_ratio"] = filtered.get("volume_confirmation_ratio", "")
     export["valid_pairs"] = filtered.get("valid_pairs", "")
     export["median_max_gain_pct"] = filtered.get("median_max_gain_pct", "")
     export["avg_max_gain_pct"] = filtered.get("avg_max_gain_pct", "")
     export["best_max_gain_pct"] = filtered.get("best_max_gain_pct", "")
+    export["median_days_to_peak"] = filtered.get("median_days_to_peak", "")
+    export["peak_speed_bucket"] = filtered.get("peak_speed_bucket", "")
+    export["avg_days_to_peak"] = filtered.get("avg_days_to_peak", "")
     export["hit_10pct_rate_pct"] = filtered.get("hit_10pct_rate_pct", "")
     export["hit_20pct_rate_pct"] = filtered.get("hit_20pct_rate_pct", "")
     export["suggested_conservative_gtt_pct"] = filtered.get("suggested_conservative_gtt_pct", "")

@@ -8,6 +8,7 @@ import pandas as pd
 
 from stock_screener.data.storage import Storage
 from stock_screener.resample import resample_daily_to_weekly
+from stock_screener.strategy.technical_ratings import latest_technical_rating
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
 from stock_screener.universe import build_universe
 
@@ -225,6 +226,7 @@ def max_gain_between_dates(
             "valid_daily_window": False,
             "highest_price_between_buy_sell": pd.NA,
             "highest_price_date": pd.NA,
+            "days_to_peak_from_buy": pd.NA,
             "max_gain_pct": pd.NA,
             "went_above_buy_price": pd.NA,
         }
@@ -235,17 +237,20 @@ def max_gain_between_dates(
             "valid_daily_window": False,
             "highest_price_between_buy_sell": pd.NA,
             "highest_price_date": pd.NA,
+            "days_to_peak_from_buy": pd.NA,
             "max_gain_pct": pd.NA,
             "went_above_buy_price": pd.NA,
         }
 
     max_index = highs.idxmax()
     highest_price = float(highs.loc[max_index])
+    highest_price_date = pd.Timestamp(window.loc[max_index, "date"])
     max_gain_pct = ((highest_price - buy_close) / buy_close) * 100
     return {
         "valid_daily_window": True,
         "highest_price_between_buy_sell": highest_price,
-        "highest_price_date": window.loc[max_index, "date"],
+        "highest_price_date": highest_price_date,
+        "days_to_peak_from_buy": int((highest_price_date - pd.Timestamp(buy_date)).days),
         "max_gain_pct": max_gain_pct,
         "went_above_buy_price": max_gain_pct > 0,
     }
@@ -255,11 +260,14 @@ def build_stock_gtt_stats(pair_details: pd.DataFrame, latest_context: pd.DataFra
     if pair_details.empty:
         return _merge_latest_context(_empty_stock_stats(), latest_context)
 
-    frame = pair_details.copy()
+    frame = _backfill_pair_days_to_peak(pair_details)
     frame["valid_daily_window"] = _truthy(frame.get("valid_daily_window", pd.Series(False, index=frame.index)))
     if "max_gain_pct" not in frame.columns:
         frame["max_gain_pct"] = pd.NA
     frame["max_gain_pct"] = pd.to_numeric(frame["max_gain_pct"], errors="coerce")
+    if "days_to_peak_from_buy" not in frame.columns:
+        frame["days_to_peak_from_buy"] = pd.NA
+    frame["days_to_peak_from_buy"] = pd.to_numeric(frame["days_to_peak_from_buy"], errors="coerce")
 
     rows: list[dict[str, Any]] = []
     for (exchange, symbol, name), group in frame.groupby(["exchange", "symbol", "name"], dropna=False):
@@ -267,6 +275,7 @@ def build_stock_gtt_stats(pair_details: pd.DataFrame, latest_context: pd.DataFra
         valid_pairs = len(valid)
         closed_pairs = len(group)
         max_gain = valid["max_gain_pct"]
+        days_to_peak = valid["days_to_peak_from_buy"].dropna()
         row = {
             "exchange": exchange,
             "symbol": symbol,
@@ -279,6 +288,9 @@ def build_stock_gtt_stats(pair_details: pd.DataFrame, latest_context: pd.DataFra
             "median_max_gain_pct": float(max_gain.median()) if valid_pairs else pd.NA,
             "avg_max_gain_pct": float(max_gain.mean()) if valid_pairs else pd.NA,
             "best_max_gain_pct": float(max_gain.max()) if valid_pairs else pd.NA,
+            "median_days_to_peak": float(days_to_peak.median()) if len(days_to_peak) else pd.NA,
+            "avg_days_to_peak": float(days_to_peak.mean()) if len(days_to_peak) else pd.NA,
+            "peak_speed_bucket": _peak_speed_bucket(float(days_to_peak.median()) if len(days_to_peak) else pd.NA),
             "low_sample": valid_pairs < 3,
             "suggested_conservative_gtt_pct": _suggested_target(max_gain, "conservative"),
             "suggested_moderate_gtt_pct": _suggested_target(max_gain, "moderate"),
@@ -350,12 +362,25 @@ def save_gtt_gain_outputs(result: GttGainStudyResult, output_dir: Path) -> dict[
 
 def load_gtt_gain_outputs(output_dir: Path) -> GttGainStudyResult:
     summary_frame = _read_csv(output_dir / "latest_summary.csv")
+    pair_details = _backfill_pair_days_to_peak(_read_csv(output_dir / "latest_pair_details.csv"))
+    stock_stats = _read_csv(output_dir / "latest_stock_gtt_stats.csv")
+    if not pair_details.empty:
+        latest_context = _context_columns_from_stock_stats(stock_stats) if not stock_stats.empty else None
+        stock_stats = build_stock_gtt_stats(pair_details, latest_context)
+    else:
+        stock_stats = _ensure_stock_stats_columns(stock_stats)
     return GttGainStudyResult(
         summary=summary_frame.iloc[0].to_dict() if not summary_frame.empty else {},
-        stock_stats=_read_csv(output_dir / "latest_stock_gtt_stats.csv"),
-        pair_details=_read_csv(output_dir / "latest_pair_details.csv"),
+        stock_stats=stock_stats,
+        pair_details=pair_details,
         open_positions=_read_csv(output_dir / "latest_open_positions.csv"),
     )
+
+
+def _context_columns_from_stock_stats(stock_stats: pd.DataFrame) -> pd.DataFrame:
+    metric_columns = set(_metric_columns())
+    columns = [column for column in stock_stats.columns if column not in metric_columns]
+    return stock_stats[columns].copy()
 
 
 def _open_position_row(daily: pd.DataFrame, active_buy: dict[str, Any]) -> dict[str, Any]:
@@ -400,10 +425,16 @@ def _latest_signal_context(strategy_output: pd.DataFrame, exchange: str, symbol:
             "close_above_ema20": False,
             "ema20_above_ema50": False,
             "trend_confirmation": False,
+            "volume_confirmation": False,
+            "volume_confirmation_ratio": pd.NA,
             "latest_week_signal": "NONE",
             "latest_signal": "NONE",
             "latest_signal_date": pd.NA,
             "is_latest_signal_buy": False,
+            "weekly_technical_rating": pd.NA,
+            "weekly_technical_rating_status": "NA",
+            "weekly_ma_rating": pd.NA,
+            "weekly_oscillator_rating": pd.NA,
         }
 
     frame = strategy_output.copy()
@@ -416,9 +447,11 @@ def _latest_signal_context(strategy_output: pd.DataFrame, exchange: str, symbol:
     latest_close = _float_or_na(latest.get("close"))
     ema_20 = _float_or_na(latest.get("ema_20"))
     ema_50 = _float_or_na(latest.get("ema_50"))
+    volume_confirmation_ratio = _float_or_na(latest.get("volume_confirmation_ratio"))
     close_above_ema20 = _is_number(latest_close) and _is_number(ema_20) and float(latest_close) > float(ema_20)
     ema20_above_ema50 = _is_number(ema_20) and _is_number(ema_50) and float(ema_20) > float(ema_50)
     latest_signal = str(latest_signal_row.get("signal", "NONE")) if latest_signal_row is not None else "NONE"
+    technical_rating = latest_technical_rating(frame)
 
     return {
         "exchange": exchange,
@@ -431,10 +464,16 @@ def _latest_signal_context(strategy_output: pd.DataFrame, exchange: str, symbol:
         "close_above_ema20": close_above_ema20,
         "ema20_above_ema50": ema20_above_ema50,
         "trend_confirmation": close_above_ema20 and ema20_above_ema50,
+        "volume_confirmation": bool(latest.get("volume_confirmation", False)),
+        "volume_confirmation_ratio": volume_confirmation_ratio,
         "latest_week_signal": str(latest.get("signal", "NONE")),
         "latest_signal": latest_signal,
         "latest_signal_date": latest_signal_row.get("date", pd.NA) if latest_signal_row is not None else pd.NA,
         "is_latest_signal_buy": latest_signal == "BUY",
+        "weekly_technical_rating": _float_or_na(technical_rating.get("rating")),
+        "weekly_technical_rating_status": str(technical_rating.get("rating_status", "NA")),
+        "weekly_ma_rating": _float_or_na(technical_rating.get("ma_rating")),
+        "weekly_oscillator_rating": _float_or_na(technical_rating.get("oscillator_rating")),
     }
 
 
@@ -455,11 +494,22 @@ def _merge_latest_context(stats: pd.DataFrame, latest_context: pd.DataFrame | No
         merged[column] = pd.to_numeric(merged.get(column), errors="coerce").fillna(0).astype(int)
     for column in _rate_columns():
         merged[column] = pd.to_numeric(merged.get(column), errors="coerce").fillna(0.0)
-    for column in ("median_max_gain_pct", "avg_max_gain_pct", "best_max_gain_pct"):
+    for column in ("median_max_gain_pct", "avg_max_gain_pct", "best_max_gain_pct", "median_days_to_peak", "avg_days_to_peak"):
         if column not in merged.columns:
             merged[column] = pd.NA
+    merged["peak_speed_bucket"] = merged.get("peak_speed_bucket", pd.Series(pd.NA, index=merged.index))
+    merged["peak_speed_bucket"] = merged.apply(
+        lambda row: row["peak_speed_bucket"]
+        if pd.notna(row.get("peak_speed_bucket"))
+        and str(row.get("peak_speed_bucket")).strip().upper() not in {"", "NA", "NAN", "NONE"}
+        else _peak_speed_bucket(row.get("median_days_to_peak")),
+        axis=1,
+    )
     merged["low_sample"] = pd.to_numeric(merged.get("valid_pairs"), errors="coerce").fillna(0).astype(int) < 3
     for column in ("suggested_conservative_gtt_pct", "suggested_moderate_gtt_pct"):
+        if column not in merged.columns:
+            merged[column] = pd.NA
+    for column in _stock_stats_columns():
         if column not in merged.columns:
             merged[column] = pd.NA
     return merged[_stock_stats_columns()]
@@ -485,10 +535,16 @@ def _stock_stats_columns() -> list[str]:
         "close_above_ema20",
         "ema20_above_ema50",
         "trend_confirmation",
+        "volume_confirmation",
+        "volume_confirmation_ratio",
         "latest_week_signal",
         "latest_signal",
         "latest_signal_date",
         "is_latest_signal_buy",
+        "weekly_technical_rating",
+        "weekly_technical_rating_status",
+        "weekly_ma_rating",
+        "weekly_oscillator_rating",
         "closed_pairs",
         "valid_pairs",
         "pairs_without_daily_window",
@@ -497,6 +553,9 @@ def _stock_stats_columns() -> list[str]:
         "median_max_gain_pct",
         "avg_max_gain_pct",
         "best_max_gain_pct",
+        "median_days_to_peak",
+        "avg_days_to_peak",
+        "peak_speed_bucket",
         "hit_5pct_count",
         "hit_5pct_rate_pct",
         "hit_10pct_count",
@@ -552,6 +611,9 @@ def _metric_columns() -> list[str]:
         "median_max_gain_pct",
         "avg_max_gain_pct",
         "best_max_gain_pct",
+        "median_days_to_peak",
+        "avg_days_to_peak",
+        "peak_speed_bucket",
         "hit_5pct_count",
         "hit_5pct_rate_pct",
         "hit_10pct_count",
@@ -583,7 +645,7 @@ def _threshold_flags(value: Any) -> dict[str, Any]:
 
 
 def _suggested_target(max_gain: pd.Series, style: str) -> float | pd.NA:
-    if len(max_gain.dropna()) < 3:
+    if len(max_gain.dropna()) < 1:
         return pd.NA
     if style == "conservative":
         value = float(max_gain.median())
@@ -626,6 +688,32 @@ def _read_csv(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _backfill_pair_days_to_peak(pair_details: pd.DataFrame) -> pd.DataFrame:
+    frame = pair_details.copy()
+    if frame.empty:
+        return frame
+
+    if "days_to_peak_from_buy" not in frame.columns:
+        frame["days_to_peak_from_buy"] = pd.NA
+
+    required_columns = {"buy_date", "highest_price_date"}
+    if not required_columns.issubset(frame.columns):
+        return frame
+
+    existing_days = pd.to_numeric(frame["days_to_peak_from_buy"], errors="coerce")
+    buy_dates = pd.to_datetime(frame["buy_date"], errors="coerce")
+    peak_dates = pd.to_datetime(frame["highest_price_date"], errors="coerce")
+    derived_days = (peak_dates - buy_dates).dt.days
+    can_backfill = existing_days.isna() & buy_dates.notna() & peak_dates.notna()
+    if "valid_daily_window" in frame.columns:
+        can_backfill = can_backfill & _truthy(frame["valid_daily_window"])
+    if "max_gain_pct" in frame.columns:
+        can_backfill = can_backfill & pd.to_numeric(frame["max_gain_pct"], errors="coerce").notna()
+
+    frame["days_to_peak_from_buy"] = existing_days.mask(can_backfill, derived_days)
+    return frame
+
+
 def _truthy(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
 
@@ -634,6 +722,23 @@ def _rate(mask: pd.Series) -> float:
     if len(mask) == 0:
         return 0
     return float(mask.mean() * 100)
+
+
+def _peak_speed_bucket(days_to_peak: Any) -> str:
+    days = pd.to_numeric(pd.Series([days_to_peak]), errors="coerce").iloc[0]
+    if pd.isna(days):
+        return "NA"
+    if days <= 30:
+        return "Within 30 days"
+    if days <= 60:
+        return "31-60 days"
+    if days <= 90:
+        return "61-90 days"
+    if days <= 180:
+        return "91-180 days"
+    if days <= 365:
+        return "181-365 days"
+    return "Over 1 year"
 
 
 def _empty_summary(exchange: str) -> dict[str, Any]:
@@ -654,6 +759,7 @@ def _empty_pair_details() -> pd.DataFrame:
             "valid_daily_window",
             "highest_price_between_buy_sell",
             "highest_price_date",
+            "days_to_peak_from_buy",
             "max_gain_pct",
             "went_above_buy_price",
             "hit_5pct",

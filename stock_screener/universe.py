@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from stock_screener.symbols import normalize_nse_symbol
+from stock_screener.symbols import has_nse_series_suffix, normalize_nse_symbol
 
 
 def _load_metadata(path: str | None) -> pd.DataFrame:
@@ -102,6 +102,7 @@ def build_universe(instruments: pd.DataFrame, config: dict[str, Any]) -> pd.Data
         exchanges = set(universe_cfg.get("exchanges", ["NSE", "BSE"]))
 
     instrument_types = set(universe_cfg.get("instrument_types", ["EQ"]))
+    exclude_series_suffixes = tuple(universe_cfg.get("exclude_series_suffixes", []) or [])
     allow_symbols = set(universe_cfg.get("allow_symbols", []) or [])
     block_symbols = set(universe_cfg.get("block_symbols", []) or [])
     max_symbols = universe_cfg.get("max_symbols")
@@ -121,6 +122,8 @@ def build_universe(instruments: pd.DataFrame, config: dict[str, Any]) -> pd.Data
     if "tradingsymbol" in frame.columns:
         frame["tradingsymbol"] = frame["tradingsymbol"].fillna("").astype(str).str.strip()
         frame = frame[frame["tradingsymbol"] != ""]
+        if exclude_series_suffixes:
+            frame = frame[~frame["tradingsymbol"].apply(lambda symbol: has_nse_series_suffix(symbol, exclude_series_suffixes))]
         frame = frame[~frame["tradingsymbol"].isin(block_symbols)]
         if allow_symbols:
             frame = frame[frame["tradingsymbol"].isin(allow_symbols)]

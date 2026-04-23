@@ -19,6 +19,13 @@ universe:
     - "NSE"
   instrument_types:
     - "EQ"
+  exclude_series_suffixes:
+    - "-BE"
+    - "-BZ"
+    - "-BL"
+    - "-BT"
+    - "-SM"
+    - "-ST"
   prefer_exchange: "NSE"
   include_bse_only: true
   deduplicate_by_isin: false
@@ -54,6 +61,10 @@ strategy:
   volume_confirmation_lookback: 20
   volume_confirmation_multiplier: 1.25
   pair_return_lookback_weeks: 104
+
+daily_signals:
+  enabled: true
+  max_signal_age_bars: 5
 
 filters:
   enabled: true

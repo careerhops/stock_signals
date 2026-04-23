@@ -12,7 +12,7 @@
       {% if workbook_exists %}
         <a class="button secondary" href="/gtt-gain-study/report">Download Excel Report</a>
       {% endif %}
-      <span>Uses daily Kite highs strictly between BUY date and SELL date.</span>
+      <span>Uses cached daily Kite highs strictly between BUY date and SELL date. This does not fetch fresh Kite OHLC.</span>
     </form>
 
     <form action="/gtt-gain-study" method="get" class="filter-panel">
@@ -28,8 +28,20 @@
       {% if fresh_weekly_buy_only %}
         <input type="hidden" name="fresh_weekly_buy_only" value="1">
       {% endif %}
+      {% if fresh_daily_buy_only %}
+        <input type="hidden" name="fresh_daily_buy_only" value="1">
+      {% endif %}
       {% if trend_only %}
         <input type="hidden" name="trend_only" value="1">
+      {% endif %}
+      {% if require_volume_confirmation %}
+        <input type="hidden" name="require_volume_confirmation" value="1">
+      {% endif %}
+      {% if selected_technical_rating_status %}
+        <input type="hidden" name="technical_rating_status" value="{{ selected_technical_rating_status }}">
+      {% endif %}
+      {% if selected_peak_speed_bucket %}
+        <input type="hidden" name="peak_speed_bucket" value="{{ selected_peak_speed_bucket }}">
       {% endif %}
       <label>
         Search stock
@@ -51,6 +63,14 @@
       <label>
         Max Market Cap (₹ Cr)
         <input type="number" name="max_market_cap_cr" value="{{ selected_max_market_cap }}" placeholder="Max">
+      </label>
+      <label>
+        Min CMP (₹)
+        <input type="number" step="0.05" name="min_cmp" value="{{ selected_min_cmp }}" placeholder="e.g. 100">
+      </label>
+      <label>
+        Max CMP (₹)
+        <input type="number" step="0.05" name="max_cmp" value="{{ selected_max_cmp }}" placeholder="e.g. 1000">
       </label>
       <div class="filter-actions">
         <button class="button secondary" type="submit">Apply Screener Filters</button>
@@ -255,13 +275,22 @@
           {% if open_buy_regime_only %} Filter: open BUY regime.{% endif %}
           {% if dashboard_buy_only %} Filter: dashboard BUY signals only.{% endif %}
           {% if fresh_weekly_buy_only %} Filter: fresh weekly BUY only.{% endif %}
+          {% if fresh_daily_buy_only %} Filter: fresh daily BUY only.{% endif %}
           {% if trend_only %} Filter: close is above 20W EMA and 20W EMA is above 50W EMA.{% endif %}
+          {% if require_volume_confirmation %} Filter: volume confirmed.{% endif %}
+          {% if selected_technical_rating_status %} Filter: weekly technical rating is {{ selected_technical_rating_status }}.{% endif %}
+          {% if selected_peak_speed_bucket %} Bucket: {{ selected_peak_speed_bucket }}.{% endif %}
           Low sample means fewer than 3 valid historical pairs.
+          Median Max Gain % is the median historical return from BUY close to the interim peak before SELL.
         </p>
         <section class="summary-grid audit-grid">
           <div class="metric">
             <span>Stocks considered after all filters</span>
             <strong>{{ stock_stats_count }}</strong>
+          </div>
+          <div class="metric">
+            <span>Before bucket selection</span>
+            <strong>{{ stock_stats_before_bucket_count }}</strong>
           </div>
           <div class="metric">
             <span>After screener filters</span>
@@ -288,6 +317,15 @@
           {% if selected_max_market_cap %}
             <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
           {% endif %}
+          {% if selected_min_cmp %}
+            <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+          {% endif %}
+          {% if selected_max_cmp %}
+            <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
+          {% endif %}
+          {% if selected_peak_speed_bucket %}
+            <input type="hidden" name="peak_speed_bucket" value="{{ selected_peak_speed_bucket }}">
+          {% endif %}
           <label class="checkbox-field">
             <input type="checkbox" name="open_buy_regime_only" value="1" {% if open_buy_regime_only %}checked{% endif %}>
             <span class="checkbox-copy">
@@ -310,14 +348,94 @@
             </span>
           </label>
           <label class="checkbox-field">
+            <input type="checkbox" name="fresh_daily_buy_only" value="1" {% if fresh_daily_buy_only %}checked{% endif %}>
+            <span class="checkbox-copy">
+              <strong>Fresh daily BUY only</strong>
+              <small>Only stocks present in the latest Daily BUY Signals list from latest_daily_filtered.csv.</small>
+            </span>
+          </label>
+          <label class="checkbox-field">
             <input type="checkbox" name="trend_only" value="1" {% if trend_only %}checked{% endif %}>
             <span class="checkbox-copy">
               <strong>Close &gt; 20W EMA and 20W EMA &gt; 50W EMA</strong>
             </span>
           </label>
+          <label class="checkbox-field">
+            <input type="checkbox" name="require_volume_confirmation" value="1" {% if require_volume_confirmation %}checked{% endif %}>
+            <span class="checkbox-copy">
+              <strong>Volume confirmed</strong>
+              <small>Latest weekly volume is above the configured average-volume threshold.</small>
+            </span>
+          </label>
+          <label>
+            Weekly technical rating
+            <select name="technical_rating_status">
+              <option value="">All</option>
+              {% for option in gtt_technical_rating_filters %}
+                <option value="{{ option }}" {% if selected_technical_rating_status == option %}selected{% endif %}>{{ option }}</option>
+              {% endfor %}
+            </select>
+          </label>
           <button class="button secondary" type="submit">Apply GTT Filters</button>
         </form>
       </div>
+
+      <section class="opportunity-map-panel">
+        <div class="panel-heading compact-heading">
+          <h3>GTT Peak Speed Buckets</h3>
+          <p>
+            Plots only the stocks that remain after applying Fresh weekly BUY only and the 20W/50W EMA trend filter.
+            Each bar is a median BUY-to-peak time bucket. Hover a bucket to see stock count, median hit rate, median max gain, and top symbols.
+          </p>
+        </div>
+        {% if gtt_opportunity_chart_html %}
+          {{ gtt_opportunity_chart_html | safe }}
+        {% else %}
+          <p class="empty">{{ gtt_opportunity_chart_message }}</p>
+        {% endif %}
+        <form action="/gtt-gain-study" method="get" class="filter-form bucket-filter-form">
+          {% if dashboard_token %}
+            <input type="hidden" name="token" value="{{ dashboard_token }}">
+          {% endif %}
+          <input type="hidden" name="stock_search" value="{{ stock_search }}">
+          <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
+          <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
+          <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+          <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+          <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
+          {% if open_buy_regime_only %}
+            <input type="hidden" name="open_buy_regime_only" value="1">
+          {% endif %}
+          {% if dashboard_buy_only %}
+            <input type="hidden" name="dashboard_buy_only" value="1">
+          {% endif %}
+          {% if fresh_weekly_buy_only %}
+            <input type="hidden" name="fresh_weekly_buy_only" value="1">
+          {% endif %}
+          {% if fresh_daily_buy_only %}
+            <input type="hidden" name="fresh_daily_buy_only" value="1">
+          {% endif %}
+          {% if trend_only %}
+            <input type="hidden" name="trend_only" value="1">
+          {% endif %}
+          {% if require_volume_confirmation %}
+            <input type="hidden" name="require_volume_confirmation" value="1">
+          {% endif %}
+          {% if selected_technical_rating_status %}
+            <input type="hidden" name="technical_rating_status" value="{{ selected_technical_rating_status }}">
+          {% endif %}
+          <label>
+            Show stocks from bucket
+            <select name="peak_speed_bucket">
+              <option value="">All buckets</option>
+              {% for bucket in gtt_peak_speed_buckets %}
+                <option value="{{ bucket }}" {% if selected_peak_speed_bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <button class="button secondary" type="submit">Show Bucket Stocks</button>
+        </form>
+      </section>
 
       {% if stock_stats %}
         <form action="/telegram/send-gtt-list" method="post" class="telegram-action">
@@ -328,6 +446,9 @@
           <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
           <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
           <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+          <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+          <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
+          <input type="hidden" name="peak_speed_bucket" value="{{ selected_peak_speed_bucket }}">
           {% if open_buy_regime_only %}
             <input type="hidden" name="open_buy_regime_only" value="1">
           {% endif %}
@@ -337,8 +458,17 @@
           {% if fresh_weekly_buy_only %}
             <input type="hidden" name="fresh_weekly_buy_only" value="1">
           {% endif %}
+          {% if fresh_daily_buy_only %}
+            <input type="hidden" name="fresh_daily_buy_only" value="1">
+          {% endif %}
           {% if trend_only %}
             <input type="hidden" name="trend_only" value="1">
+          {% endif %}
+          {% if require_volume_confirmation %}
+            <input type="hidden" name="require_volume_confirmation" value="1">
+          {% endif %}
+          {% if selected_technical_rating_status %}
+            <input type="hidden" name="technical_rating_status" value="{{ selected_technical_rating_status }}">
           {% endif %}
           <button class="button secondary" type="submit">Send GTT Filtered List To Telegram</button>
           <span>{{ stock_stats_count }} stocks will be sent. Long lists include a short chat summary plus a CSV file.</span>
@@ -347,22 +477,30 @@
         <div class="table-wrap signal-history">
 	          <table>
 	            <thead>
-	              <tr>
-	                <th>
-	                  <label class="table-checkbox">
-	                    <input type="checkbox" id="gtt-select-all-symbols" checked>
-	                    Include
-	                  </label>
-	                </th>
-	                <th>Symbol</th>
+              <tr>
+                <th>
+                  <label class="table-checkbox">
+                    <input type="checkbox" id="gtt-select-all-symbols" checked>
+                    Include
+                  </label>
+                </th>
+                <th>Symbol</th>
                 <th>Name</th>
+                <th>CMP</th>
                 <th>Closed Pairs</th>
                 <th>Valid Pairs</th>
                 <th>Low Sample</th>
+                <th>Volume Confirmed</th>
+                <th>Volume Ratio</th>
+                <th>Weekly Tech Score</th>
+                <th>Weekly Tech Rating</th>
                 <th>Went Above BUY %</th>
                 <th>Median Max Gain %</th>
                 <th>Avg Max Gain %</th>
                 <th>Best Max Gain %</th>
+                <th>Median Days To Peak</th>
+                <th>Peak Speed Bucket</th>
+                <th>Avg Days To Peak</th>
                 <th>Hit 5%</th>
                 <th>Hit 10%</th>
                 <th>Hit 15%</th>
@@ -373,21 +511,29 @@
                 <th>Moderate GTT %</th>
               </tr>
             </thead>
-	            <tbody>
-	              {% for row in stock_stats %}
-	                <tr>
-	                  <td>
-	                    <input class="gtt-symbol-checkbox" type="checkbox" value="{{ row.get("symbol", "") }}" checked>
-	                  </td>
-	                  <td>{{ row.get("symbol", "") }}</td>
+            <tbody>
+              {% for row in stock_stats %}
+                <tr>
+                  <td>
+                    <input class="gtt-symbol-checkbox" type="checkbox" value="{{ row.get("symbol", "") }}" checked>
+                  </td>
+                  <td>{{ row.get("symbol", "") }}</td>
                   <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("latest_close", "")|number }}</td>
                   <td>{{ row.get("closed_pairs", "") }}</td>
                   <td>{{ row.get("valid_pairs", "") }}</td>
                   <td>{{ row.get("low_sample", "") }}</td>
+                  <td>{{ row.get("volume_confirmation", "") }}</td>
+                  <td>{{ row.get("volume_confirmation_ratio", "")|number }}</td>
+                  <td>{{ row.get("weekly_technical_rating", "")|number }}</td>
+                  <td>{{ row.get("weekly_technical_rating_status", "") }}</td>
                   <td>{{ row.get("went_above_buy_price_rate_pct", "")|number }}</td>
                   <td>{{ row.get("median_max_gain_pct", "")|number }}</td>
                   <td>{{ row.get("avg_max_gain_pct", "")|number }}</td>
                   <td>{{ row.get("best_max_gain_pct", "")|number }}</td>
+                  <td>{{ row.get("median_days_to_peak", "")|number }}</td>
+                  <td>{{ row.get("peak_speed_bucket", "") }}</td>
+                  <td>{{ row.get("avg_days_to_peak", "")|number }}</td>
                   <td>{{ row.get("hit_5pct_rate_pct", "")|number }}</td>
                   <td>{{ row.get("hit_10pct_rate_pct", "")|number }}</td>
                   <td>{{ row.get("hit_15pct_rate_pct", "")|number }}</td>
@@ -420,101 +566,6 @@
       {% endif %}
     </section>
 
-    <section class="panel">
-      <div class="panel-heading">
-        <h2>Pair Details</h2>
-        <p>Every closed BUY-to-SELL pair with the highest daily high found strictly between the signal dates.</p>
-      </div>
-
-      {% if pair_details %}
-        <div class="table-wrap signal-history">
-          <table>
-            <thead>
-              <tr>
-                <th>Symbol</th>
-                <th>Name</th>
-                <th>BUY Date</th>
-                <th>BUY Close</th>
-                <th>SELL Date</th>
-                <th>SELL Close</th>
-                <th>Close Return %</th>
-                <th>Highest Daily High</th>
-                <th>Highest Date</th>
-                <th>Max Gain %</th>
-                <th>Hit 10%</th>
-                <th>Hit 20%</th>
-                <th>Valid</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for row in pair_details %}
-                <tr>
-                  <td>{{ row.get("symbol", "") }}</td>
-                  <td>{{ row.get("name", "") }}</td>
-                  <td>{{ row.get("buy_date", "") }}</td>
-                  <td>{{ row.get("buy_close", "")|number }}</td>
-                  <td>{{ row.get("sell_date", "") }}</td>
-                  <td>{{ row.get("sell_close", "")|number }}</td>
-                  <td>{{ row.get("buy_to_sell_return_pct", "")|number }}</td>
-                  <td>{{ row.get("highest_price_between_buy_sell", "")|number }}</td>
-                  <td>{{ row.get("highest_price_date", "") }}</td>
-                  <td>{{ row.get("max_gain_pct", "")|number }}</td>
-                  <td>{{ row.get("hit_10pct", "") }}</td>
-                  <td>{{ row.get("hit_20pct", "") }}</td>
-                  <td>{{ row.get("valid_daily_window", "") }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      {% else %}
-        <p class="empty">No pair-level rows are available yet.</p>
-      {% endif %}
-    </section>
-
-    <section class="panel">
-      <div class="panel-heading">
-        <h2>Open BUY Positions</h2>
-        <p>Informational only. These rows are not included in historical closed-pair medians.</p>
-      </div>
-
-      {% if open_positions %}
-        <div class="table-wrap signal-history">
-          <table>
-            <thead>
-              <tr>
-                <th>Symbol</th>
-                <th>Name</th>
-                <th>BUY Date</th>
-                <th>BUY Close</th>
-                <th>Latest Date</th>
-                <th>Latest Close</th>
-                <th>Highest Since BUY</th>
-                <th>Highest Date</th>
-                <th>Open Max Gain %</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for row in open_positions %}
-                <tr>
-                  <td>{{ row.get("symbol", "") }}</td>
-                  <td>{{ row.get("name", "") }}</td>
-                  <td>{{ row.get("buy_date", "") }}</td>
-                  <td>{{ row.get("buy_close", "")|number }}</td>
-                  <td>{{ row.get("latest_date", "") }}</td>
-                  <td>{{ row.get("latest_close", "")|number }}</td>
-                  <td>{{ row.get("highest_price_since_buy", "")|number }}</td>
-                  <td>{{ row.get("highest_price_date", "") }}</td>
-                  <td>{{ row.get("open_max_gain_pct", "")|number }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      {% else %}
-        <p class="empty">No open BUY positions are available in the latest GTT study.</p>
-      {% endif %}
-    </section>
   {% else %}
     <section class="panel">
       <p class="empty">No GTT Gain Study has been generated yet. Click Run GTT Gain Study.</p>

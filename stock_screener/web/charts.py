@@ -35,6 +35,23 @@ def _format_float(value: Any, decimals: int = 2, suffix: str = "") -> str:
     return f"{float(numeric):.{decimals}f}{suffix}"
 
 
+def _peak_speed_bucket(days_to_peak: Any) -> str:
+    days = pd.to_numeric(pd.Series([days_to_peak]), errors="coerce").iloc[0]
+    if pd.isna(days):
+        return "NA"
+    if days <= 30:
+        return "Within 30 days"
+    if days <= 60:
+        return "31-60 days"
+    if days <= 90:
+        return "61-90 days"
+    if days <= 180:
+        return "91-180 days"
+    if days <= 365:
+        return "181-365 days"
+    return "Over 1 year"
+
+
 def _buy_quality_text(row: pd.Series) -> str:
     return (
         "BUY"
@@ -314,6 +331,161 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
         "if (el) { requestAnimationFrame(() => { el.parentElement.scrollLeft = el.parentElement.scrollWidth; }); }"
         "</script>"
     )
+
+
+def build_gtt_opportunity_chart(stock_stats: pd.DataFrame, height: int = 540) -> str:
+    if stock_stats.empty:
+        return ""
+
+    frame = stock_stats.copy()
+    numeric_columns = [
+        "valid_pairs",
+        "hit_10pct_rate_pct",
+        "median_max_gain_pct",
+        "avg_max_gain_pct",
+        "best_max_gain_pct",
+        "median_days_to_peak",
+        "suggested_conservative_gtt_pct",
+        "suggested_moderate_gtt_pct",
+    ]
+    for column in numeric_columns:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame = frame[
+        frame["valid_pairs"].fillna(0).gt(0)
+        & frame["hit_10pct_rate_pct"].notna()
+        & frame["median_max_gain_pct"].notna()
+    ].copy()
+    if frame.empty:
+        return ""
+
+    median_gain_score = frame["median_max_gain_pct"].clip(lower=0, upper=50) / 50 * 100
+    sample_score = frame["valid_pairs"].clip(lower=0, upper=10) / 10 * 100
+    speed_score = (180 - frame["median_days_to_peak"].clip(lower=0, upper=180)) / 180 * 100
+    speed_score = speed_score.fillna(0)
+    frame["opportunity_score"] = (
+        frame["hit_10pct_rate_pct"].clip(lower=0, upper=100) * 0.4
+        + median_gain_score * 0.3
+        + sample_score * 0.2
+        + speed_score * 0.1
+    )
+    frame = frame.sort_values("opportunity_score", ascending=False).copy()
+    frame["peak_speed_bucket"] = frame.get("peak_speed_bucket", pd.Series("NA", index=frame.index))
+    frame["peak_speed_bucket"] = frame.apply(
+        lambda row: row["peak_speed_bucket"]
+        if pd.notna(row.get("peak_speed_bucket"))
+        and str(row.get("peak_speed_bucket")).strip().upper() not in {"", "NA", "NAN", "NONE"}
+        else _peak_speed_bucket(row.get("median_days_to_peak")),
+        axis=1,
+    )
+
+    bucket_colors = {
+        "Within 30 days": "#15866f",
+        "31-60 days": "#4f8ecf",
+        "61-90 days": "#d5a84b",
+        "91-180 days": "#c77d48",
+        "181-365 days": "#c65a62",
+        "Over 1 year": "#8a607d",
+        "NA": "#94a3b8",
+    }
+    bucket_order = ["Within 30 days", "31-60 days", "61-90 days", "91-180 days", "181-365 days", "Over 1 year", "NA"]
+    frame["peak_speed_bucket"] = frame["peak_speed_bucket"].where(
+        frame["peak_speed_bucket"].isin(bucket_order),
+        "NA",
+    )
+
+    bucket_rows: list[dict[str, Any]] = []
+    for bucket in bucket_order:
+        rows = frame[frame["peak_speed_bucket"] == bucket]
+        if rows.empty:
+            bucket_rows.append(
+                {
+                    "bucket": bucket,
+                    "stock_count": 0,
+                    "median_hit_10pct": pd.NA,
+                    "median_max_gain_pct": pd.NA,
+                    "median_days_to_peak": pd.NA,
+                    "median_valid_pairs": pd.NA,
+                    "top_symbols": "",
+                    "color": bucket_colors[bucket],
+                }
+            )
+            continue
+
+        top_symbols = rows.sort_values("opportunity_score", ascending=False).head(12)["symbol"].astype(str).tolist()
+        bucket_rows.append(
+            {
+                "bucket": bucket,
+                "stock_count": len(rows),
+                "median_hit_10pct": rows["hit_10pct_rate_pct"].median(),
+                "median_max_gain_pct": rows["median_max_gain_pct"].median(),
+                "median_days_to_peak": rows["median_days_to_peak"].median(),
+                "median_valid_pairs": rows["valid_pairs"].median(),
+                "top_symbols": ", ".join(top_symbols),
+                "color": bucket_colors[bucket],
+            }
+        )
+
+    bucket_frame = pd.DataFrame(bucket_rows)
+    customdata = [
+        [
+            _format_float(row.get("median_hit_10pct"), 2, "%"),
+            _format_float(row.get("median_max_gain_pct"), 2, "%"),
+            _format_float(row.get("median_days_to_peak"), 0),
+            _format_float(row.get("median_valid_pairs"), 1),
+            row.get("top_symbols") or "NA",
+        ]
+        for _, row in bucket_frame.iterrows()
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=bucket_frame["bucket"],
+            y=bucket_frame["stock_count"],
+            text=bucket_frame["stock_count"],
+            textposition="outside",
+            marker={"color": bucket_frame["color"], "line": {"color": "#ffffff", "width": 1.5}},
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Stocks: %{y}<br>"
+                "Median hit 10%: %{customdata[0]}<br>"
+                "Median max gain: %{customdata[1]}<br>"
+                "Median days to peak: %{customdata[2]}<br>"
+                "Median valid pairs: %{customdata[3]}<br>"
+                "Top symbols: %{customdata[4]}<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_layout(
+        title="GTT Peak Speed Buckets: Fresh Weekly BUY + EMA Trend",
+        xaxis_title="Median BUY-to-peak time bucket",
+        yaxis_title="Stocks in bucket",
+        hovermode="x",
+        height=height,
+        margin={"l": 58, "r": 28, "t": 82, "b": 86},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=False,
+    )
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor="rgba(217, 225, 234, 0.8)",
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor="rgba(217, 225, 234, 0.8)",
+        zeroline=False,
+        rangemode="tozero",
+    )
+
+    chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
+    return f'<div class="opportunity-chart-frame">{chart_html}</div>'
 
 
 def latest_signal_summary(strategy_output: pd.DataFrame) -> dict[str, Any]:

@@ -39,6 +39,7 @@ class UniverseTests(unittest.TestCase):
                 "universe": {
                     "mode": "nse_all",
                     "instrument_types": ["EQ"],
+                    "exclude_series_suffixes": [],
                     "restrict_to_metadata_symbols": True,
                     "metadata_file": str(metadata_path),
                     "filters": {
@@ -51,6 +52,51 @@ class UniverseTests(unittest.TestCase):
 
         self.assertEqual(universe["tradingsymbol"].tolist(), ["E2E-BE"])
         self.assertEqual(universe["symbol"].tolist(), ["E2E"])
+
+    def test_excludes_configured_nse_series_suffixes_for_mainboard_only_universe(self) -> None:
+        instruments = pd.DataFrame(
+            [
+                {
+                    "instrument_token": 1,
+                    "exchange": "NSE",
+                    "tradingsymbol": "ASLIND-SM",
+                    "name": "ASL INDUSTRIES",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 2,
+                    "exchange": "NSE",
+                    "tradingsymbol": "MANAV-ST",
+                    "name": "MANAV INFRA PROJECTS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 3,
+                    "exchange": "NSE",
+                    "tradingsymbol": "TCS",
+                    "name": "TATA CONSULTANCY SERV LT",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+            ]
+        )
+
+        universe = build_universe(
+            instruments,
+            {
+                "universe": {
+                    "mode": "nse_all",
+                    "instrument_types": ["EQ"],
+                    "exclude_series_suffixes": ["-BE", "-BZ", "-BL", "-BT", "-SM", "-ST"],
+                    "restrict_to_metadata_symbols": False,
+                    "filters": {},
+                }
+            },
+        )
+
+        self.assertEqual(universe["tradingsymbol"].tolist(), ["TCS"])
 
     def test_blank_kite_name_uses_symbol_as_display_name_without_dropping_symbol(self) -> None:
         instruments = pd.DataFrame(

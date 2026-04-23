@@ -4,10 +4,25 @@ import unittest
 
 import pandas as pd
 
-from stock_screener.web.main import _apply_signal_quality_filters
+from stock_screener.web.main import _apply_cmp_filters, _apply_signal_quality_filters
 
 
 class DashboardQualityFilterTests(unittest.TestCase):
+    def test_cmp_filter_applies_min_and_max_to_selected_price_column(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"symbol": "CHEAP", "close": 75.0, "latest_close": 75.0},
+                {"symbol": "PASS", "close": 500.0, "latest_close": 500.0},
+                {"symbol": "EXPENSIVE", "close": 1250.0, "latest_close": 1250.0},
+            ]
+        )
+
+        screener_filtered = _apply_cmp_filters(frame, 100.0, 1000.0, "close")
+        gtt_filtered = _apply_cmp_filters(frame, 100.0, 1000.0, "latest_close")
+
+        self.assertEqual(screener_filtered["symbol"].tolist(), ["PASS"])
+        self.assertEqual(gtt_filtered["symbol"].tolist(), ["PASS"])
+
     def test_quality_filters_require_volume_trend_and_return_threshold(self) -> None:
         signals = pd.DataFrame(
             [

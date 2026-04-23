@@ -29,18 +29,19 @@ from stock_screener.data.storage import Storage
 from stock_screener.data.supabase_store import SupabaseStore
 from stock_screener.gtt_gain_report import write_gtt_gain_workbook
 from stock_screener.gtt_gain_study import load_gtt_gain_outputs, run_gtt_gain_study, save_gtt_gain_outputs
-from stock_screener.jobs.daily_scan import run_daily_scan
+from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
 from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram, send_gtt_stock_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
 from stock_screener.signal_qa import build_signal_quality_report, strategy_rows_for_display
+from stock_screener.strategy.technical_ratings import latest_technical_rating
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
-from stock_screener.symbols import normalize_nse_symbol
+from stock_screener.symbols import has_nse_series_suffix, normalize_nse_symbol
 from stock_screener.universe import build_universe
 from stock_screener.jobs.large_deals import (
     default_last_7_days_range,
     fetch_and_store_current_large_deals,
 )
-from stock_screener.web.charts import build_signal_chart, latest_signal_summary
+from stock_screener.web.charts import build_gtt_opportunity_chart, build_signal_chart, latest_signal_summary
 
 
 app = FastAPI(title="NSE/BSE Investment Signal Screener")
@@ -66,6 +67,17 @@ templates.env.filters["number"] = _template_number
 SCAN_JOBS: dict[str, dict[str, Any]] = {}
 SCAN_JOBS_LOCK = Lock()
 
+GTT_PEAK_SPEED_BUCKETS = [
+    "Within 30 days",
+    "31-60 days",
+    "61-90 days",
+    "91-180 days",
+    "181-365 days",
+    "Over 1 year",
+    "NA",
+]
+GTT_TECHNICAL_RATING_FILTERS = ["Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell"]
+
 
 def _set_scan_job(job_id: str, **updates: Any) -> None:
     with SCAN_JOBS_LOCK:
@@ -76,6 +88,10 @@ def _set_scan_job(job_id: str, **updates: Any) -> None:
 def _get_scan_job(job_id: str) -> dict[str, Any]:
     with SCAN_JOBS_LOCK:
         return dict(SCAN_JOBS.get(job_id, {}))
+
+
+def _has_meaningful_text(series: pd.Series) -> pd.Series:
+    return ~series.astype(str).str.strip().str.upper().isin({"", "NA", "NAN", "NONE", "<NA>"})
 
 
 def _is_allowed(request: Request) -> bool:
@@ -190,6 +206,27 @@ def _apply_market_cap_filters(
     return filtered
 
 
+def _apply_cmp_filters(
+    frame: pd.DataFrame,
+    min_cmp: float | None,
+    max_cmp: float | None,
+    price_column: str = "close",
+) -> pd.DataFrame:
+    if frame.empty or (min_cmp is None and max_cmp is None):
+        return frame
+    if price_column not in frame.columns:
+        return frame.iloc[0:0].copy()
+
+    filtered = frame.copy()
+    prices = pd.to_numeric(filtered[price_column], errors="coerce")
+    if min_cmp is not None:
+        filtered = filtered[prices >= float(min_cmp)]
+        prices = pd.to_numeric(filtered[price_column], errors="coerce")
+    if max_cmp is not None:
+        filtered = filtered[prices <= float(max_cmp)]
+    return filtered
+
+
 def _truthy_series(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
 
@@ -278,6 +315,10 @@ def _apply_gtt_stock_filters(
     dashboard_buy_only: bool = False,
     dashboard_buy_symbols: set[str] | None = None,
     fresh_weekly_buy_only: bool = False,
+    fresh_daily_buy_only: bool = False,
+    fresh_daily_buy_symbols: set[str] | None = None,
+    require_volume_confirmation: bool = False,
+    technical_rating_status: str = "",
 ) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -296,6 +337,22 @@ def _apply_gtt_stock_filters(
             return filtered.iloc[0:0].copy()
         filtered = filtered[filtered["latest_week_signal"].astype(str).str.upper() == "BUY"]
 
+    if fresh_daily_buy_only:
+        filtered = _filter_by_symbols(filtered, fresh_daily_buy_symbols or set())
+
+    if require_volume_confirmation:
+        if "volume_confirmation" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        filtered = filtered[_truthy_series(filtered["volume_confirmation"])]
+
+    if technical_rating_status:
+        if "weekly_technical_rating_status" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        filtered = filtered[
+            filtered["weekly_technical_rating_status"].astype(str).str.strip().str.upper()
+            == technical_rating_status.upper()
+        ]
+
     if trend_only:
         required = {"close_above_ema20", "ema20_above_ema50"}
         if not required.issubset(filtered.columns):
@@ -308,6 +365,15 @@ def _apply_gtt_stock_filters(
     return filtered
 
 
+def _apply_peak_speed_bucket_filter(frame: pd.DataFrame, selected_bucket: str) -> pd.DataFrame:
+    selected_bucket = selected_bucket.strip()
+    if frame.empty or not selected_bucket:
+        return frame
+    if selected_bucket not in GTT_PEAK_SPEED_BUCKETS or "peak_speed_bucket" not in frame.columns:
+        return frame.iloc[0:0].copy()
+    return frame[frame["peak_speed_bucket"].astype(str) == selected_bucket].copy()
+
+
 def _gtt_filter_warning(
     frame: pd.DataFrame,
     open_buy_regime_only: bool,
@@ -315,6 +381,10 @@ def _gtt_filter_warning(
     dashboard_buy_only: bool = False,
     fresh_weekly_buy_only: bool = False,
     dashboard_buy_symbols: set[str] | None = None,
+    fresh_daily_buy_only: bool = False,
+    fresh_daily_buy_symbols: set[str] | None = None,
+    require_volume_confirmation: bool = False,
+    technical_rating_status: str = "",
 ) -> str:
     missing = []
     if open_buy_regime_only and "is_latest_signal_buy" not in frame.columns:
@@ -323,8 +393,20 @@ def _gtt_filter_warning(
         missing.append("fresh weekly BUY")
     if trend_only and not {"close_above_ema20", "ema20_above_ema50"}.issubset(frame.columns):
         missing.append("EMA trend")
+    if require_volume_confirmation and (
+        "volume_confirmation" not in frame.columns
+        or not frame["volume_confirmation"].notna().any()
+    ):
+        missing.append("volume confirmation")
     if dashboard_buy_only and not dashboard_buy_symbols:
         missing.append("dashboard BUY symbols")
+    if fresh_daily_buy_only and not fresh_daily_buy_symbols:
+        missing.append("daily BUY symbols")
+    if technical_rating_status and (
+        "weekly_technical_rating_status" not in frame.columns
+        or not _has_meaningful_text(frame["weekly_technical_rating_status"]).any()
+    ):
+        missing.append("weekly technical rating")
     if not missing:
         return ""
     return (
@@ -353,6 +435,15 @@ def _symbols_from_frame(frame: pd.DataFrame) -> set[str]:
 
 def _dashboard_buy_symbols(data_root: Path) -> set[str]:
     filtered = Storage(data_root).load_signals("latest_filtered.csv")
+    if filtered.empty:
+        return set()
+    if "signal" in filtered.columns:
+        filtered = filtered[filtered["signal"].astype(str).str.upper() == "BUY"]
+    return _symbols_from_frame(filtered)
+
+
+def _daily_buy_symbols(data_root: Path) -> set[str]:
+    filtered = Storage(data_root).load_signals("latest_daily_filtered.csv")
     if filtered.empty:
         return set()
     if "signal" in filtered.columns:
@@ -475,7 +566,113 @@ def _align_gtt_stock_stats_to_latest_universe(
     aligned["low_sample"] = aligned["low_sample"].map(
         lambda value: True if pd.isna(value) else str(value).strip().lower() in {"1", "true", "yes", "y"}
     )
+    if "peak_speed_bucket" not in aligned.columns:
+        aligned["peak_speed_bucket"] = pd.NA
+    aligned["peak_speed_bucket"] = aligned.apply(
+        lambda row: row["peak_speed_bucket"]
+        if pd.notna(row.get("peak_speed_bucket"))
+        and str(row.get("peak_speed_bucket")).strip().upper() not in {"", "NA", "NAN", "NONE"}
+        else _gtt_peak_speed_bucket(row.get("median_days_to_peak")),
+        axis=1,
+    )
     return aligned
+
+
+def _ensure_gtt_weekly_technical_ratings(
+    data_root: Path,
+    stock_stats: pd.DataFrame,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    if stock_stats.empty or "symbol" not in stock_stats.columns:
+        return stock_stats
+
+    required_columns = {
+        "weekly_technical_rating",
+        "weekly_technical_rating_status",
+        "weekly_ma_rating",
+        "weekly_oscillator_rating",
+    }
+    if required_columns.issubset(stock_stats.columns) and _has_meaningful_text(stock_stats["weekly_technical_rating_status"]).all():
+        return stock_stats
+
+    storage = Storage(data_root)
+    strategy_cfg = config.get("strategy", {})
+    weekly_anchor = strategy_cfg.get("weekly_anchor", "W-FRI")
+    use_completed_weeks_only = bool(strategy_cfg.get("use_completed_weeks_only", True))
+
+    ratings_rows: list[dict[str, Any]] = []
+    if required_columns.issubset(stock_stats.columns):
+        symbols_to_refresh = stock_stats.loc[
+            ~_has_meaningful_text(stock_stats["weekly_technical_rating_status"]),
+            ["exchange", "symbol"],
+        ].drop_duplicates()
+    else:
+        symbols_to_refresh = stock_stats[["exchange", "symbol"]].drop_duplicates()
+
+    unique_symbols = symbols_to_refresh
+    if unique_symbols.empty:
+        return stock_stats
+    for _, row in unique_symbols.iterrows():
+        exchange = str(row.get("exchange") or "NSE").upper()
+        symbol = str(row.get("symbol") or "").upper()
+        rating_row = {
+            "exchange": exchange,
+            "symbol": symbol,
+            "weekly_technical_rating": pd.NA,
+            "weekly_technical_rating_status": "NA",
+            "weekly_ma_rating": pd.NA,
+            "weekly_oscillator_rating": pd.NA,
+        }
+        if not symbol:
+            ratings_rows.append(rating_row)
+            continue
+        daily = storage.load_candles(exchange, symbol, "1D")
+        if daily.empty:
+            ratings_rows.append(rating_row)
+            continue
+        weekly = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
+        technical = latest_technical_rating(weekly)
+        rating_row.update(
+            {
+                "weekly_technical_rating": technical.get("rating", pd.NA),
+                "weekly_technical_rating_status": str(technical.get("rating_status", "NA")),
+                "weekly_ma_rating": technical.get("ma_rating", pd.NA),
+                "weekly_oscillator_rating": technical.get("oscillator_rating", pd.NA),
+            }
+        )
+        ratings_rows.append(rating_row)
+
+    ratings = pd.DataFrame(ratings_rows)
+    merged = stock_stats.merge(ratings, on=["exchange", "symbol"], how="left", suffixes=("", "_fresh"))
+    for column in required_columns:
+        fresh_column = f"{column}_fresh"
+        if column not in merged.columns:
+            merged[column] = pd.NA
+        if fresh_column in merged.columns:
+            merged[column] = merged[fresh_column].combine_first(merged[column])
+            merged = merged.drop(columns=[fresh_column], errors="ignore")
+
+    stock_stats_path = _latest_gtt_gain_paths(data_root)["stock_stats"]
+    if stock_stats_path.exists():
+        merged.to_csv(stock_stats_path, index=False)
+    return merged
+
+
+def _gtt_peak_speed_bucket(days_to_peak: Any) -> str:
+    days = pd.to_numeric(pd.Series([days_to_peak]), errors="coerce").iloc[0]
+    if pd.isna(days):
+        return "NA"
+    if days <= 30:
+        return "Within 30 days"
+    if days <= 60:
+        return "31-60 days"
+    if days <= 90:
+        return "61-90 days"
+    if days <= 180:
+        return "91-180 days"
+    if days <= 365:
+        return "181-365 days"
+    return "Over 1 year"
 
 
 def _gtt_cached_symbols(data_root: Path, exchange: str = "NSE") -> set[str]:
@@ -576,14 +773,19 @@ def _gtt_filter_query(
     market_cap_bucket: str = "",
     min_market_cap_cr: str = "",
     max_market_cap_cr: str = "",
+    min_cmp: str = "",
+    max_cmp: str = "",
     open_buy_regime_only: bool = False,
     dashboard_buy_only: bool = False,
     fresh_weekly_buy_only: bool = False,
+    fresh_daily_buy_only: bool = False,
     trend_only: bool = False,
     require_volume_confirmation: bool = False,
     require_screener_trend_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_pct: str = "",
+    peak_speed_bucket: str = "",
+    technical_rating_status: str = "",
 ) -> str:
     params = []
     if token:
@@ -596,12 +798,18 @@ def _gtt_filter_query(
         params.append(f"min_market_cap_cr={quote(min_market_cap_cr)}")
     if max_market_cap_cr:
         params.append(f"max_market_cap_cr={quote(max_market_cap_cr)}")
+    if min_cmp:
+        params.append(f"min_cmp={quote(min_cmp)}")
+    if max_cmp:
+        params.append(f"max_cmp={quote(max_cmp)}")
     if open_buy_regime_only:
         params.append("open_buy_regime_only=1")
     if dashboard_buy_only:
         params.append("dashboard_buy_only=1")
     if fresh_weekly_buy_only:
         params.append("fresh_weekly_buy_only=1")
+    if fresh_daily_buy_only:
+        params.append("fresh_daily_buy_only=1")
     if trend_only:
         params.append("trend_only=1")
     if require_volume_confirmation:
@@ -612,6 +820,10 @@ def _gtt_filter_query(
         params.append(f"return_metric={quote(return_metric)}")
     if min_pair_return_pct:
         params.append(f"min_pair_return_pct={quote(min_pair_return_pct)}")
+    if peak_speed_bucket:
+        params.append(f"peak_speed_bucket={quote(peak_speed_bucket)}")
+    if technical_rating_status:
+        params.append(f"technical_rating_status={quote(technical_rating_status)}")
     return "&".join(params)
 
 
@@ -620,14 +832,19 @@ def _gtt_filter_summary(
     market_cap_bucket: str,
     min_market_cap_text: str,
     max_market_cap_text: str,
+    min_cmp_text: str = "",
+    max_cmp_text: str = "",
     open_buy_regime_only: bool = False,
     dashboard_buy_only: bool = False,
     fresh_weekly_buy_only: bool = False,
+    fresh_daily_buy_only: bool = False,
     trend_only: bool = False,
     require_volume_confirmation: bool = False,
     require_screener_trend_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_text: str = "",
+    peak_speed_bucket: str = "",
+    technical_rating_status: str = "",
 ) -> str:
     filters = []
     if stock_search:
@@ -638,21 +855,31 @@ def _gtt_filter_summary(
         filters.append(f"Min market cap: {min_market_cap_text} Cr")
     if max_market_cap_text:
         filters.append(f"Max market cap: {max_market_cap_text} Cr")
+    if min_cmp_text:
+        filters.append(f"Min CMP: ₹{min_cmp_text}")
+    if max_cmp_text:
+        filters.append(f"Max CMP: ₹{max_cmp_text}")
     if open_buy_regime_only:
         filters.append("Open BUY regime")
     if dashboard_buy_only:
         filters.append("Dashboard BUY signals only")
     if fresh_weekly_buy_only:
         filters.append("Fresh weekly BUY only")
+    if fresh_daily_buy_only:
+        filters.append("Fresh daily BUY only")
     if trend_only:
         filters.append("Close > 20W EMA and 20W EMA > 50W EMA")
     if require_volume_confirmation:
-        filters.append("Home screener volume confirmation")
+        filters.append("Volume confirmed")
+    if technical_rating_status:
+        filters.append(f"Weekly technical rating: {technical_rating_status}")
     if require_screener_trend_confirmation:
         filters.append("Home screener trend confirmation")
     if min_pair_return_text:
         metric_label = "Home last completed BUY-SELL return" if return_metric == "last_1" else "Home median last 3 BUY-SELL returns"
         filters.append(f"{metric_label} >= {min_pair_return_text}%")
+    if peak_speed_bucket:
+        filters.append(f"Peak speed bucket: {peak_speed_bucket}")
     return "; ".join(filters) if filters else "None"
 
 
@@ -695,6 +922,8 @@ def _dashboard_link_suffix(request: Request) -> str:
         "market_cap_bucket",
         "min_market_cap_cr",
         "max_market_cap_cr",
+        "min_cmp",
+        "max_cmp",
         "require_volume_confirmation",
         "require_trend_confirmation",
         "return_metric",
@@ -712,6 +941,8 @@ def _dashboard_filter_query(
     market_cap_bucket: str = "",
     min_market_cap_cr: str = "",
     max_market_cap_cr: str = "",
+    min_cmp: str = "",
+    max_cmp: str = "",
     require_volume_confirmation: bool = False,
     require_trend_confirmation: bool = False,
     return_metric: str = "",
@@ -728,6 +959,10 @@ def _dashboard_filter_query(
         params.append(f"min_market_cap_cr={quote(min_market_cap_cr)}")
     if max_market_cap_cr:
         params.append(f"max_market_cap_cr={quote(max_market_cap_cr)}")
+    if min_cmp:
+        params.append(f"min_cmp={quote(min_cmp)}")
+    if max_cmp:
+        params.append(f"max_cmp={quote(max_cmp)}")
     if require_volume_confirmation:
         params.append("require_volume_confirmation=1")
     if require_trend_confirmation:
@@ -744,6 +979,8 @@ def _buy_signal_filter_summary(
     market_cap_bucket: str,
     min_market_cap_text: str,
     max_market_cap_text: str,
+    min_cmp_text: str = "",
+    max_cmp_text: str = "",
     require_volume_confirmation: bool = False,
     require_trend_confirmation: bool = False,
     return_metric: str = "",
@@ -758,6 +995,10 @@ def _buy_signal_filter_summary(
         filters.append(f"Min market cap: {min_market_cap_text} Cr")
     if max_market_cap_text:
         filters.append(f"Max market cap: {max_market_cap_text} Cr")
+    if min_cmp_text:
+        filters.append(f"Min CMP: ₹{min_cmp_text}")
+    if max_cmp_text:
+        filters.append(f"Max CMP: ₹{max_cmp_text}")
     if require_volume_confirmation:
         filters.append("Volume confirmation: Yes")
     if require_trend_confirmation:
@@ -804,6 +1045,8 @@ def _load_visible_buy_signals(
     min_market_cap: float | None,
     max_market_cap: float | None,
     market_cap_bucket: str,
+    min_cmp: float | None = None,
+    max_cmp: float | None = None,
     require_volume_confirmation: bool = False,
     require_trend_confirmation: bool = False,
     return_metric: str = "",
@@ -813,6 +1056,7 @@ def _load_visible_buy_signals(
     filtered = storage.load_signals("latest_filtered.csv")
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     filtered = _apply_market_cap_filters(filtered, min_market_cap, max_market_cap, market_cap_bucket)
+    filtered = _apply_cmp_filters(filtered, min_cmp, max_cmp, "close")
     filtered = _apply_stock_search(filtered, stock_search)
     filtered = _apply_signal_quality_filters(
         filtered,
@@ -843,15 +1087,23 @@ def _load_visible_gtt_stock_stats(
     min_market_cap: float | None,
     max_market_cap: float | None,
     market_cap_bucket: str,
+    min_cmp: float | None = None,
+    max_cmp: float | None = None,
     open_buy_regime_only: bool = False,
     dashboard_buy_only: bool = False,
     fresh_weekly_buy_only: bool = False,
+    fresh_daily_buy_only: bool = False,
     trend_only: bool = False,
+    peak_speed_bucket: str = "",
+    require_volume_confirmation: bool = False,
+    technical_rating_status: str = "",
 ) -> pd.DataFrame:
     latest = load_gtt_gain_outputs(_gtt_gain_dir(data_root))
     stock_stats = _align_gtt_stock_stats_to_latest_universe(data_root, latest.stock_stats, config)
+    stock_stats = _ensure_gtt_weekly_technical_ratings(data_root, stock_stats, config)
     stock_stats = _enrich_with_symbol_metadata(stock_stats, _combined_symbol_metadata(config, storage), "symbol")
     stock_stats = _apply_market_cap_filters(stock_stats, min_market_cap, max_market_cap, market_cap_bucket)
+    stock_stats = _apply_cmp_filters(stock_stats, min_cmp, max_cmp, "latest_close")
     stock_stats = _apply_stock_search(stock_stats, stock_search)
     stock_stats = _apply_gtt_stock_filters(
         stock_stats,
@@ -860,7 +1112,12 @@ def _load_visible_gtt_stock_stats(
         dashboard_buy_only,
         _dashboard_buy_symbols(data_root),
         fresh_weekly_buy_only,
+        fresh_daily_buy_only,
+        _daily_buy_symbols(data_root),
+        require_volume_confirmation,
+        technical_rating_status,
     )
+    stock_stats = _apply_peak_speed_bucket_filter(stock_stats, peak_speed_bucket)
 
     if stock_stats.empty:
         return stock_stats
@@ -949,6 +1206,7 @@ def _scan_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
         "/?"
         f"scan_ran=1&symbols_scanned={summary.get('symbols_scanned', 0)}"
         f"&filtered_matches={summary.get('filtered_matches', 0)}"
+        f"&refresh_mode={quote(str(summary.get('refresh_mode', 'kite_refresh')))}"
         f"{query_suffix}"
     )
 
@@ -1409,6 +1667,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     data_root = get_data_root(config)
     latest = load_gtt_gain_outputs(_gtt_gain_dir(data_root))
     latest_stock_stats = _align_gtt_stock_stats_to_latest_universe(data_root, latest.stock_stats, config)
+    latest_stock_stats = _ensure_gtt_weekly_technical_ratings(data_root, latest_stock_stats, config)
     latest_universe_symbols = _latest_kite_universe_symbols(data_root, config)
     metadata = _combined_symbol_metadata(config, Storage(data_root))
     latest_stock_stats = _enrich_with_symbol_metadata(latest_stock_stats, metadata, "symbol")
@@ -1416,19 +1675,31 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     selected_market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
     min_market_cap_text = request.query_params.get("min_market_cap_cr", "").strip()
     max_market_cap_text = request.query_params.get("max_market_cap_cr", "").strip()
+    min_cmp_text = request.query_params.get("min_cmp", "").strip()
+    max_cmp_text = request.query_params.get("max_cmp", "").strip()
     min_market_cap = _optional_float(min_market_cap_text)
     max_market_cap = _optional_float(max_market_cap_text)
+    min_cmp = _optional_float(min_cmp_text)
+    max_cmp = _optional_float(max_cmp_text)
     require_volume_confirmation = _request_bool(request, "require_volume_confirmation")
     require_screener_trend_confirmation = _request_bool(request, "require_trend_confirmation")
     selected_return_metric = request.query_params.get("return_metric", "median_3").strip() or "median_3"
     if selected_return_metric not in {"last_1", "median_3"}:
         selected_return_metric = "median_3"
     min_pair_return_text = request.query_params.get("min_pair_return_pct", "").strip()
+    selected_peak_speed_bucket = request.query_params.get("peak_speed_bucket", "").strip()
+    if selected_peak_speed_bucket not in GTT_PEAK_SPEED_BUCKETS:
+        selected_peak_speed_bucket = ""
+    selected_technical_rating_status = request.query_params.get("technical_rating_status", "").strip()
+    if selected_technical_rating_status not in GTT_TECHNICAL_RATING_FILTERS:
+        selected_technical_rating_status = ""
     open_buy_regime_only = _request_bool(request, "open_buy_regime_only") or _request_bool(request, "latest_buy_only")
     dashboard_buy_only = _request_bool(request, "dashboard_buy_only")
     fresh_weekly_buy_only = _request_bool(request, "fresh_weekly_buy_only")
+    fresh_daily_buy_only = _request_bool(request, "fresh_daily_buy_only")
     trend_only = _request_bool(request, "trend_only")
     dashboard_buy_symbols = _dashboard_buy_symbols(data_root)
+    fresh_daily_buy_symbols = _daily_buy_symbols(data_root)
     universe_audit = _build_gtt_universe_audit(data_root, latest_stock_stats, config)
     universe_pair_details = latest.pair_details
     universe_open_positions = latest.open_positions
@@ -1447,6 +1718,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         max_market_cap,
         selected_market_cap_bucket,
     )
+    stock_stats = _apply_cmp_filters(stock_stats, min_cmp, max_cmp, "latest_close")
     stock_stats = _apply_stock_search(stock_stats, stock_search)
     stock_stats_after_screener_filter_count = len(stock_stats)
     stock_stats_before_filter_count = len(stock_stats)
@@ -1457,6 +1729,10 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         dashboard_buy_only,
         fresh_weekly_buy_only,
         dashboard_buy_symbols,
+        fresh_daily_buy_only,
+        fresh_daily_buy_symbols,
+        require_volume_confirmation,
+        selected_technical_rating_status,
     )
     pair_details = universe_pair_details
     open_positions = universe_open_positions
@@ -1469,11 +1745,41 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         dashboard_buy_only,
         dashboard_buy_symbols,
         fresh_weekly_buy_only,
+        fresh_daily_buy_only,
+        fresh_daily_buy_symbols,
+        require_volume_confirmation,
+        selected_technical_rating_status,
     )
-    if open_buy_regime_only or dashboard_buy_only or fresh_weekly_buy_only or trend_only:
+    bucket_chart_stock_stats = stock_stats.copy()
+    stock_stats_before_bucket_count = len(bucket_chart_stock_stats)
+    stock_stats = _apply_peak_speed_bucket_filter(stock_stats, selected_peak_speed_bucket)
+    if (
+        open_buy_regime_only
+        or dashboard_buy_only
+        or fresh_weekly_buy_only
+        or fresh_daily_buy_only
+        or trend_only
+        or require_volume_confirmation
+        or selected_peak_speed_bucket
+        or selected_technical_rating_status
+        or min_cmp is not None
+        or max_cmp is not None
+    ):
         visible_symbols = set(stock_stats["symbol"].astype(str)) if "symbol" in stock_stats.columns else set()
         pair_details = _filter_by_symbols(pair_details, visible_symbols)
         open_positions = _filter_by_symbols(open_positions, visible_symbols)
+    gtt_opportunity_chart_html = ""
+    if fresh_weekly_buy_only and trend_only:
+        gtt_opportunity_chart_html = build_gtt_opportunity_chart(bucket_chart_stock_stats)
+        gtt_opportunity_chart_message = (
+            "No chartable stocks remain after the Fresh weekly BUY and EMA trend filters."
+            if not gtt_opportunity_chart_html
+            else ""
+        )
+    else:
+        gtt_opportunity_chart_message = (
+            "Apply Fresh weekly BUY only and Close > 20W EMA / 20W EMA > 50W EMA to plot the bucket chart."
+        )
     workbook_path = _latest_gtt_gain_paths(data_root)["workbook"]
     gtt_filter_query = _gtt_filter_query(
         token=request.query_params.get("token", ""),
@@ -1481,28 +1787,38 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         market_cap_bucket=selected_market_cap_bucket,
         min_market_cap_cr=min_market_cap_text,
         max_market_cap_cr=max_market_cap_text,
+        min_cmp=min_cmp_text,
+        max_cmp=max_cmp_text,
         open_buy_regime_only=open_buy_regime_only,
         dashboard_buy_only=dashboard_buy_only,
         fresh_weekly_buy_only=fresh_weekly_buy_only,
+        fresh_daily_buy_only=fresh_daily_buy_only,
         trend_only=trend_only,
         require_volume_confirmation=require_volume_confirmation,
         require_screener_trend_confirmation=require_screener_trend_confirmation,
         return_metric=selected_return_metric if min_pair_return_text else "",
         min_pair_return_pct=min_pair_return_text,
+        peak_speed_bucket=selected_peak_speed_bucket,
+        technical_rating_status=selected_technical_rating_status,
     )
     active_gtt_filter_summary = _gtt_filter_summary(
         stock_search,
         selected_market_cap_bucket,
         min_market_cap_text,
         max_market_cap_text,
+        min_cmp_text,
+        max_cmp_text,
         open_buy_regime_only,
         dashboard_buy_only,
         fresh_weekly_buy_only,
+        fresh_daily_buy_only,
         trend_only,
         require_volume_confirmation,
         require_screener_trend_confirmation,
         selected_return_metric,
         min_pair_return_text,
+        selected_peak_speed_bucket,
+        selected_technical_rating_status,
     )
 
     return templates.TemplateResponse(
@@ -1514,12 +1830,20 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "summary": display_summary,
             "stock_stats": _records(stock_stats),
             "stock_symbols_csv": _comma_separated_symbols(stock_stats),
+            "gtt_peak_speed_buckets": GTT_PEAK_SPEED_BUCKETS,
+            "selected_peak_speed_bucket": selected_peak_speed_bucket,
+            "selected_technical_rating_status": selected_technical_rating_status,
+            "gtt_technical_rating_filters": GTT_TECHNICAL_RATING_FILTERS,
+            "stock_stats_before_bucket_count": stock_stats_before_bucket_count,
+            "gtt_opportunity_chart_html": gtt_opportunity_chart_html,
+            "gtt_opportunity_chart_message": gtt_opportunity_chart_message,
             "pair_details": _records(pair_details.head(150)),
             "open_positions": _records(open_positions.head(100)),
             "stock_search": stock_search,
             "open_buy_regime_only": open_buy_regime_only,
             "dashboard_buy_only": dashboard_buy_only,
             "fresh_weekly_buy_only": fresh_weekly_buy_only,
+            "fresh_daily_buy_only": fresh_daily_buy_only,
             "trend_only": trend_only,
             "stock_stats_count": len(stock_stats),
             "stock_stats_before_filter_count": stock_stats_before_filter_count,
@@ -1527,6 +1851,8 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "selected_market_cap_bucket": selected_market_cap_bucket,
             "selected_min_market_cap": min_market_cap_text,
             "selected_max_market_cap": max_market_cap_text,
+            "selected_min_cmp": min_cmp_text,
+            "selected_max_cmp": max_cmp_text,
             "require_volume_confirmation": require_volume_confirmation,
             "require_screener_trend_confirmation": require_screener_trend_confirmation,
             "selected_return_metric": selected_return_metric,
@@ -1568,9 +1894,14 @@ def run_gtt_gain_study_from_dashboard(request: Request, background_tasks: Backgr
 @app.get("/gtt-gain-study/report")
 def download_gtt_gain_study_report() -> FileResponse:
     config = load_config()
-    workbook_path = _latest_gtt_gain_paths(get_data_root(config))["workbook"]
-    if not workbook_path.exists():
+    data_root = get_data_root(config)
+    gtt_dir = _gtt_gain_dir(data_root)
+    workbook_path = _latest_gtt_gain_paths(data_root)["workbook"]
+    result = load_gtt_gain_outputs(gtt_dir)
+    if result.stock_stats.empty and result.pair_details.empty and not workbook_path.exists():
         raise HTTPException(status_code=404, detail="GTT gain study report has not been generated yet.")
+    if not result.stock_stats.empty or not result.pair_details.empty:
+        write_gtt_gain_workbook(result, workbook_path)
     return FileResponse(
         workbook_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1593,12 +1924,16 @@ def dashboard(request: Request) -> HTMLResponse:
     _ensure_market_cap_metadata(config, storage)
     filtered = storage.load_signals("latest_filtered.csv")
     raw = storage.load_signals("latest_raw_signals.csv")
+    daily_filtered = storage.load_signals("latest_daily_filtered.csv")
+    daily_raw = storage.load_signals("latest_daily_raw_signals.csv")
     scan_details = storage.load_signals("latest_scan_details.csv")
     metadata = _combined_symbol_metadata(config, storage)
     stock_search = request.query_params.get("stock_search", "").strip()
     selected_market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
     min_market_cap = _request_float(request, "min_market_cap_cr")
     max_market_cap = _request_float(request, "max_market_cap_cr")
+    min_cmp = _request_float(request, "min_cmp")
+    max_cmp = _request_float(request, "max_cmp")
     require_volume_confirmation = _request_bool(request, "require_volume_confirmation")
     require_trend_confirmation = _request_bool(request, "require_trend_confirmation")
     selected_return_metric = request.query_params.get("return_metric", "median_3").strip() or "median_3"
@@ -1615,6 +1950,10 @@ def dashboard(request: Request) -> HTMLResponse:
         active_filter_parts.append(f"Min market cap: {request.query_params.get('min_market_cap_cr')} Cr")
     if max_market_cap is not None:
         active_filter_parts.append(f"Max market cap: {request.query_params.get('max_market_cap_cr')} Cr")
+    if min_cmp is not None:
+        active_filter_parts.append(f"Min CMP: ₹{request.query_params.get('min_cmp')}")
+    if max_cmp is not None:
+        active_filter_parts.append(f"Max CMP: ₹{request.query_params.get('max_cmp')}")
     if require_volume_confirmation:
         active_filter_parts.append("Volume confirmed")
     if require_trend_confirmation:
@@ -1625,14 +1964,25 @@ def dashboard(request: Request) -> HTMLResponse:
 
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     raw = _enrich_with_symbol_metadata(raw, metadata, "symbol")
+    daily_filtered = _enrich_with_symbol_metadata(daily_filtered, metadata, "symbol")
+    daily_raw = _enrich_with_symbol_metadata(daily_raw, metadata, "symbol")
     scan_details = _enrich_with_symbol_metadata(scan_details, metadata, "symbol")
 
     filtered = _apply_market_cap_filters(filtered, min_market_cap, max_market_cap, selected_market_cap_bucket)
     raw = _apply_market_cap_filters(raw, min_market_cap, max_market_cap, selected_market_cap_bucket)
+    daily_filtered = _apply_market_cap_filters(daily_filtered, min_market_cap, max_market_cap, selected_market_cap_bucket)
+    daily_raw = _apply_market_cap_filters(daily_raw, min_market_cap, max_market_cap, selected_market_cap_bucket)
     scan_details = _apply_market_cap_filters(scan_details, min_market_cap, max_market_cap, selected_market_cap_bucket)
+
+    filtered = _apply_cmp_filters(filtered, min_cmp, max_cmp, "close")
+    raw = _apply_cmp_filters(raw, min_cmp, max_cmp, "close")
+    daily_filtered = _apply_cmp_filters(daily_filtered, min_cmp, max_cmp, "close")
+    daily_raw = _apply_cmp_filters(daily_raw, min_cmp, max_cmp, "close")
 
     filtered = _apply_stock_search(filtered, stock_search)
     raw = _apply_stock_search(raw, stock_search)
+    daily_filtered = _apply_stock_search(daily_filtered, stock_search)
+    daily_raw = _apply_stock_search(daily_raw, stock_search)
     scan_details = _apply_stock_search(scan_details, stock_search)
 
     signal_quality_warning = _signal_quality_filter_warning(
@@ -1650,6 +2000,7 @@ def dashboard(request: Request) -> HTMLResponse:
     )
     large_deals = _load_big_bull_deals(data_root)
     filtered = _apply_large_deal_markers(filtered, large_deals)
+    daily_filtered = _apply_large_deal_markers(daily_filtered, large_deals)
 
     market_cap_bounds = {"min": "", "max": ""}
     if not metadata.empty and "market_cap_cr" in metadata.columns and metadata["market_cap_cr"].notna().any():
@@ -1694,6 +2045,7 @@ def dashboard(request: Request) -> HTMLResponse:
     chart_html = ""
     chart_message = "Choose filters and run the weekly BUY screener to load charts."
     latest_summary = {"signal": "NONE", "date": "", "close": ""}
+    latest_daily_summary = {"signal": "NONE", "date": "", "close": ""}
 
     if selected_exchange and selected_symbol:
         daily = storage.load_candles(selected_exchange, selected_symbol, "1D")
@@ -1712,11 +2064,23 @@ def dashboard(request: Request) -> HTMLResponse:
             strategy_output = run_weekly_buy_sell(strategy_input, config)
             chart_html = build_signal_chart(strategy_output, selected_exchange, selected_symbol, height=620)
             latest_summary = latest_signal_summary(strategy_output)
+            daily_strategy_output = run_weekly_buy_sell(daily, daily_signal_config(config))
+            latest_daily_summary = latest_signal_summary(daily_strategy_output)
 
     raw_table = raw.copy()
     if not raw_table.empty:
         raw_table["date"] = raw_table["date"].astype(str)
         raw_table = raw_table.sort_values("date", ascending=False)
+
+    daily_filtered_table = daily_filtered.copy()
+    if not daily_filtered_table.empty:
+        daily_filtered_table["date"] = daily_filtered_table["date"].astype(str)
+        daily_filtered_table = daily_filtered_table.sort_values("date", ascending=False)
+
+    daily_raw_table = daily_raw.copy()
+    if not daily_raw_table.empty:
+        daily_raw_table["date"] = daily_raw_table["date"].astype(str)
+        daily_raw_table = daily_raw_table.sort_values("date", ascending=False)
 
     return templates.TemplateResponse(
         "dashboard.html",
@@ -1726,6 +2090,9 @@ def dashboard(request: Request) -> HTMLResponse:
             "filtered": _records(filtered),
             "raw_count": len(raw),
             "filtered_count": len(filtered),
+            "daily_filtered": _records(daily_filtered_table),
+            "daily_raw_count": len(daily_raw),
+            "daily_filtered_count": len(daily_filtered),
             "token_status": token_status(data_root),
             "scan_details": _records(scan_details),
             "scan_details_count": len(scan_details),
@@ -1736,12 +2103,16 @@ def dashboard(request: Request) -> HTMLResponse:
             "selected_symbol": selected_symbol or "",
             "stock_search": stock_search,
             "latest_summary": latest_summary,
+            "latest_daily_summary": latest_daily_summary,
             "chart_html": chart_html,
             "chart_message": chart_message,
             "all_signals": _records(raw_table),
+            "all_daily_signals": _records(daily_raw_table),
             "selected_market_cap_bucket": selected_market_cap_bucket,
             "selected_min_market_cap": request.query_params.get("min_market_cap_cr", ""),
             "selected_max_market_cap": request.query_params.get("max_market_cap_cr", ""),
+            "selected_min_cmp": request.query_params.get("min_cmp", ""),
+            "selected_max_cmp": request.query_params.get("max_cmp", ""),
             "require_volume_confirmation": require_volume_confirmation,
             "require_trend_confirmation": require_trend_confirmation,
             "selected_return_metric": selected_return_metric,
@@ -1753,6 +2124,8 @@ def dashboard(request: Request) -> HTMLResponse:
                 market_cap_bucket=selected_market_cap_bucket,
                 min_market_cap_cr=request.query_params.get("min_market_cap_cr", ""),
                 max_market_cap_cr=request.query_params.get("max_market_cap_cr", ""),
+                min_cmp=request.query_params.get("min_cmp", ""),
+                max_cmp=request.query_params.get("max_cmp", ""),
             ),
             "full_filter_query": _dashboard_filter_query(
                 token=request.query_params.get("token", ""),
@@ -1760,6 +2133,8 @@ def dashboard(request: Request) -> HTMLResponse:
                 market_cap_bucket=selected_market_cap_bucket,
                 min_market_cap_cr=request.query_params.get("min_market_cap_cr", ""),
                 max_market_cap_cr=request.query_params.get("max_market_cap_cr", ""),
+                min_cmp=request.query_params.get("min_cmp", ""),
+                max_cmp=request.query_params.get("max_cmp", ""),
                 require_volume_confirmation=require_volume_confirmation,
                 require_trend_confirmation=require_trend_confirmation,
                 return_metric=selected_return_metric if request.query_params.get("min_pair_return_pct", "") else "",
@@ -1773,6 +2148,7 @@ def dashboard(request: Request) -> HTMLResponse:
             "telegram_sent": request.query_params.get("telegram_sent", ""),
             "telegram_error": request.query_params.get("telegram_error", ""),
             "symbols_scanned": request.query_params.get("symbols_scanned", ""),
+            "refresh_mode": request.query_params.get("refresh_mode", ""),
             "active_filter_summary": " · ".join(active_filter_parts),
         },
     )
@@ -1799,9 +2175,12 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
     market_cap_bucket = str(form.get("market_cap_bucket", "")).strip()
     min_market_cap_text = str(form.get("min_market_cap_cr", "")).strip()
     max_market_cap_text = str(form.get("max_market_cap_cr", "")).strip()
+    min_cmp_text = str(form.get("min_cmp", "")).strip()
+    max_cmp_text = str(form.get("max_cmp", "")).strip()
     min_market_cap = _optional_float(min_market_cap_text)
     max_market_cap = _optional_float(max_market_cap_text)
     market_cap_filter_requested = bool(market_cap_bucket or min_market_cap_text or max_market_cap_text)
+    refresh_data = str(form.get("refresh_data", "0")).strip().lower() in {"1", "true", "on", "yes"}
 
     params = []
     if dashboard_token:
@@ -1814,6 +2193,10 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
         params.append(f"min_market_cap_cr={quote(min_market_cap_text)}")
     if max_market_cap_text:
         params.append(f"max_market_cap_cr={quote(max_market_cap_text)}")
+    if min_cmp_text:
+        params.append(f"min_cmp={quote(min_cmp_text)}")
+    if max_cmp_text:
+        params.append(f"max_cmp={quote(max_cmp_text)}")
     query_suffix = ("&" + "&".join(params)) if params else ""
 
     try:
@@ -1831,6 +2214,7 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
             market_cap_bucket,
             stock_search,
         )
+        scan_config.setdefault("data", {})["skip_kite_fetch"] = not refresh_data
         job_id = uuid4().hex
         _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
         background_tasks.add_task(_run_screener_job, job_id, scan_config, query_suffix)
@@ -1853,6 +2237,8 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
     market_cap_bucket = str(form.get("market_cap_bucket", "")).strip()
     min_market_cap_text = str(form.get("min_market_cap_cr", "")).strip()
     max_market_cap_text = str(form.get("max_market_cap_cr", "")).strip()
+    min_cmp_text = str(form.get("min_cmp", "")).strip()
+    max_cmp_text = str(form.get("max_cmp", "")).strip()
     require_volume_confirmation = str(form.get("require_volume_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
     require_trend_confirmation = str(form.get("require_trend_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
     return_metric = str(form.get("return_metric", "median_3")).strip() or "median_3"
@@ -1861,6 +2247,8 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
     min_pair_return_text = str(form.get("min_pair_return_pct", "")).strip()
     min_market_cap = _optional_float(min_market_cap_text)
     max_market_cap = _optional_float(max_market_cap_text)
+    min_cmp = _optional_float(min_cmp_text)
+    max_cmp = _optional_float(max_cmp_text)
     min_pair_return = _optional_float(min_pair_return_text)
 
     filter_query = _dashboard_filter_query(
@@ -1869,6 +2257,8 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
         market_cap_bucket=market_cap_bucket,
         min_market_cap_cr=min_market_cap_text,
         max_market_cap_cr=max_market_cap_text,
+        min_cmp=min_cmp_text,
+        max_cmp=max_cmp_text,
         require_volume_confirmation=require_volume_confirmation,
         require_trend_confirmation=require_trend_confirmation,
         return_metric=return_metric if min_pair_return_text else "",
@@ -1883,6 +2273,8 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             min_market_cap,
             max_market_cap,
             market_cap_bucket,
+            min_cmp,
+            max_cmp,
             require_volume_confirmation,
             require_trend_confirmation,
             return_metric,
@@ -1900,6 +2292,8 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             market_cap_bucket,
             min_market_cap_text,
             max_market_cap_text,
+            min_cmp_text,
+            max_cmp_text,
             require_volume_confirmation,
             require_trend_confirmation,
             return_metric,
@@ -1927,12 +2321,24 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
     market_cap_bucket = str(form.get("market_cap_bucket", "")).strip()
     min_market_cap_text = str(form.get("min_market_cap_cr", "")).strip()
     max_market_cap_text = str(form.get("max_market_cap_cr", "")).strip()
+    min_cmp_text = str(form.get("min_cmp", "")).strip()
+    max_cmp_text = str(form.get("max_cmp", "")).strip()
     min_market_cap = _optional_float(min_market_cap_text)
     max_market_cap = _optional_float(max_market_cap_text)
+    min_cmp = _optional_float(min_cmp_text)
+    max_cmp = _optional_float(max_cmp_text)
     open_buy_regime_only = str(form.get("open_buy_regime_only", "")).strip().lower() in {"1", "true", "on", "yes"}
     dashboard_buy_only = str(form.get("dashboard_buy_only", "")).strip().lower() in {"1", "true", "on", "yes"}
     fresh_weekly_buy_only = str(form.get("fresh_weekly_buy_only", "")).strip().lower() in {"1", "true", "on", "yes"}
+    fresh_daily_buy_only = str(form.get("fresh_daily_buy_only", "")).strip().lower() in {"1", "true", "on", "yes"}
     trend_only = str(form.get("trend_only", "")).strip().lower() in {"1", "true", "on", "yes"}
+    require_volume_confirmation = str(form.get("require_volume_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    peak_speed_bucket = str(form.get("peak_speed_bucket", "")).strip()
+    technical_rating_status = str(form.get("technical_rating_status", "")).strip()
+    if peak_speed_bucket not in GTT_PEAK_SPEED_BUCKETS:
+        peak_speed_bucket = ""
+    if technical_rating_status not in GTT_TECHNICAL_RATING_FILTERS:
+        technical_rating_status = ""
 
     filter_query = _gtt_filter_query(
         token=dashboard_token,
@@ -1940,10 +2346,16 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
         market_cap_bucket=market_cap_bucket,
         min_market_cap_cr=min_market_cap_text,
         max_market_cap_cr=max_market_cap_text,
+        min_cmp=min_cmp_text,
+        max_cmp=max_cmp_text,
         open_buy_regime_only=open_buy_regime_only,
         dashboard_buy_only=dashboard_buy_only,
         fresh_weekly_buy_only=fresh_weekly_buy_only,
+        fresh_daily_buy_only=fresh_daily_buy_only,
         trend_only=trend_only,
+        require_volume_confirmation=require_volume_confirmation,
+        peak_speed_bucket=peak_speed_bucket,
+        technical_rating_status=technical_rating_status,
     )
 
     try:
@@ -1955,10 +2367,16 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
             min_market_cap,
             max_market_cap,
             market_cap_bucket,
+            min_cmp,
+            max_cmp,
             open_buy_regime_only,
             dashboard_buy_only,
             fresh_weekly_buy_only,
+            fresh_daily_buy_only,
             trend_only,
+            peak_speed_bucket,
+            require_volume_confirmation,
+            technical_rating_status,
         )
         if visible_gtt_stocks.empty:
             raise RuntimeError("No GTT stocks are available to send with the selected filters.")
@@ -1968,10 +2386,16 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
             market_cap_bucket,
             min_market_cap_text,
             max_market_cap_text,
+            min_cmp_text,
+            max_cmp_text,
             open_buy_regime_only,
             dashboard_buy_only,
             fresh_weekly_buy_only,
+            fresh_daily_buy_only,
             trend_only,
+            require_volume_confirmation=require_volume_confirmation,
+            peak_speed_bucket=peak_speed_bucket,
+            technical_rating_status=technical_rating_status,
         )
         send_gtt_stock_list_to_telegram(config, visible_gtt_stocks, filters_text=filters_text)
         status_query = "telegram_sent=1"
@@ -2188,12 +2612,17 @@ def stocks_page(request: Request) -> HTMLResponse:
         universe_cfg = config.get("universe", {})
         exchanges = set(universe_cfg.get("exchanges", ["NSE"]))
         instrument_types = set(universe_cfg.get("instrument_types", ["EQ"]))
+        exclude_series_suffixes = tuple(universe_cfg.get("exclude_series_suffixes", []) or [])
         restrict_to_metadata_symbols = bool(universe_cfg.get("restrict_to_metadata_symbols", False))
         stocks = stocks[stocks["exchange"].isin(exchanges)]
         if "instrument_type" in stocks.columns:
             stocks = stocks[stocks["instrument_type"].isin(instrument_types)]
         if "segment" in stocks.columns:
             stocks = stocks[stocks["segment"].astype(str).str.upper() != "INDICES"]
+        if exclude_series_suffixes and "tradingsymbol" in stocks.columns:
+            stocks = stocks[
+                ~stocks["tradingsymbol"].apply(lambda symbol: has_nse_series_suffix(symbol, exclude_series_suffixes))
+            ]
 
         if not metadata.empty:
             stocks = stocks.copy()

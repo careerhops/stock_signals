@@ -4,10 +4,10 @@
   <section class="panel">
     <div class="panel-heading">
       <h2>Run Screener</h2>
-      <p>Filter the NSE universe first, then run the weekly strategy to find current BUY candidates.</p>
+      <p>Search and filters use saved results. Refresh Kite data once after market close, then recalculate from cache as needed.</p>
     </div>
 
-    <form action="/run-screener" method="post" class="filter-panel">
+    <form action="/" method="get" class="filter-panel">
       {% if dashboard_token %}
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
@@ -46,10 +46,43 @@
                placeholder="{{ market_cap_bounds.max or 'Max' }}">
       </label>
 
+      <label>
+        Min CMP (₹)
+        <input type="number"
+               step="0.05"
+               name="min_cmp"
+               value="{{ selected_min_cmp }}"
+               placeholder="e.g. 100">
+      </label>
+
+      <label>
+        Max CMP (₹)
+        <input type="number"
+               step="0.05"
+               name="max_cmp"
+               value="{{ selected_max_cmp }}"
+               placeholder="e.g. 1000">
+      </label>
+
       <div class="filter-actions">
-        <button class="button" type="submit">Run Weekly BUY Screener</button>
+        <button class="button secondary" type="submit">Apply Filters Only</button>
         <a class="table-link" href="/{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
       </div>
+    </form>
+
+    <form action="/run-screener" method="post" class="action-row">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="stock_search" value="{{ stock_search }}">
+      <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
+      <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
+      <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+      <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+      <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
+      <button class="button secondary" type="submit" name="refresh_data" value="0">Recalculate From Cached OHLC</button>
+      <button class="button" type="submit" name="refresh_data" value="1">Refresh Kite Data + Run Screener</button>
+      <span>Use refresh once daily after market close. Searches and filters do not call Kite.</span>
     </form>
 
     {% if active_filter_summary %}
@@ -73,7 +106,10 @@
     {% endif %}
 
     {% if scan_ran %}
-      <p class="success-note">Screener completed. Scanned {{ symbols_scanned }} stocks and found {{ filtered_count }} BUY matches.</p>
+      <p class="success-note">
+        Screener completed{% if refresh_mode == "cached_only" %} using cached OHLC{% else %} after Kite refresh{% endif %}.
+        Scanned {{ symbols_scanned }} stocks and found {{ filtered_count }} weekly BUY matches.
+      </p>
     {% endif %}
 
     {% if scan_error %}
@@ -180,7 +216,7 @@
           <p class="eyebrow">Selected result</p>
           <h2>{{ selected_exchange }}:{{ selected_symbol }}</h2>
           <p>
-            Latest signal:
+            Latest weekly signal:
             <strong>{{ latest_summary.signal }}</strong>
             {% if latest_summary.date %} on {{ latest_summary.date }}{% endif %}
             {% if latest_summary.close %} at close {{ latest_summary.close }}{% endif %}
@@ -241,6 +277,8 @@
         <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
         <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
         <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+        <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+        <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
 
         <label class="checkbox-field">
           <input type="checkbox" name="require_volume_confirmation" value="1" {% if require_volume_confirmation %}checked{% endif %}>
@@ -288,6 +326,8 @@
         <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
         <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
         <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+        <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+        <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
         {% if require_volume_confirmation %}
           <input type="hidden" name="require_volume_confirmation" value="1">
         {% endif %}
@@ -396,58 +436,6 @@
       </script>
     {% else %}
       <p class="empty">No BUY signals are available yet.</p>
-    {% endif %}
-  </section>
-
-  <section class="panel">
-    <div class="panel-heading">
-      <h2>Scan Audit</h2>
-      <p>Every stock attempted in the latest run, including stocks that did not pass the weekly BUY filter.</p>
-    </div>
-
-    {% if scan_details %}
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Exchange</th>
-              <th>Symbol</th>
-              <th>Name</th>
-              <th>Market Cap (₹ Cr)</th>
-              <th>Bucket</th>
-              <th>Fetch</th>
-              <th>Daily Rows</th>
-              <th>Strategy Rows</th>
-              <th>Raw Signals</th>
-              <th>Latest Signal</th>
-              <th>Latest Signal Date</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in scan_details %}
-              <tr>
-                <td>{{ row.get("exchange", "") }}</td>
-                <td>
-                  <a class="table-link" href="/?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol') or row.get('tradingsymbol', '') }}{{ filter_link_suffix }}">
-                    {{ row.get("symbol") or row.get("tradingsymbol", "") }}
-                  </a>
-                </td>
-                <td>{{ row.get("name", "") }}</td>
-                <td>{{ row.get("market_cap_cr", "") }}</td>
-                <td>{{ row.get("market_cap_bucket", "") }}</td>
-                <td>{{ row.get("fetch_status", "") }}</td>
-                <td>{{ row.get("daily_rows", "") }}</td>
-                <td>{{ row.get("strategy_rows", "") }}</td>
-                <td>{{ row.get("raw_signal_count", "") }}</td>
-                <td>{{ row.get("latest_signal", "") }}</td>
-                <td>{{ row.get("latest_signal_date", "") }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% else %}
-      <p class="empty">No scan audit is available yet.</p>
     {% endif %}
   </section>
 

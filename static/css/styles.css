@@ -785,6 +785,63 @@ tbody tr:hover {
   padding: 8px;
 }
 
+.opportunity-map-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  margin: 16px 0;
+  padding: 14px;
+}
+
+.compact-heading {
+  margin-bottom: 10px;
+}
+
+.compact-heading h3 {
+  margin: 0 0 5px;
+}
+
+.compact-heading p {
+  color: var(--muted);
+  margin-bottom: 0;
+}
+
+.opportunity-chart-frame {
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-height: 540px;
+  overflow: hidden;
+}
+
+.bucket-filter-form {
+  align-items: end;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+}
+
+.bucket-filter-form label {
+  color: var(--muted);
+  display: grid;
+  font-size: 13px;
+  font-weight: 800;
+  gap: 6px;
+}
+
+.bucket-filter-form select {
+  background: #ffffff;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  min-width: 220px;
+  padding: 8px 9px;
+}
+
 .qa-check-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
