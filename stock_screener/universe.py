@@ -4,7 +4,12 @@ from typing import Any
 
 import pandas as pd
 
-from stock_screener.symbols import has_nse_series_suffix, normalize_nse_symbol
+from stock_screener.symbols import (
+    NSE_TRADED_ALLOWED_SUFFIXES,
+    has_nse_series_suffix,
+    is_nse_traded_equity_style_series,
+    normalize_nse_symbol,
+)
 
 
 def _load_metadata(path: str | None) -> pd.DataFrame:
@@ -89,6 +94,29 @@ def _apply_metadata_filters(frame: pd.DataFrame, universe_cfg: dict[str, Any]) -
     return merged.drop(columns=["symbol_key", "metadata_symbol_key"], errors="ignore")
 
 
+def _apply_traded_universe_filters(frame: pd.DataFrame, universe_cfg: dict[str, Any]) -> pd.DataFrame:
+    traded_cfg = universe_cfg.get("approximate_nse_traded_universe", {}) or {}
+    if not bool(traded_cfg.get("enabled", False)):
+        return frame
+
+    working = frame.copy()
+    if bool(traded_cfg.get("require_nonblank_name", True)) and "name" in working.columns:
+        working["name"] = working["name"].fillna("").astype(str).str.strip()
+        working = working[working["name"] != ""]
+
+    allowed_suffixes = tuple(traded_cfg.get("allowed_series_suffixes", NSE_TRADED_ALLOWED_SUFFIXES) or NSE_TRADED_ALLOWED_SUFFIXES)
+    if "tradingsymbol" in working.columns:
+        working = working[
+            is_nse_traded_equity_style_series(
+                working["tradingsymbol"],
+                working["name"] if "name" in working.columns else pd.Series("", index=working.index),
+                allowed_suffixes=allowed_suffixes,
+            )
+        ]
+
+    return working
+
+
 def build_universe(instruments: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     universe_cfg = config.get("universe", {})
     mode = universe_cfg.get("mode", "configured")
@@ -133,6 +161,7 @@ def build_universe(instruments: pd.DataFrame, config: dict[str, Any]) -> pd.Data
     else:
         frame["name"] = ""
 
+    frame = _apply_traded_universe_filters(frame, universe_cfg)
     frame = _apply_metadata_filters(frame, universe_cfg)
     if "name" in frame.columns:
         name = frame["name"].fillna("").astype(str).str.strip()

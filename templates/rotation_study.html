@@ -1,0 +1,360 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Rotation Study</h2>
+      <p>
+        Groups stocks by multi-year weekly price behaviour and highlights which names in each group have already moved,
+        which are moving in sync, and which look like lagging catch-up candidates.
+      </p>
+    </div>
+
+    <form action="/rotation-study/run{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}" method="post" class="action-row">
+      <button class="button" type="submit">Run Rotation Study</button>
+      <span>Uses cached 5-year daily Kite history, resampled to weekly, without changing the screener, backtest, or GTT logic.</span>
+    </form>
+
+    <form action="/rotation-study" method="get" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company name">
+      </label>
+      <label>
+        Group ID
+        <input type="search" name="group_id" value="{{ selected_group_id }}" placeholder="e.g. G001">
+      </label>
+      <label>
+        Movement Status
+        <select name="movement_status">
+          <option value="">All</option>
+          {% for status in movement_status_options %}
+            <option value="{{ status }}" {% if selected_movement_status == status %}selected{% endif %}>{{ status }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply Rotation Filters</button>
+        <a class="table-link" href="/rotation-study{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+      </div>
+    </form>
+
+    {% if study_ran %}
+      <p class="success-note">Rotation Study completed. Latest grouped behaviour results are loaded.</p>
+    {% endif %}
+
+    {% if study_error %}
+      <p class="warning-note">Rotation Study failed: {{ study_error }}</p>
+    {% endif %}
+
+    {% if rotation_job %}
+      <div class="scan-progress" id="rotation-progress" data-job-id="{{ rotation_job }}">
+        <div class="scan-progress-header">
+          <strong id="rotation-progress-title">Rotation Study is running</strong>
+          <span id="rotation-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="rotation-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="rotation-progress-detail">Preparing weekly price histories...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if rotation_job %}
+    <script>
+      const rotationProgressBox = document.getElementById("rotation-progress");
+      const rotationProgressTitle = document.getElementById("rotation-progress-title");
+      const rotationProgressPercent = document.getElementById("rotation-progress-percent");
+      const rotationProgressFill = document.getElementById("rotation-progress-fill");
+      const rotationProgressDetail = document.getElementById("rotation-progress-detail");
+
+      async function pollRotationProgress() {
+        if (!rotationProgressBox) return;
+        const jobId = rotationProgressBox.dataset.jobId;
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+          if (!response.ok) {
+            rotationProgressTitle.textContent = "Rotation status unavailable";
+            rotationProgressDetail.textContent = status.error || "Could not find the rotation study job.";
+            return;
+          }
+          const percent = Number(status.percent || 0);
+          rotationProgressFill.style.width = `${percent}%`;
+          rotationProgressPercent.textContent = `${percent}%`;
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          rotationProgressTitle.textContent = status.status === "queued" ? "Rotation Study queued" : "Rotation Study is running";
+          rotationProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} stocks${current}`;
+          if (status.status === "completed") {
+            rotationProgressTitle.textContent = "Rotation Study completed";
+            rotationProgressFill.style.width = "100%";
+            rotationProgressPercent.textContent = "100%";
+            rotationProgressDetail.textContent = "Loading latest rotation results...";
+            window.location.href = status.redirect_url || "/rotation-study";
+            return;
+          }
+          if (status.status === "failed") {
+            rotationProgressTitle.textContent = "Rotation Study failed";
+            rotationProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          rotationProgressTitle.textContent = "Waiting for Rotation Study";
+          rotationProgressDetail.textContent = "Still checking progress...";
+        }
+        window.setTimeout(pollRotationProgress, 1000);
+      }
+
+      pollRotationProgress();
+    </script>
+  {% endif %}
+
+  {% if summary %}
+    {% if group_chart_rows %}
+      <section class="panel">
+        <div class="panel-heading">
+          <h2>Group Comparative Charts</h2>
+          <p>
+            Normalized weekly price trends for each displayed group. Lines show who already jumped, who is catching up, and markers show the latest weekly BUY or SELL where present.
+          </p>
+        </div>
+
+        <div class="rotation-chart-stack">
+          {% for row in group_chart_rows %}
+            <div class="rotation-chart-card">
+              <div class="panel-heading">
+                <h3>{{ row.get("group_id", "") }}</h3>
+                <p>
+                  Group size {{ row.get("group_size", "") }},
+                  leaders {{ row.get("leaders_count", "") }},
+                  catch-up candidates {{ row.get("catch_up_candidates_count", "") }},
+                  latest weekly BUY {{ row.get("latest_weekly_buy_count", "") }},
+                  latest weekly SELL {{ row.get("latest_weekly_sell_count", "") }}.
+                </p>
+              </div>
+              {{ row.get("chart_html", "")|safe }}
+            </div>
+          {% endfor %}
+        </div>
+      </section>
+    {% endif %}
+
+    <section class="summary-grid">
+      <div class="metric">
+        <span>Universe rows</span>
+        <strong>{{ summary.get("universe_rows", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Symbols with history</span>
+        <strong>{{ summary.get("symbols_with_history", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Eligible symbols</span>
+        <strong>{{ summary.get("eligible_symbols", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Groups found</span>
+        <strong>{{ summary.get("groups_found", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Grouped symbols</span>
+        <strong>{{ summary.get("grouped_symbols", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Ungrouped symbols</span>
+        <strong>{{ summary.get("ungrouped_symbols", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Largest group</span>
+        <strong>{{ summary.get("largest_group_size", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Avg group correlation</span>
+        <strong>{{ summary.get("avg_group_correlation", 0)|number }}</strong>
+      </div>
+      <div class="metric">
+        <span>Catch-up candidates</span>
+        <strong>{{ summary.get("catch_up_candidates", 0) }}</strong>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Catch-up Candidates</h2>
+        <p>
+          These are group members that still behave like the group historically, but have underperformed the group recently after the group moved.
+        </p>
+      </div>
+
+      {% if candidates %}
+        <div class="table-wrap signal-history">
+          <table>
+            <thead>
+              <tr>
+                <th>Group</th>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>CMP</th>
+                <th>Candidate Score</th>
+                <th>Lag (weeks)</th>
+                <th>Lag Corr</th>
+                <th>4W %</th>
+                <th>8W %</th>
+                <th>Group 8W %</th>
+                <th>Gap 8W %</th>
+                <th>52W %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in candidates %}
+                <tr>
+                  <td>{{ row.get("group_id", "") }}</td>
+                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("latest_close", "")|number }}</td>
+                  <td>{{ row.get("candidate_score", "")|number }}</td>
+                  <td>{{ row.get("best_lag_weeks", "") }}</td>
+                  <td>{{ row.get("best_lag_correlation", "")|number }}</td>
+                  <td>{{ row.get("recent_return_4w_pct", "")|number }}</td>
+                  <td>{{ row.get("recent_return_8w_pct", "")|number }}</td>
+                  <td>{{ row.get("group_return_8w_pct", "")|number }}</td>
+                  <td>{{ row.get("catch_up_gap_8w_pct", "")|number }}</td>
+                  <td>{{ row.get("recent_return_52w_pct", "")|number }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="empty">No catch-up candidates are available yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Behaviour Groups</h2>
+        <p>
+          Groups are formed from multi-year weekly return similarity. Use these to understand which baskets have historically moved together.
+        </p>
+      </div>
+
+      {% if groups %}
+        <div class="table-wrap signal-history">
+          <table>
+            <thead>
+              <tr>
+                <th>Group</th>
+                <th>Size</th>
+                <th>Avg Corr</th>
+                <th>4W %</th>
+                <th>8W %</th>
+                <th>13W %</th>
+                <th>26W %</th>
+                <th>Leaders</th>
+                <th>Catch-up</th>
+                <th>Latest BUY</th>
+                <th>Latest SELL</th>
+                <th>Symbols</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in groups %}
+                <tr>
+                  <td>{{ row.get("group_id", "") }}</td>
+                  <td>{{ row.get("group_size", "") }}</td>
+                  <td>{{ row.get("avg_pair_correlation", "")|number }}</td>
+                  <td>{{ row.get("group_return_4w_pct", "")|number }}</td>
+                  <td>{{ row.get("group_return_8w_pct", "")|number }}</td>
+                  <td>{{ row.get("group_return_13w_pct", "")|number }}</td>
+                  <td>{{ row.get("group_return_26w_pct", "")|number }}</td>
+                  <td>{{ row.get("leaders_count", "") }}</td>
+                  <td>{{ row.get("catch_up_candidates_count", "") }}</td>
+                  <td>{{ row.get("latest_weekly_buy_count", "") }}</td>
+                  <td>{{ row.get("latest_weekly_sell_count", "") }}</td>
+                  <td>{{ row.get("symbols", "") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="empty">No behaviour groups are available yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Group Members</h2>
+        <p>
+          Member-level view showing who has already moved, who is in sync with the group, and who is lagging.
+        </p>
+      </div>
+
+      {% if members %}
+        <div class="table-wrap signal-history">
+          <table>
+            <thead>
+              <tr>
+                <th>Group</th>
+                <th>Symbol</th>
+                <th>Name</th>
+                <th>Status</th>
+                <th>CMP</th>
+                <th>Corr to Group</th>
+                <th>Lag (weeks)</th>
+                <th>Lag Corr</th>
+                <th>4W %</th>
+                <th>8W %</th>
+                <th>13W %</th>
+                <th>26W %</th>
+                <th>52W %</th>
+                <th>Gap 8W %</th>
+                <th>Latest Weekly Signal</th>
+                <th>Signal Date</th>
+                <th>Fresh Signal</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in members %}
+                <tr>
+                  <td>{{ row.get("group_id", "") }}</td>
+                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("name", "") }}</td>
+                  <td>{{ row.get("movement_status", "") }}</td>
+                  <td>{{ row.get("latest_close", "")|number }}</td>
+                  <td>{{ row.get("correlation_to_group", "")|number }}</td>
+                  <td>{{ row.get("best_lag_weeks", "") }}</td>
+                  <td>{{ row.get("best_lag_correlation", "")|number }}</td>
+                  <td>{{ row.get("recent_return_4w_pct", "")|number }}</td>
+                  <td>{{ row.get("recent_return_8w_pct", "")|number }}</td>
+                  <td>{{ row.get("recent_return_13w_pct", "")|number }}</td>
+                  <td>{{ row.get("recent_return_26w_pct", "")|number }}</td>
+                  <td>{{ row.get("recent_return_52w_pct", "")|number }}</td>
+                  <td>{{ row.get("catch_up_gap_8w_pct", "")|number }}</td>
+                  <td>{{ row.get("latest_week_signal", "") }}</td>
+                  <td>{{ row.get("latest_week_signal_date", "") }}</td>
+                  <td>{{ row.get("latest_week_signal_is_fresh", "") }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="empty">No member rows are available yet.</p>
+      {% endif %}
+    </section>
+  {% else %}
+    <section class="panel">
+      <p class="empty">No rotation study has been generated yet. Click Run Rotation Study.</p>
+    </section>
+  {% endif %}
+{% endblock %}

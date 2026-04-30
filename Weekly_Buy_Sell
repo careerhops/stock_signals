@@ -1,0 +1,96 @@
+//@version=6
+indicator("Weekly Buy Sell", overlay=true, max_labels_count=500)
+
+// ==========================================
+// 1. Inputs
+// ==========================================
+// Sensitivity: Lower = More Signals (Aggressive), Higher = More Reliable (Conservative)
+sensitivity = input.int(3, "Structure Sensitivity", minval=1, maxval=20, tooltip="The number of candles to look back to find local highs/lows.")
+fvgLookback = input.int(5, "FVG Search Window", minval=1, maxval=10, tooltip="Number of candles to look back for an imbalance (displacement).")
+
+// ==========================================
+// 2. Real-Time Market Structure (BOS/CHoCH)
+// ==========================================
+// We define levels based on the highest/lowest of the PREVIOUS candles to avoid repainting
+float upperLevel = ta.highest(high[1], sensitivity)
+float lowerLevel = ta.lowest(low[1], sensitivity)
+
+var int marketTrend = 0 // 1 for Bullish, -1 for Bearish
+bool bullBreak = ta.crossover(close, upperLevel)
+bool bearBreak = ta.crossunder(close, lowerLevel)
+
+// ==========================================
+// 3. Displacement / FVG Logic
+// ==========================================
+// FVG occurs when there is a gap between candle 0 and candle 2
+bool fvgBull = low > high[2]
+bool fvgBear = high < low[2]
+
+// Count FVGs in the lookback window using float series to avoid compiler errors
+float fvgBullRecent = math.sum(fvgBull ? 1.0 : 0.0, fvgLookback)
+float fvgBearRecent = math.sum(fvgBear ? 1.0 : 0.0, fvgLookback)
+
+// ==========================================
+// 4. Order Block (OB) Logic
+// ==========================================
+// We capture the "Supply" or "Demand" zone created at the break
+var float demandZone = 0.0
+var float supplyZone = 0.0
+
+if bullBreak
+    demandZone := math.min(low, low[1])
+if bearBreak
+    supplyZone := math.max(high, high[1])
+
+// ==========================================
+// 5. Signal Engine (Event-Driven Confluence)
+// ==========================================
+// A valid signal requires:
+// 1. A price breakout (BOS/CHoCH)
+// 2. Presence of an FVG (Displacement) nearby
+// 3. Trend alignment
+
+bool buySignal  = bullBreak and fvgBullRecent > 0
+bool sellSignal = bearBreak and fvgBearRecent > 0
+
+// Mutual Exclusivity: Only signal if the trend flips or continues strongly
+var int lastSignalDirection = 0 // 1 for Buy, -1 for Sell
+
+bool finalBuy  = buySignal and lastSignalDirection <= 0
+bool finalSell = sellSignal and lastSignalDirection >= 0
+
+if finalBuy
+    lastSignalDirection := 1
+if finalSell
+    lastSignalDirection := -1
+
+// ==========================================
+// 6. Visuals & Plotting
+// ==========================================
+
+// Signals
+plotshape(finalBuy,  title="SMC Buy",  text="BUY",  style=shape.triangleup,   location=location.belowbar, color=color.new(#00ff88, 0), size=size.small)
+plotshape(finalSell, title="SMC Sell", text="SELL", style=shape.triangledown, location=location.abovebar, color=color.new(#ff0055, 0), size=size.small)
+
+// Dynamic Structure Levels (Visual guides for the "Event" trigger)
+plot(upperLevel, "Structural Ceiling", color=color.new(color.red, 75),   style=plot.style_linebr, linewidth=1)
+plot(lowerLevel, "Structural Floor",   color=color.new(color.green, 75), style=plot.style_linebr, linewidth=1)
+
+// OB Zones
+plot(finalBuy ? demandZone : na,  "Demand Zone", color=color.new(color.green, 50), style=plot.style_circles, linewidth=2)
+plot(finalSell ? supplyZone : na, "Supply Zone", color=color.new(color.red, 50),   style=plot.style_circles, linewidth=2)
+
+// ==========================================
+// 7. ALERTS (Visible in Dropdown)
+// ==========================================
+
+// This makes them show up in the "Condition" list in the Alert Dialog
+alertcondition(finalBuy,  title="Buy Signal",  message="Bullish Breakout: {{exchange}}:{{ticker}} at {{close}}")
+alertcondition(finalSell, title="Sell Signal", message="Bearish Breakout: {{exchange}}:{{ticker}} at {{close}}")
+
+// This handles dynamic alerts/webhooks automatically
+if finalBuy
+    alert("Buy: " + syminfo.ticker + " Price: " + str.tostring(close), alert.freq_once_per_bar)
+
+if finalSell
+    alert("Sell: " + syminfo.ticker + " Price: " + str.tostring(close), alert.freq_once_per_bar)

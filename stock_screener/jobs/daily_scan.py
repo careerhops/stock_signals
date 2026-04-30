@@ -13,6 +13,7 @@ from stock_screener.data.storage import Storage
 from stock_screener.filters import apply_filters
 from stock_screener.notifications.telegram import build_telegram_message, send_telegram_message
 from stock_screener.resample import resample_daily_to_weekly
+from stock_screener.strategy.daily_confirmation import add_latest_daily_confirmation_columns
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
 from stock_screener.universe import build_universe
 
@@ -169,9 +170,11 @@ def run_daily_scan(
 
         strategy_output = run_weekly_buy_sell(strategy_input, config)
         signal_rows = strategy_output[strategy_output["signal"].isin(["BUY", "SELL"])].copy()
+        signal_rows = add_latest_daily_confirmation_columns(signal_rows, daily)
         if daily_enabled:
             daily_strategy_output = run_weekly_buy_sell(daily, daily_config)
             daily_signal_rows = daily_strategy_output[daily_strategy_output["signal"].isin(["BUY", "SELL"])].copy()
+            daily_signal_rows = add_latest_daily_confirmation_columns(daily_signal_rows, daily)
         else:
             daily_signal_rows = pd.DataFrame()
 

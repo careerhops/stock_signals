@@ -2,7 +2,24 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+
+def _pine_crossover(left: pd.Series, right: pd.Series) -> pd.Series:
+    """True when left crosses above right (was <= right on prior bar)."""
+    cond = (left > right) & (left.shift(1) <= right.shift(1))
+    return cond.fillna(False)
+
+
+def _pine_crossunder(left: pd.Series, right: pd.Series) -> pd.Series:
+    """True when left crosses below right (was >= right on prior bar)."""
+    cond = (left < right) & (left.shift(1) >= right.shift(1))
+    return cond.fillna(False)
+
+
+def _pine_sum(values: pd.Series, length: int) -> pd.Series:
+    return values.astype(float).rolling(length, min_periods=1).sum()
 
 
 def run_weekly_buy_sell(candles: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
@@ -15,48 +32,63 @@ def run_weekly_buy_sell(candles: pd.DataFrame, config: dict[str, Any]) -> pd.Dat
     pair_return_lookback_weeks = int(strategy_cfg.get("pair_return_lookback_weeks", 104))
 
     if candles.empty:
-        return candles
+        return _empty_strategy_frame(candles)
 
     frame = candles.copy()
     frame["date"] = pd.to_datetime(frame["date"])
     frame = frame.sort_values("date").reset_index(drop=True)
 
-    frame["upper_level"] = frame["high"].shift(1).rolling(sensitivity).max()
-    frame["lower_level"] = frame["low"].shift(1).rolling(sensitivity).min()
+    # Structure Levels
+    frame["upper_level"] = frame["high"].shift(1).rolling(sensitivity, min_periods=sensitivity).max()
+    frame["lower_level"] = frame["low"].shift(1).rolling(sensitivity, min_periods=sensitivity).min()
 
-    prev_close = frame["close"].shift(1)
-    prev_upper = frame["upper_level"].shift(1)
-    prev_lower = frame["lower_level"].shift(1)
+    # bool bullBreak = ta.crossover(close, upperLevel)
+    # bool bearBreak = ta.crossunder(close, lowerLevel)
+    frame["bull_break"] = _pine_crossover(frame["close"], frame["upper_level"])
+    frame["bear_break"] = _pine_crossunder(frame["close"], frame["lower_level"])
 
-    frame["bull_break"] = (frame["close"] > frame["upper_level"]) & (prev_close <= prev_upper)
-    frame["bear_break"] = (frame["close"] < frame["lower_level"]) & (prev_close >= prev_lower)
+    # bool fvgBull = low > high[2]
+    # bool fvgBear = high < low[2]
+    frame["fvg_bull"] = (frame["low"] > frame["high"].shift(2)).fillna(False)
+    frame["fvg_bear"] = (frame["high"] < frame["low"].shift(2)).fillna(False)
 
-    frame["fvg_bull"] = frame["low"] > frame["high"].shift(2)
-    frame["fvg_bear"] = frame["high"] < frame["low"].shift(2)
+    # float fvgBullRecent = math.sum(fvgBull ? 1.0 : 0.0, fvgLookback)
+    # float fvgBearRecent = math.sum(fvgBear ? 1.0 : 0.0, fvgLookback)
+    frame["fvg_bull_recent"] = _pine_sum(frame["fvg_bull"], fvg_lookback)
+    frame["fvg_bear_recent"] = _pine_sum(frame["fvg_bear"], fvg_lookback)
 
-    frame["fvg_bull_recent"] = frame["fvg_bull"].astype(int).rolling(fvg_lookback, min_periods=1).sum()
-    frame["fvg_bear_recent"] = frame["fvg_bear"].astype(int).rolling(fvg_lookback, min_periods=1).sum()
-
+    # bool buySignal = bullBreak and fvgBullRecent > 0
+    # bool sellSignal = bearBreak and fvgBearRecent > 0
     frame["buy_signal"] = frame["bull_break"] & (frame["fvg_bull_recent"] > 0)
     frame["sell_signal"] = frame["bear_break"] & (frame["fvg_bear_recent"] > 0)
 
-    frame["demand_zone"] = pd.NA
-    frame.loc[frame["bull_break"], "demand_zone"] = frame.loc[frame["bull_break"], ["low"]].join(
-        frame["low"].shift(1).rename("prior_low")
-    ).min(axis=1)
+    highs = frame["high"].to_numpy()
+    lows = frame["low"].to_numpy()
+    bull_breaks = frame["bull_break"].to_numpy()
+    bear_breaks = frame["bear_break"].to_numpy()
+    raw_buys = frame["buy_signal"].to_numpy()
+    raw_sells = frame["sell_signal"].to_numpy()
 
-    frame["supply_zone"] = pd.NA
-    frame.loc[frame["bear_break"], "supply_zone"] = frame.loc[frame["bear_break"], ["high"]].join(
-        frame["high"].shift(1).rename("prior_high")
-    ).max(axis=1)
+    demand_zones = np.zeros(len(frame), dtype=float)
+    supply_zones = np.zeros(len(frame), dtype=float)
+    final_buy = np.zeros(len(frame), dtype=bool)
+    final_sell = np.zeros(len(frame), dtype=bool)
 
-    final_buy: list[bool] = []
-    final_sell: list[bool] = []
+    current_demand_zone = 0.0
+    current_supply_zone = 0.0
     last_signal_direction = 0
 
-    for _, row in frame.iterrows():
-        raw_buy = bool(row["buy_signal"])
-        raw_sell = bool(row["sell_signal"])
+    for i in range(len(frame)):
+        if bull_breaks[i]:
+            prev_low = lows[i - 1] if i > 0 else lows[i]
+            current_demand_zone = min(float(lows[i]), float(prev_low))
+
+        if bear_breaks[i]:
+            prev_high = highs[i - 1] if i > 0 else highs[i]
+            current_supply_zone = max(float(highs[i]), float(prev_high))
+
+        raw_buy = bool(raw_buys[i])
+        raw_sell = bool(raw_sells[i]) and not raw_buy
 
         if prevent_repeated:
             is_buy = raw_buy and last_signal_direction <= 0
@@ -65,16 +97,24 @@ def run_weekly_buy_sell(candles: pd.DataFrame, config: dict[str, Any]) -> pd.Dat
             is_buy = raw_buy
             is_sell = raw_sell
 
-        final_buy.append(is_buy)
-        final_sell.append(is_sell)
+        if is_buy and is_sell:
+            is_sell = False
+
+        final_buy[i] = is_buy
+        final_sell[i] = is_sell
 
         if is_buy:
             last_signal_direction = 1
         elif is_sell:
             last_signal_direction = -1
 
+        demand_zones[i] = current_demand_zone
+        supply_zones[i] = current_supply_zone
+
     frame["final_buy"] = final_buy
     frame["final_sell"] = final_sell
+    frame["demand_zone"] = demand_zones
+    frame["supply_zone"] = supply_zones
     frame["signal"] = "NONE"
     frame.loc[frame["final_buy"], "signal"] = "BUY"
     frame.loc[frame["final_sell"], "signal"] = "SELL"
@@ -101,6 +141,43 @@ def run_weekly_buy_sell(candles: pd.DataFrame, config: dict[str, Any]) -> pd.Dat
 
     _add_completed_trade_return_metrics(frame, pair_return_lookback_start)
 
+    return frame
+
+
+def _empty_strategy_frame(candles: pd.DataFrame) -> pd.DataFrame:
+    frame = candles.copy()
+    default_columns = {
+        "upper_level": pd.Series(dtype="float64"),
+        "lower_level": pd.Series(dtype="float64"),
+        "bull_break": pd.Series(dtype="bool"),
+        "bear_break": pd.Series(dtype="bool"),
+        "fvg_bull": pd.Series(dtype="bool"),
+        "fvg_bear": pd.Series(dtype="bool"),
+        "fvg_bull_recent": pd.Series(dtype="float64"),
+        "fvg_bear_recent": pd.Series(dtype="float64"),
+        "buy_signal": pd.Series(dtype="bool"),
+        "sell_signal": pd.Series(dtype="bool"),
+        "demand_zone": pd.Series(dtype="float64"),
+        "supply_zone": pd.Series(dtype="float64"),
+        "final_buy": pd.Series(dtype="bool"),
+        "final_sell": pd.Series(dtype="bool"),
+        "signal": pd.Series(dtype="object"),
+        "avg_volume_20": pd.Series(dtype="float64"),
+        "avg_traded_value_20": pd.Series(dtype="float64"),
+        "ema_20": pd.Series(dtype="float64"),
+        "ema_50": pd.Series(dtype="float64"),
+        "ema_200": pd.Series(dtype="float64"),
+        "avg_volume_confirmation": pd.Series(dtype="float64"),
+        "volume_confirmation": pd.Series(dtype="bool"),
+        "volume_confirmation_ratio": pd.Series(dtype="float64"),
+        "trend_confirmation": pd.Series(dtype="bool"),
+        "prior_pair_return_last_1_pct": pd.Series(dtype="float64"),
+        "median_pair_return_last_3_pct": pd.Series(dtype="float64"),
+        "sell_pair_return_pct": pd.Series(dtype="float64"),
+    }
+    for column, empty_series in default_columns.items():
+        if column not in frame.columns:
+            frame[column] = empty_series
     return frame
 
 

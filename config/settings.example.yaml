@@ -19,20 +19,26 @@ universe:
     - "NSE"
   instrument_types:
     - "EQ"
-  exclude_series_suffixes:
-    - "-BE"
-    - "-BZ"
-    - "-BL"
-    - "-BT"
-    - "-SM"
-    - "-ST"
+  exclude_series_suffixes: []
   prefer_exchange: "NSE"
   include_bse_only: true
   deduplicate_by_isin: false
   max_symbols: null
   allow_symbols: []
   block_symbols: []
-  restrict_to_metadata_symbols: true
+  restrict_to_metadata_symbols: false
+  approximate_nse_traded_universe:
+    enabled: true
+    require_nonblank_name: true
+    allowed_series_suffixes:
+      - ""
+      - "-SM"
+      - "-ST"
+      - "-BZ"
+      - "-IV"
+      - "-E1"
+      - "-P1"
+      - "-RR"
   metadata_file: "data/instruments/symbol_metadata.csv"
   filters:
     industries: []
@@ -55,9 +61,9 @@ strategy:
   breakout_price: "close"
   prevent_repeated_direction: true
   signal_on_confirmed_candle: true
-  weekly_anchor: "W-FRI"
+  weekly_anchor: "W-MON"
   weekly_label: "period_end"
-  use_completed_weeks_only: true
+  use_completed_weeks_only: false
   volume_confirmation_lookback: 20
   volume_confirmation_multiplier: 1.25
   pair_return_lookback_weeks: 104
@@ -65,6 +71,19 @@ strategy:
 daily_signals:
   enabled: true
   max_signal_age_bars: 5
+
+rotation_study:
+  lookback_weeks: 260
+  min_history_weeks: 104
+  min_overlap_weeks: 52
+  min_group_size: 5
+  target_group_size: 12
+  max_group_size: 20
+  min_correlation: 0.68
+  lag_window_weeks: 8
+  min_lag_correlation: 0.45
+  catch_up_gap_pct: 8.0
+  group_strength_min_8w: 5.0
 
 filters:
   enabled: true

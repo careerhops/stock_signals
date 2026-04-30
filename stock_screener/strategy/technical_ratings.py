@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
@@ -8,24 +9,64 @@ import pandas as pd
 STRONG_BOUND = 0.5
 WEAK_BOUND = 0.1
 MA_PERIODS = (10, 20, 30, 50, 100, 200)
-OSCILLATOR_SIGNAL_COLUMNS = (
-    "rating_rsi_14",
-    "rating_stoch_14_3_3",
-    "rating_cci_20",
-    "rating_adx_14_14",
-    "rating_ao",
-    "rating_mom_10",
-    "rating_macd_12_26_9",
-    "rating_stoch_rsi_14_14_3_3",
-    "rating_williams_r_14",
-    "rating_bull_bear_power_50",
-    "rating_uo_7_14_28",
+
+
+@dataclass(frozen=True)
+class TechnicalRatingComponent:
+    group: str
+    name: str
+    value_column: str
+    rating_column: str
+
+    @property
+    def action_column(self) -> str:
+        return f"{self.rating_column}_action"
+
+
+OSCILLATOR_COMPONENTS = (
+    TechnicalRatingComponent("Oscillators", "Relative Strength Index (14)", "rsi_14", "rating_rsi_14"),
+    TechnicalRatingComponent("Oscillators", "Stochastic %K (14, 3, 3)", "stoch_k_14_3_3", "rating_stoch_14_3_3"),
+    TechnicalRatingComponent("Oscillators", "Commodity Channel Index (20)", "cci_20", "rating_cci_20"),
+    TechnicalRatingComponent("Oscillators", "Average Directional Index (14)", "adx_14_14", "rating_adx_14_14"),
+    TechnicalRatingComponent("Oscillators", "Awesome Oscillator", "ao", "rating_ao"),
+    TechnicalRatingComponent("Oscillators", "Momentum (10)", "mom_10", "rating_mom_10"),
+    TechnicalRatingComponent("Oscillators", "MACD Level (12, 26)", "macd_level_12_26", "rating_macd_12_26_9"),
+    TechnicalRatingComponent(
+        "Oscillators",
+        "Stochastic RSI Fast (3, 3, 14, 14)",
+        "stoch_rsi_k_14_14_3_3",
+        "rating_stoch_rsi_14_14_3_3",
+    ),
+    TechnicalRatingComponent("Oscillators", "Williams Percent Range (14)", "williams_r_14", "rating_williams_r_14"),
+    TechnicalRatingComponent("Oscillators", "Bull Bear Power", "bull_bear_power_50", "rating_bull_bear_power_50"),
+    TechnicalRatingComponent("Oscillators", "Ultimate Oscillator (7, 14, 28)", "uo_7_14_28", "rating_uo_7_14_28"),
 )
-MA_SIGNAL_COLUMNS = tuple(
-    [f"rating_sma_{period}" for period in MA_PERIODS]
-    + [f"rating_ema_{period}" for period in MA_PERIODS]
-    + ["rating_hma_9", "rating_vwma_20", "rating_ichimoku_9_26_52"]
+MA_COMPONENTS = (
+    TechnicalRatingComponent("Moving Averages", "Exponential Moving Average (10)", "ema_10", "rating_ema_10"),
+    TechnicalRatingComponent("Moving Averages", "Simple Moving Average (10)", "sma_10", "rating_sma_10"),
+    TechnicalRatingComponent("Moving Averages", "Exponential Moving Average (20)", "ema_20", "rating_ema_20"),
+    TechnicalRatingComponent("Moving Averages", "Simple Moving Average (20)", "sma_20", "rating_sma_20"),
+    TechnicalRatingComponent("Moving Averages", "Exponential Moving Average (30)", "ema_30", "rating_ema_30"),
+    TechnicalRatingComponent("Moving Averages", "Simple Moving Average (30)", "sma_30", "rating_sma_30"),
+    TechnicalRatingComponent("Moving Averages", "Exponential Moving Average (50)", "ema_50", "rating_ema_50"),
+    TechnicalRatingComponent("Moving Averages", "Simple Moving Average (50)", "sma_50", "rating_sma_50"),
+    TechnicalRatingComponent("Moving Averages", "Exponential Moving Average (100)", "ema_100", "rating_ema_100"),
+    TechnicalRatingComponent("Moving Averages", "Simple Moving Average (100)", "sma_100", "rating_sma_100"),
+    TechnicalRatingComponent("Moving Averages", "Exponential Moving Average (200)", "ema_200", "rating_ema_200"),
+    TechnicalRatingComponent("Moving Averages", "Simple Moving Average (200)", "sma_200", "rating_sma_200"),
+    TechnicalRatingComponent(
+        "Moving Averages",
+        "Ichimoku Base Line (9, 26, 52, 26)",
+        "ichimoku_base_26",
+        "rating_ichimoku_9_26_52",
+    ),
+    TechnicalRatingComponent("Moving Averages", "Volume Weighted Moving Average (20)", "vwma_20", "rating_vwma_20"),
+    TechnicalRatingComponent("Moving Averages", "Hull Moving Average (9)", "hma_9", "rating_hma_9"),
 )
+TECHNICAL_RATING_COMPONENTS = OSCILLATOR_COMPONENTS + MA_COMPONENTS
+
+OSCILLATOR_SIGNAL_COLUMNS = tuple(component.rating_column for component in OSCILLATOR_COMPONENTS)
+MA_SIGNAL_COLUMNS = tuple(component.rating_column for component in MA_COMPONENTS)
 
 
 def rating_status(
@@ -46,6 +87,16 @@ def rating_status(
     return "Neutral"
 
 
+def rating_action(value: float | int | pd.NA | None) -> str:
+    if value is None or pd.isna(value):
+        return "NA"
+    if float(value) > 0:
+        return "Buy"
+    if float(value) < 0:
+        return "Sell"
+    return "Neutral"
+
+
 def compute_technical_ratings(candles: pd.DataFrame) -> pd.DataFrame:
     """Compute TradingView-style technical ratings from OHLCV candles.
 
@@ -53,12 +104,12 @@ def compute_technical_ratings(candles: pd.DataFrame) -> pd.DataFrame:
     15 MA-based signals and 11 oscillator-based signals.
 
     TradingView's Help Center documents the indicator conditions and the
-    TechnicalRating library documents the current ensemble composition.
-    For the "uptrend/downtrend" checks used by Stochastic RSI and Bull Bear
-    Power, TradingView does not document a precise standalone rule in the
-    Help Center. This implementation uses the close relative to EMA(50),
-    which aligns with the library's Bull Bear Power length of 50 and gives a
-    stable trend filter for both indicators.
+    official TechnicalRating library documents the current ensemble
+    composition. We follow the library for the oscillator basket membership,
+    including Bull Bear Power length 50. For the "uptrend/downtrend" checks
+    used by Stochastic RSI and Bull Bear Power, TradingView does not publish a
+    standalone trend helper; this implementation uses close relative to EMA(50)
+    so the trend filter stays aligned with the published Bull Bear Power length.
     """
 
     if candles.empty:
@@ -107,12 +158,14 @@ def compute_technical_ratings(candles: pd.DataFrame) -> pd.DataFrame:
     frame["ao"] = _ao(high, low)
     frame["mom_10"] = close - close.shift(10)
     frame["macd_12_26_9"], frame["macd_signal_12_26_9"] = _macd(close, 12, 26, 9)
+    frame["macd_level_12_26"] = frame["macd_12_26_9"] - frame["macd_signal_12_26_9"]
     frame["stoch_rsi_k_14_14_3_3"], frame["stoch_rsi_d_14_14_3_3"] = _stoch_rsi(close, 14, 14, 3, 3)
     frame["williams_r_14"] = _williams_r(high, low, close, 14)
 
     bull_bear_ema = frame["ema_50"]
     frame["bull_power_50"] = high - bull_bear_ema
     frame["bear_power_50"] = low - bull_bear_ema
+    frame["bull_bear_power_50"] = frame["bull_power_50"] + frame["bear_power_50"]
     frame["uo_7_14_28"] = _ultimate_oscillator(high, low, close, 7, 14, 28)
 
     trend_up = close > frame["ema_50"]
@@ -214,6 +267,11 @@ def compute_technical_ratings(candles: pd.DataFrame) -> pd.DataFrame:
     frame["rating_status"] = frame["rating"].apply(rating_status)
     frame["ma_indicator_count"] = frame.loc[:, MA_SIGNAL_COLUMNS].notna().sum(axis=1)
     frame["oscillator_indicator_count"] = frame.loc[:, OSCILLATOR_SIGNAL_COLUMNS].notna().sum(axis=1)
+    action_columns = {
+        component.action_column: frame[component.rating_column].apply(rating_action)
+        for component in TECHNICAL_RATING_COMPONENTS
+    }
+    frame = frame.assign(**action_columns)
 
     return frame
 
@@ -231,7 +289,67 @@ def latest_technical_rating(candles: pd.DataFrame) -> dict[str, Any]:
         "ma_rating_status": latest.get("ma_rating_status"),
         "oscillator_rating": latest.get("oscillator_rating"),
         "oscillator_rating_status": latest.get("oscillator_rating_status"),
+        "ma_indicator_count": latest.get("ma_indicator_count"),
+        "oscillator_indicator_count": latest.get("oscillator_indicator_count"),
     }
+
+
+def latest_technical_rating_audit(candles: pd.DataFrame) -> dict[str, Any]:
+    ratings = compute_technical_ratings(candles)
+    if ratings.empty:
+        return {}
+    latest = ratings.iloc[-1]
+    components: list[dict[str, Any]] = []
+    for component in TECHNICAL_RATING_COMPONENTS:
+        components.append(
+            {
+                "group": component.group,
+                "name": component.name,
+                "value": latest.get(component.value_column),
+                "action": latest.get(component.action_column),
+                "rating": latest.get(component.rating_column),
+                "value_column": component.value_column,
+                "rating_column": component.rating_column,
+                "action_column": component.action_column,
+            }
+        )
+
+    return {
+        **latest_technical_rating(candles),
+        "components": components,
+    }
+
+
+def compare_technical_rating_snapshot(
+    candles: pd.DataFrame,
+    expected_components: list[dict[str, Any]],
+    value_tolerance: float = 0.05,
+) -> pd.DataFrame:
+    audit = latest_technical_rating_audit(candles)
+    actual_components = {component["name"]: component for component in audit.get("components", [])}
+    rows: list[dict[str, Any]] = []
+    for expected in expected_components:
+        name = str(expected.get("name", "")).strip()
+        actual = actual_components.get(name, {})
+        expected_value = expected.get("value", pd.NA)
+        actual_value = actual.get("value", pd.NA)
+        value_matches = pd.NA
+        if pd.notna(expected_value) and pd.notna(actual_value):
+            value_matches = abs(float(expected_value) - float(actual_value)) <= value_tolerance
+        rows.append(
+            {
+                "name": name,
+                "group": expected.get("group", actual.get("group", "")),
+                "expected_action": expected.get("action", ""),
+                "actual_action": actual.get("action", ""),
+                "action_matches": str(expected.get("action", "")).strip().upper()
+                == str(actual.get("action", "")).strip().upper(),
+                "expected_value": expected_value,
+                "actual_value": actual_value,
+                "value_matches": value_matches,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _three_way_rating(

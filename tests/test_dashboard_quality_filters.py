@@ -29,25 +29,36 @@ class DashboardQualityFilterTests(unittest.TestCase):
                 {
                     "symbol": "PASS",
                     "volume_confirmation": True,
-                    "trend_confirmation": True,
+                    "daily_ema_stack_confirmation": True,
+                    "daily_obv_confirmation": True,
                     "median_pair_return_last_3_pct": 12.5,
                 },
                 {
                     "symbol": "LOWRET",
                     "volume_confirmation": True,
-                    "trend_confirmation": True,
+                    "daily_ema_stack_confirmation": True,
+                    "daily_obv_confirmation": True,
                     "median_pair_return_last_3_pct": 2.0,
                 },
                 {
                     "symbol": "NOVOL",
                     "volume_confirmation": False,
-                    "trend_confirmation": True,
+                    "daily_ema_stack_confirmation": True,
+                    "daily_obv_confirmation": True,
                     "median_pair_return_last_3_pct": 20.0,
                 },
                 {
                     "symbol": "NOTREND",
                     "volume_confirmation": True,
-                    "trend_confirmation": False,
+                    "daily_ema_stack_confirmation": False,
+                    "daily_obv_confirmation": True,
+                    "median_pair_return_last_3_pct": 20.0,
+                },
+                {
+                    "symbol": "NOOBV",
+                    "volume_confirmation": True,
+                    "daily_ema_stack_confirmation": True,
+                    "daily_obv_confirmation": False,
                     "median_pair_return_last_3_pct": 20.0,
                 },
             ]
@@ -57,6 +68,7 @@ class DashboardQualityFilterTests(unittest.TestCase):
             signals,
             require_volume_confirmation=True,
             require_trend_confirmation=True,
+            require_obv_confirmation=True,
             return_metric="median_3",
             min_pair_return=5.0,
         )
@@ -80,6 +92,7 @@ class DashboardQualityFilterTests(unittest.TestCase):
             signals,
             require_volume_confirmation=False,
             require_trend_confirmation=False,
+            require_obv_confirmation=False,
             return_metric="last_1",
             min_pair_return=5.0,
         )

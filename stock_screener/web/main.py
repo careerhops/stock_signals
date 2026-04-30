@@ -4,6 +4,7 @@ from copy import deepcopy
 import os
 from pathlib import Path
 from threading import Lock
+import time
 from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
@@ -28,20 +29,33 @@ from stock_screener.data.nse_market_cap import (
 from stock_screener.data.storage import Storage
 from stock_screener.data.supabase_store import SupabaseStore
 from stock_screener.gtt_gain_report import write_gtt_gain_workbook
-from stock_screener.gtt_gain_study import load_gtt_gain_outputs, run_gtt_gain_study, save_gtt_gain_outputs
+from stock_screener.gtt_gain_study import (
+    _latest_signal_context,
+    _merge_latest_context,
+    _prepare_daily,
+    load_gtt_gain_outputs,
+    run_gtt_gain_study,
+    save_gtt_gain_outputs,
+)
 from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
 from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram, send_gtt_stock_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
+from stock_screener.rotation_study import load_rotation_study_outputs, run_rotation_study, save_rotation_study_outputs
 from stock_screener.signal_qa import build_signal_quality_report, strategy_rows_for_display
 from stock_screener.strategy.technical_ratings import latest_technical_rating
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
-from stock_screener.symbols import has_nse_series_suffix, normalize_nse_symbol
+from stock_screener.symbols import normalize_nse_symbol
 from stock_screener.universe import build_universe
 from stock_screener.jobs.large_deals import (
     default_last_7_days_range,
     fetch_and_store_current_large_deals,
 )
-from stock_screener.web.charts import build_gtt_opportunity_chart, build_signal_chart, latest_signal_summary
+from stock_screener.web.charts import (
+    build_gtt_opportunity_chart,
+    build_rotation_group_chart,
+    build_signal_chart,
+    latest_signal_summary,
+)
 
 
 app = FastAPI(title="NSE/BSE Investment Signal Screener")
@@ -66,6 +80,12 @@ templates.env.filters["number"] = _template_number
 
 SCAN_JOBS: dict[str, dict[str, Any]] = {}
 SCAN_JOBS_LOCK = Lock()
+BIG_BULL_DEALS_CACHE: dict[str, Any] = {
+    "fetched_at": 0.0,
+    "rows": pd.DataFrame(),
+}
+BIG_BULL_DEALS_CACHE_LOCK = Lock()
+BIG_BULL_DEALS_CACHE_TTL_SECONDS = 300
 
 GTT_PEAK_SPEED_BUCKETS = [
     "Within 30 days",
@@ -107,7 +127,10 @@ def _load_symbol_metadata(config: dict) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
 
-    metadata = pd.read_csv(path)
+    try:
+        metadata = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
     if metadata.empty or "symbol" not in metadata.columns:
         return pd.DataFrame()
 
@@ -235,6 +258,7 @@ def _apply_signal_quality_filters(
     frame: pd.DataFrame,
     require_volume_confirmation: bool,
     require_trend_confirmation: bool,
+    require_obv_confirmation: bool,
     return_metric: str,
     min_pair_return: float | None,
 ) -> pd.DataFrame:
@@ -248,9 +272,18 @@ def _apply_signal_quality_filters(
         filtered = filtered[_truthy_series(filtered["volume_confirmation"])]
 
     if require_trend_confirmation:
-        if "trend_confirmation" not in filtered.columns:
+        required = {"daily_ema_stack_confirmation", "trend_confirmation"}
+        if not required.intersection(filtered.columns):
             return filtered.iloc[0:0].copy()
-        filtered = filtered[_truthy_series(filtered["trend_confirmation"])]
+        column = "daily_ema_stack_confirmation" if "daily_ema_stack_confirmation" in filtered.columns else "trend_confirmation"
+        filtered = filtered[_truthy_series(filtered[column])]
+
+    if require_obv_confirmation:
+        required = {"daily_obv_confirmation", "obv_confirmation"}
+        if not required.intersection(filtered.columns):
+            return filtered.iloc[0:0].copy()
+        column = "daily_obv_confirmation" if "daily_obv_confirmation" in filtered.columns else "obv_confirmation"
+        filtered = filtered[_truthy_series(filtered[column])]
 
     if min_pair_return is not None:
         metric_column = (
@@ -269,13 +302,16 @@ def _signal_quality_filter_warning(
     frame: pd.DataFrame,
     require_volume_confirmation: bool,
     require_trend_confirmation: bool,
+    require_obv_confirmation: bool,
     min_pair_return: float | None,
 ) -> str:
     missing_columns = []
     if require_volume_confirmation and "volume_confirmation" not in frame.columns:
         missing_columns.append("volume confirmation")
-    if require_trend_confirmation and "trend_confirmation" not in frame.columns:
-        missing_columns.append("trend confirmation")
+    if require_trend_confirmation and not {"daily_ema_stack_confirmation", "trend_confirmation"}.intersection(frame.columns):
+        missing_columns.append("daily EMA stack confirmation")
+    if require_obv_confirmation and not {"daily_obv_confirmation", "obv_confirmation"}.intersection(frame.columns):
+        missing_columns.append("OBV confirmation")
     if min_pair_return is not None and not {
         "prior_pair_return_last_1_pct",
         "median_pair_return_last_3_pct",
@@ -318,6 +354,7 @@ def _apply_gtt_stock_filters(
     fresh_daily_buy_only: bool = False,
     fresh_daily_buy_symbols: set[str] | None = None,
     require_volume_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     technical_rating_status: str = "",
 ) -> pd.DataFrame:
     if frame.empty:
@@ -345,6 +382,13 @@ def _apply_gtt_stock_filters(
             return filtered.iloc[0:0].copy()
         filtered = filtered[_truthy_series(filtered["volume_confirmation"])]
 
+    if require_obv_confirmation:
+        required = {"daily_obv_confirmation", "obv_confirmation"}
+        if not required.intersection(filtered.columns):
+            return filtered.iloc[0:0].copy()
+        column = "daily_obv_confirmation" if "daily_obv_confirmation" in filtered.columns else "obv_confirmation"
+        filtered = filtered[_truthy_series(filtered[column])]
+
     if technical_rating_status:
         if "weekly_technical_rating_status" not in filtered.columns:
             return filtered.iloc[0:0].copy()
@@ -354,13 +398,11 @@ def _apply_gtt_stock_filters(
         ]
 
     if trend_only:
-        required = {"close_above_ema20", "ema20_above_ema50"}
-        if not required.issubset(filtered.columns):
+        required = {"daily_ema_stack_confirmation", "trend_confirmation"}
+        if not required.intersection(filtered.columns):
             return filtered.iloc[0:0].copy()
-        filtered = filtered[
-            _truthy_series(filtered["close_above_ema20"])
-            & _truthy_series(filtered["ema20_above_ema50"])
-        ]
+        column = "daily_ema_stack_confirmation" if "daily_ema_stack_confirmation" in filtered.columns else "trend_confirmation"
+        filtered = filtered[_truthy_series(filtered[column])]
 
     return filtered
 
@@ -384,6 +426,7 @@ def _gtt_filter_warning(
     fresh_daily_buy_only: bool = False,
     fresh_daily_buy_symbols: set[str] | None = None,
     require_volume_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     technical_rating_status: str = "",
 ) -> str:
     missing = []
@@ -391,13 +434,15 @@ def _gtt_filter_warning(
         missing.append("open BUY regime")
     if fresh_weekly_buy_only and "latest_week_signal" not in frame.columns:
         missing.append("fresh weekly BUY")
-    if trend_only and not {"close_above_ema20", "ema20_above_ema50"}.issubset(frame.columns):
-        missing.append("EMA trend")
+    if trend_only and not {"daily_ema_stack_confirmation", "trend_confirmation"}.intersection(frame.columns):
+        missing.append("daily EMA stack")
     if require_volume_confirmation and (
         "volume_confirmation" not in frame.columns
         or not frame["volume_confirmation"].notna().any()
     ):
         missing.append("volume confirmation")
+    if require_obv_confirmation and not {"daily_obv_confirmation", "obv_confirmation"}.intersection(frame.columns):
+        missing.append("OBV confirmation")
     if dashboard_buy_only and not dashboard_buy_symbols:
         missing.append("dashboard BUY symbols")
     if fresh_daily_buy_only and not fresh_daily_buy_symbols:
@@ -658,6 +703,61 @@ def _ensure_gtt_weekly_technical_ratings(
     return merged
 
 
+def _expected_weekday_for_anchor(weekly_anchor: str) -> int | None:
+    anchor = str(weekly_anchor or "").strip().upper()
+    mapping = {
+        "W-MON": 0,
+        "W-TUE": 1,
+        "W-WED": 2,
+        "W-THU": 3,
+        "W-FRI": 4,
+        "W-SAT": 5,
+        "W-SUN": 6,
+    }
+    return mapping.get(anchor)
+
+
+def _ensure_gtt_latest_signal_context(
+    data_root: Path,
+    stock_stats: pd.DataFrame,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    if stock_stats.empty or "symbol" not in stock_stats.columns:
+        return stock_stats
+
+    strategy_cfg = config.get("strategy", {})
+    weekly_anchor = strategy_cfg.get("weekly_anchor", "W-FRI")
+    use_completed_weeks_only = bool(strategy_cfg.get("use_completed_weeks_only", True))
+
+    storage = Storage(data_root)
+    context_rows: list[dict[str, Any]] = []
+    symbols_to_refresh = stock_stats[["exchange", "symbol", "name"]].drop_duplicates()
+
+    for _, row in symbols_to_refresh.iterrows():
+        exchange = str(row.get("exchange") or "NSE").upper()
+        symbol = str(row.get("symbol") or "").upper()
+        name = str(row.get("name") or symbol)
+        if not symbol:
+            continue
+        daily = storage.load_candles(exchange, symbol, "1D")
+        if daily.empty:
+            context_rows.append(_latest_signal_context(pd.DataFrame(), pd.DataFrame(), exchange, symbol, name))
+            continue
+        daily = _prepare_daily(daily)
+        weekly = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
+        strategy_output = run_weekly_buy_sell(weekly, config) if not weekly.empty else pd.DataFrame()
+        context_rows.append(_latest_signal_context(strategy_output, daily, exchange, symbol, name))
+
+    if not context_rows:
+        return stock_stats
+
+    refreshed = _merge_latest_context(stock_stats, pd.DataFrame(context_rows))
+    stock_stats_path = _latest_gtt_gain_paths(data_root)["stock_stats"]
+    if stock_stats_path.exists():
+        refreshed.to_csv(stock_stats_path, index=False)
+    return refreshed
+
+
 def _gtt_peak_speed_bucket(days_to_peak: Any) -> str:
     days = pd.to_numeric(pd.Series([days_to_peak]), errors="coerce").iloc[0]
     if pd.isna(days):
@@ -781,6 +881,7 @@ def _gtt_filter_query(
     fresh_daily_buy_only: bool = False,
     trend_only: bool = False,
     require_volume_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     require_screener_trend_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_pct: str = "",
@@ -814,6 +915,8 @@ def _gtt_filter_query(
         params.append("trend_only=1")
     if require_volume_confirmation:
         params.append("require_volume_confirmation=1")
+    if require_obv_confirmation:
+        params.append("require_obv_confirmation=1")
     if require_screener_trend_confirmation:
         params.append("require_trend_confirmation=1")
     if return_metric:
@@ -840,6 +943,7 @@ def _gtt_filter_summary(
     fresh_daily_buy_only: bool = False,
     trend_only: bool = False,
     require_volume_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     require_screener_trend_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_text: str = "",
@@ -868,13 +972,15 @@ def _gtt_filter_summary(
     if fresh_daily_buy_only:
         filters.append("Fresh daily BUY only")
     if trend_only:
-        filters.append("Close > 20W EMA and 20W EMA > 50W EMA")
+        filters.append("Daily EMA stack confirmed")
     if require_volume_confirmation:
         filters.append("Volume confirmed")
+    if require_obv_confirmation:
+        filters.append("OBV rising over last 20 days")
     if technical_rating_status:
         filters.append(f"Weekly technical rating: {technical_rating_status}")
     if require_screener_trend_confirmation:
-        filters.append("Home screener trend confirmation")
+        filters.append("Home screener daily EMA stack")
     if min_pair_return_text:
         metric_label = "Home last completed BUY-SELL return" if return_metric == "last_1" else "Home median last 3 BUY-SELL returns"
         filters.append(f"{metric_label} >= {min_pair_return_text}%")
@@ -926,6 +1032,7 @@ def _dashboard_link_suffix(request: Request) -> str:
         "max_cmp",
         "require_volume_confirmation",
         "require_trend_confirmation",
+        "require_obv_confirmation",
         "return_metric",
         "min_pair_return_pct",
     ):
@@ -945,6 +1052,7 @@ def _dashboard_filter_query(
     max_cmp: str = "",
     require_volume_confirmation: bool = False,
     require_trend_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_pct: str = "",
 ) -> str:
@@ -967,6 +1075,8 @@ def _dashboard_filter_query(
         params.append("require_volume_confirmation=1")
     if require_trend_confirmation:
         params.append("require_trend_confirmation=1")
+    if require_obv_confirmation:
+        params.append("require_obv_confirmation=1")
     if return_metric:
         params.append(f"return_metric={quote(return_metric)}")
     if min_pair_return_pct:
@@ -983,6 +1093,7 @@ def _buy_signal_filter_summary(
     max_cmp_text: str = "",
     require_volume_confirmation: bool = False,
     require_trend_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_text: str = "",
 ) -> str:
@@ -1002,7 +1113,9 @@ def _buy_signal_filter_summary(
     if require_volume_confirmation:
         filters.append("Volume confirmation: Yes")
     if require_trend_confirmation:
-        filters.append("Trend confirmation: Yes")
+        filters.append("Daily EMA stack: Yes")
+    if require_obv_confirmation:
+        filters.append("OBV rising 20D: Yes")
     if min_pair_return_text:
         metric_label = "Last completed BUY-SELL return" if return_metric == "last_1" else "Median last 3 BUY-SELL returns"
         filters.append(f"{metric_label} >= {min_pair_return_text}%")
@@ -1049,6 +1162,7 @@ def _load_visible_buy_signals(
     max_cmp: float | None = None,
     require_volume_confirmation: bool = False,
     require_trend_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return: float | None = None,
 ) -> pd.DataFrame:
@@ -1062,6 +1176,7 @@ def _load_visible_buy_signals(
         filtered,
         require_volume_confirmation,
         require_trend_confirmation,
+        require_obv_confirmation,
         return_metric,
         min_pair_return,
     )
@@ -1096,6 +1211,7 @@ def _load_visible_gtt_stock_stats(
     trend_only: bool = False,
     peak_speed_bucket: str = "",
     require_volume_confirmation: bool = False,
+    require_obv_confirmation: bool = False,
     technical_rating_status: str = "",
 ) -> pd.DataFrame:
     latest = load_gtt_gain_outputs(_gtt_gain_dir(data_root))
@@ -1115,6 +1231,7 @@ def _load_visible_gtt_stock_stats(
         fresh_daily_buy_only,
         _daily_buy_symbols(data_root),
         require_volume_confirmation,
+        require_obv_confirmation,
         technical_rating_status,
     )
     stock_stats = _apply_peak_speed_bucket_filter(stock_stats, peak_speed_bucket)
@@ -1226,6 +1343,19 @@ def _gtt_gain_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
 
 def _gtt_gain_error_url(error: Exception, query_suffix: str) -> str:
     return f"/gtt-gain-study?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
+def _rotation_study_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/rotation-study?"
+        f"study_ran=1&groups_found={summary.get('groups_found', 0)}"
+        f"&candidates={summary.get('catch_up_candidates', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _rotation_study_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/rotation-study?study_error={quote(str(error)[:500])}{query_suffix}"
 
 
 def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: str) -> None:
@@ -1343,6 +1473,59 @@ def _run_gtt_gain_job(job_id: str, config: dict[str, Any], data_root: Path, quer
         )
 
 
+def _run_rotation_study_job(job_id: str, config: dict[str, Any], data_root: Path, query_suffix: str) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Rotation Study",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_rotation_study(config, storage, exchange="NSE", progress_callback=progress_callback)
+        save_rotation_study_outputs(result, _rotation_study_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_rotation_study_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_rotation_study_error_url(exc, query_suffix),
+        )
+
+
 def _has_market_cap_metadata(storage: Storage) -> bool:
     metadata = storage.load_symbol_metadata()
     return (
@@ -1399,21 +1582,35 @@ def _ensure_market_cap_metadata(config: dict, storage: Storage) -> None:
 
 
 def _load_big_bull_deals(data_root: Path) -> pd.DataFrame:
+    with BIG_BULL_DEALS_CACHE_LOCK:
+        fetched_at = float(BIG_BULL_DEALS_CACHE.get("fetched_at") or 0.0)
+        cached_rows = BIG_BULL_DEALS_CACHE.get("rows")
+        if (
+            isinstance(cached_rows, pd.DataFrame)
+            and time.monotonic() - fetched_at < BIG_BULL_DEALS_CACHE_TTL_SECONDS
+        ):
+            return cached_rows.copy()
+
     default_from, default_to = default_last_7_days_range()
     try:
         rows = SupabaseStore().list_large_deals(
             limit=1000,
             from_date=default_from.isoformat(),
             to_date=default_to.isoformat(),
+            timeout=3,
         )
         if rows:
-            return pd.DataFrame(rows)
+            deals = pd.DataFrame(rows)
+            with BIG_BULL_DEALS_CACHE_LOCK:
+                BIG_BULL_DEALS_CACHE["fetched_at"] = time.monotonic()
+                BIG_BULL_DEALS_CACHE["rows"] = deals.copy()
+            return deals
     except Exception as exc:
         print(f"Supabase large deals unavailable; falling back to CSV: {exc}")
 
     path = data_root / "deals" / "big_bull_trades.csv"
     if not path.exists():
-        return pd.DataFrame(
+        deals = pd.DataFrame(
             columns=[
                 "date",
                 "exchange",
@@ -1427,7 +1624,13 @@ def _load_big_bull_deals(data_root: Path) -> pd.DataFrame:
                 "source",
             ]
         )
-    return pd.read_csv(path)
+    else:
+        deals = pd.read_csv(path)
+
+    with BIG_BULL_DEALS_CACHE_LOCK:
+        BIG_BULL_DEALS_CACHE["fetched_at"] = time.monotonic()
+        BIG_BULL_DEALS_CACHE["rows"] = deals.copy()
+    return deals
 
 
 def _large_deal_markers(deals: pd.DataFrame) -> dict[str, dict[str, Any]]:
@@ -1522,6 +1725,63 @@ def _latest_gtt_gain_paths(data_root: Path) -> dict[str, Path]:
         "open_positions": directory / "latest_open_positions.csv",
         "workbook": directory / "gtt_gain_study_report.xlsx",
     }
+
+
+def _rotation_study_dir(data_root: Path) -> Path:
+    path = data_root / "rotation_study"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _latest_rotation_study_paths(data_root: Path) -> dict[str, Path]:
+    directory = _rotation_study_dir(data_root)
+    return {
+        "summary": directory / "latest_summary.csv",
+        "groups": directory / "latest_groups.csv",
+        "members": directory / "latest_members.csv",
+        "candidates": directory / "latest_candidates.csv",
+    }
+
+
+def _rotation_group_chart_rows(
+    data_root: Path,
+    config: dict[str, Any],
+    groups: pd.DataFrame,
+    members: pd.DataFrame,
+    selected_group_id: str,
+) -> list[dict[str, Any]]:
+    if groups.empty or members.empty:
+        return []
+
+    chart_groups = groups.copy()
+    if selected_group_id:
+        chart_groups = chart_groups[chart_groups["group_id"].astype(str).str.upper() == selected_group_id.upper()]
+    else:
+        chart_groups = chart_groups.head(6)
+
+    rows: list[dict[str, Any]] = []
+    for _, group_row in chart_groups.iterrows():
+        group_id = str(group_row.get("group_id", ""))
+        if not group_id:
+            continue
+        group_members = members[members["group_id"].astype(str) == group_id].copy()
+        if group_members.empty:
+            continue
+        chart_html = build_rotation_group_chart(data_root, config, group_id, group_members)
+        if not chart_html:
+            continue
+        rows.append(
+            {
+                "group_id": group_id,
+                "group_size": group_row.get("group_size", ""),
+                "leaders_count": group_row.get("leaders_count", ""),
+                "catch_up_candidates_count": group_row.get("catch_up_candidates_count", ""),
+                "latest_weekly_buy_count": group_row.get("latest_weekly_buy_count", ""),
+                "latest_weekly_sell_count": group_row.get("latest_weekly_sell_count", ""),
+                "chart_html": chart_html,
+            }
+        )
+    return rows
 
 
 def _load_latest_backtest(data_root: Path) -> dict[str, Any]:
@@ -1682,6 +1942,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     min_cmp = _optional_float(min_cmp_text)
     max_cmp = _optional_float(max_cmp_text)
     require_volume_confirmation = _request_bool(request, "require_volume_confirmation")
+    require_obv_confirmation = _request_bool(request, "require_obv_confirmation")
     require_screener_trend_confirmation = _request_bool(request, "require_trend_confirmation")
     selected_return_metric = request.query_params.get("return_metric", "median_3").strip() or "median_3"
     if selected_return_metric not in {"last_1", "median_3"}:
@@ -1732,6 +1993,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         fresh_daily_buy_only,
         fresh_daily_buy_symbols,
         require_volume_confirmation,
+        require_obv_confirmation,
         selected_technical_rating_status,
     )
     pair_details = universe_pair_details
@@ -1748,6 +2010,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         fresh_daily_buy_only,
         fresh_daily_buy_symbols,
         require_volume_confirmation,
+        require_obv_confirmation,
         selected_technical_rating_status,
     )
     bucket_chart_stock_stats = stock_stats.copy()
@@ -1760,6 +2023,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         or fresh_daily_buy_only
         or trend_only
         or require_volume_confirmation
+        or require_obv_confirmation
         or selected_peak_speed_bucket
         or selected_technical_rating_status
         or min_cmp is not None
@@ -1772,13 +2036,13 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     if fresh_weekly_buy_only and trend_only:
         gtt_opportunity_chart_html = build_gtt_opportunity_chart(bucket_chart_stock_stats)
         gtt_opportunity_chart_message = (
-            "No chartable stocks remain after the Fresh weekly BUY and EMA trend filters."
+            "No chartable stocks remain after the Fresh weekly BUY and daily EMA stack filters."
             if not gtt_opportunity_chart_html
             else ""
         )
     else:
         gtt_opportunity_chart_message = (
-            "Apply Fresh weekly BUY only and Close > 20W EMA / 20W EMA > 50W EMA to plot the bucket chart."
+            "Apply Fresh weekly BUY only and Daily EMA stack to plot the bucket chart."
         )
     workbook_path = _latest_gtt_gain_paths(data_root)["workbook"]
     gtt_filter_query = _gtt_filter_query(
@@ -1795,6 +2059,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         fresh_daily_buy_only=fresh_daily_buy_only,
         trend_only=trend_only,
         require_volume_confirmation=require_volume_confirmation,
+        require_obv_confirmation=require_obv_confirmation,
         require_screener_trend_confirmation=require_screener_trend_confirmation,
         return_metric=selected_return_metric if min_pair_return_text else "",
         min_pair_return_pct=min_pair_return_text,
@@ -1814,6 +2079,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         fresh_daily_buy_only,
         trend_only,
         require_volume_confirmation,
+        require_obv_confirmation,
         require_screener_trend_confirmation,
         selected_return_metric,
         min_pair_return_text,
@@ -1854,6 +2120,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "selected_min_cmp": min_cmp_text,
             "selected_max_cmp": max_cmp_text,
             "require_volume_confirmation": require_volume_confirmation,
+            "require_obv_confirmation": require_obv_confirmation,
             "require_screener_trend_confirmation": require_screener_trend_confirmation,
             "selected_return_metric": selected_return_metric,
             "selected_min_pair_return": min_pair_return_text,
@@ -1909,6 +2176,95 @@ def download_gtt_gain_study_report() -> FileResponse:
     )
 
 
+@app.get("/rotation-study", response_class=HTMLResponse)
+def rotation_study_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    data_root = get_data_root(config)
+    latest = load_rotation_study_outputs(_rotation_study_dir(data_root))
+
+    selected_group_id = request.query_params.get("group_id", "").strip().upper()
+    selected_movement_status = request.query_params.get("movement_status", "").strip()
+    stock_search = request.query_params.get("stock_search", "").strip()
+
+    groups = latest.groups.copy()
+    all_members = latest.members.copy()
+    members = all_members.copy()
+    candidates = latest.candidates.copy()
+
+    if selected_group_id and not members.empty:
+        members = members[members["group_id"].astype(str).str.upper() == selected_group_id]
+        candidates = candidates[candidates["group_id"].astype(str).str.upper() == selected_group_id]
+    if selected_movement_status and not members.empty:
+        members = members[members["movement_status"].astype(str) == selected_movement_status]
+    if stock_search:
+        members = _apply_stock_search(members, stock_search)
+        candidates = _apply_stock_search(candidates, stock_search)
+
+    if not groups.empty:
+        groups = groups.head(40)
+    if not members.empty:
+        members = members.head(200)
+    if not candidates.empty:
+        candidates = candidates.head(100)
+    group_chart_rows = _rotation_group_chart_rows(
+        data_root=data_root,
+        config=config,
+        groups=groups,
+        members=all_members,
+        selected_group_id=selected_group_id,
+    )
+
+    return templates.TemplateResponse(
+        "rotation_study.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "summary": latest.summary,
+            "groups": _records(groups),
+            "members": _records(members),
+            "candidates": _records(candidates),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "rotation_job": request.query_params.get("rotation_job", ""),
+            "selected_group_id": selected_group_id,
+            "selected_movement_status": selected_movement_status,
+            "stock_search": stock_search,
+            "movement_status_options": ["Leader", "Catch-up Candidate", "In Sync", "Lagging"],
+            "groups_found": request.query_params.get("groups_found", ""),
+            "candidates_found": request.query_params.get("candidates", ""),
+            "group_chart_rows": group_chart_rows,
+        },
+    )
+
+
+@app.post("/rotation-study/run")
+def run_rotation_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    dashboard_token = request.query_params.get("token", "").strip()
+    params = []
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = ("&" + "&".join(params)) if params else ""
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(_run_rotation_study_job, job_id, config, data_root, query_suffix)
+        redirect_url = f"/rotation-study?rotation_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = _rotation_study_error_url(exc, query_suffix)
+    return RedirectResponse(redirect_url, status_code=303)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     if not _is_allowed(request):
@@ -1936,6 +2292,7 @@ def dashboard(request: Request) -> HTMLResponse:
     max_cmp = _request_float(request, "max_cmp")
     require_volume_confirmation = _request_bool(request, "require_volume_confirmation")
     require_trend_confirmation = _request_bool(request, "require_trend_confirmation")
+    require_obv_confirmation = _request_bool(request, "require_obv_confirmation")
     selected_return_metric = request.query_params.get("return_metric", "median_3").strip() or "median_3"
     if selected_return_metric not in {"last_1", "median_3"}:
         selected_return_metric = "median_3"
@@ -1957,7 +2314,9 @@ def dashboard(request: Request) -> HTMLResponse:
     if require_volume_confirmation:
         active_filter_parts.append("Volume confirmed")
     if require_trend_confirmation:
-        active_filter_parts.append("Trend confirmed")
+        active_filter_parts.append("Daily EMA stack confirmed")
+    if require_obv_confirmation:
+        active_filter_parts.append("OBV rising over last 20 days")
     if min_pair_return is not None:
         metric_label = "last pair return" if selected_return_metric == "last_1" else "median last 3 pair return"
         active_filter_parts.append(f"{metric_label} >= {request.query_params.get('min_pair_return_pct')}%")
@@ -1989,12 +2348,14 @@ def dashboard(request: Request) -> HTMLResponse:
         filtered,
         require_volume_confirmation,
         require_trend_confirmation,
+        require_obv_confirmation,
         min_pair_return,
     )
     filtered = _apply_signal_quality_filters(
         filtered,
         require_volume_confirmation,
         require_trend_confirmation,
+        require_obv_confirmation,
         selected_return_metric,
         min_pair_return,
     )
@@ -2115,6 +2476,7 @@ def dashboard(request: Request) -> HTMLResponse:
             "selected_max_cmp": request.query_params.get("max_cmp", ""),
             "require_volume_confirmation": require_volume_confirmation,
             "require_trend_confirmation": require_trend_confirmation,
+            "require_obv_confirmation": require_obv_confirmation,
             "selected_return_metric": selected_return_metric,
             "selected_min_pair_return": request.query_params.get("min_pair_return_pct", ""),
             "signal_quality_warning": signal_quality_warning,
@@ -2137,6 +2499,7 @@ def dashboard(request: Request) -> HTMLResponse:
                 max_cmp=request.query_params.get("max_cmp", ""),
                 require_volume_confirmation=require_volume_confirmation,
                 require_trend_confirmation=require_trend_confirmation,
+                require_obv_confirmation=require_obv_confirmation,
                 return_metric=selected_return_metric if request.query_params.get("min_pair_return_pct", "") else "",
                 min_pair_return_pct=request.query_params.get("min_pair_return_pct", ""),
             ),
@@ -2241,6 +2604,7 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
     max_cmp_text = str(form.get("max_cmp", "")).strip()
     require_volume_confirmation = str(form.get("require_volume_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
     require_trend_confirmation = str(form.get("require_trend_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    require_obv_confirmation = str(form.get("require_obv_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
     return_metric = str(form.get("return_metric", "median_3")).strip() or "median_3"
     if return_metric not in {"last_1", "median_3"}:
         return_metric = "median_3"
@@ -2261,6 +2625,7 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
         max_cmp=max_cmp_text,
         require_volume_confirmation=require_volume_confirmation,
         require_trend_confirmation=require_trend_confirmation,
+        require_obv_confirmation=require_obv_confirmation,
         return_metric=return_metric if min_pair_return_text else "",
         min_pair_return_pct=min_pair_return_text,
     )
@@ -2277,6 +2642,7 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             max_cmp,
             require_volume_confirmation,
             require_trend_confirmation,
+            require_obv_confirmation,
             return_metric,
             min_pair_return,
         )
@@ -2296,6 +2662,7 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             max_cmp_text,
             require_volume_confirmation,
             require_trend_confirmation,
+            require_obv_confirmation,
             return_metric,
             min_pair_return_text,
         )
@@ -2333,6 +2700,7 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
     fresh_daily_buy_only = str(form.get("fresh_daily_buy_only", "")).strip().lower() in {"1", "true", "on", "yes"}
     trend_only = str(form.get("trend_only", "")).strip().lower() in {"1", "true", "on", "yes"}
     require_volume_confirmation = str(form.get("require_volume_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    require_obv_confirmation = str(form.get("require_obv_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
     peak_speed_bucket = str(form.get("peak_speed_bucket", "")).strip()
     technical_rating_status = str(form.get("technical_rating_status", "")).strip()
     if peak_speed_bucket not in GTT_PEAK_SPEED_BUCKETS:
@@ -2354,6 +2722,7 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
         fresh_daily_buy_only=fresh_daily_buy_only,
         trend_only=trend_only,
         require_volume_confirmation=require_volume_confirmation,
+        require_obv_confirmation=require_obv_confirmation,
         peak_speed_bucket=peak_speed_bucket,
         technical_rating_status=technical_rating_status,
     )
@@ -2376,6 +2745,7 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
             trend_only,
             peak_speed_bucket,
             require_volume_confirmation,
+            require_obv_confirmation,
             technical_rating_status,
         )
         if visible_gtt_stocks.empty:
@@ -2394,6 +2764,7 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
             fresh_daily_buy_only,
             trend_only,
             require_volume_confirmation=require_volume_confirmation,
+            require_obv_confirmation=require_obv_confirmation,
             peak_speed_bucket=peak_speed_bucket,
             technical_rating_status=technical_rating_status,
         )
@@ -2598,7 +2969,7 @@ def stocks_page(request: Request) -> HTMLResponse:
     _ensure_market_cap_metadata(config, storage)
     instruments = storage.load_instruments()
 
-    stocks = instruments.copy()
+    stocks = build_universe(instruments, config)
     watchlist = storage.load_watchlist()
     watchlist_keys = set(zip(watchlist["exchange"], watchlist["symbol"]))
     active_stock_filters = False
@@ -2610,19 +2981,7 @@ def stocks_page(request: Request) -> HTMLResponse:
     metadata = _combined_symbol_metadata(config, storage)
     if not stocks.empty:
         universe_cfg = config.get("universe", {})
-        exchanges = set(universe_cfg.get("exchanges", ["NSE"]))
-        instrument_types = set(universe_cfg.get("instrument_types", ["EQ"]))
-        exclude_series_suffixes = tuple(universe_cfg.get("exclude_series_suffixes", []) or [])
         restrict_to_metadata_symbols = bool(universe_cfg.get("restrict_to_metadata_symbols", False))
-        stocks = stocks[stocks["exchange"].isin(exchanges)]
-        if "instrument_type" in stocks.columns:
-            stocks = stocks[stocks["instrument_type"].isin(instrument_types)]
-        if "segment" in stocks.columns:
-            stocks = stocks[stocks["segment"].astype(str).str.upper() != "INDICES"]
-        if exclude_series_suffixes and "tradingsymbol" in stocks.columns:
-            stocks = stocks[
-                ~stocks["tradingsymbol"].apply(lambda symbol: has_nse_series_suffix(symbol, exclude_series_suffixes))
-            ]
 
         if not metadata.empty:
             stocks = stocks.copy()

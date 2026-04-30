@@ -22,6 +22,15 @@ def _weekly_candles(rows: list[tuple[str, float, float, float, float, int]]) -> 
 
 
 class WeeklyBuySellParityTests(unittest.TestCase):
+    def test_empty_input_still_returns_strategy_columns(self) -> None:
+        candles = _weekly_candles([])
+
+        result = run_weekly_buy_sell(candles, _config())
+
+        self.assertTrue(result.empty)
+        for column in ("signal", "final_buy", "final_sell", "volume_confirmation", "trend_confirmation"):
+            self.assertIn(column, result.columns)
+
     def test_buy_and_sell_match_pine_break_fvg_and_exclusivity_rules(self) -> None:
         candles = _weekly_candles(
             [

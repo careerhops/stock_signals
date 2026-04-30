@@ -34,6 +34,9 @@
       {% if trend_only %}
         <input type="hidden" name="trend_only" value="1">
       {% endif %}
+      {% if require_obv_confirmation %}
+        <input type="hidden" name="require_obv_confirmation" value="1">
+      {% endif %}
       {% if require_volume_confirmation %}
         <input type="hidden" name="require_volume_confirmation" value="1">
       {% endif %}
@@ -276,8 +279,9 @@
           {% if dashboard_buy_only %} Filter: dashboard BUY signals only.{% endif %}
           {% if fresh_weekly_buy_only %} Filter: fresh weekly BUY only.{% endif %}
           {% if fresh_daily_buy_only %} Filter: fresh daily BUY only.{% endif %}
-          {% if trend_only %} Filter: close is above 20W EMA and 20W EMA is above 50W EMA.{% endif %}
+          {% if trend_only %} Filter: daily EMA stack confirmed.{% endif %}
           {% if require_volume_confirmation %} Filter: volume confirmed.{% endif %}
+          {% if require_obv_confirmation %} Filter: OBV rising over the last 20 days.{% endif %}
           {% if selected_technical_rating_status %} Filter: weekly technical rating is {{ selected_technical_rating_status }}.{% endif %}
           {% if selected_peak_speed_bucket %} Bucket: {{ selected_peak_speed_bucket }}.{% endif %}
           Low sample means fewer than 3 valid historical pairs.
@@ -357,7 +361,15 @@
           <label class="checkbox-field">
             <input type="checkbox" name="trend_only" value="1" {% if trend_only %}checked{% endif %}>
             <span class="checkbox-copy">
-              <strong>Close &gt; 20W EMA and 20W EMA &gt; 50W EMA</strong>
+              <strong>Close &gt; EMA 20D &gt; EMA 50D &gt; EMA 100D &gt; EMA 200D</strong>
+              <small>Also requires EMA50D, EMA100D, and EMA200D slopes to be above 0.</small>
+            </span>
+          </label>
+          <label class="checkbox-field">
+            <input type="checkbox" name="require_obv_confirmation" value="1" {% if require_obv_confirmation %}checked{% endif %}>
+            <span class="checkbox-copy">
+              <strong>OBV slope &gt; 0 over last 20 days</strong>
+              <small>On-Balance Volume rising means accumulation may be underway.</small>
             </span>
           </label>
           <label class="checkbox-field">
@@ -384,7 +396,7 @@
         <div class="panel-heading compact-heading">
           <h3>GTT Peak Speed Buckets</h3>
           <p>
-            Plots only the stocks that remain after applying Fresh weekly BUY only and the 20W/50W EMA trend filter.
+            Plots only the stocks that remain after applying Fresh weekly BUY only and the daily EMA stack filter.
             Each bar is a median BUY-to-peak time bucket. Hover a bucket to see stock count, median hit rate, median max gain, and top symbols.
           </p>
         </div>
@@ -417,6 +429,9 @@
           {% endif %}
           {% if trend_only %}
             <input type="hidden" name="trend_only" value="1">
+          {% endif %}
+          {% if require_obv_confirmation %}
+            <input type="hidden" name="require_obv_confirmation" value="1">
           {% endif %}
           {% if require_volume_confirmation %}
             <input type="hidden" name="require_volume_confirmation" value="1">
@@ -464,6 +479,9 @@
           {% if trend_only %}
             <input type="hidden" name="trend_only" value="1">
           {% endif %}
+          {% if require_obv_confirmation %}
+            <input type="hidden" name="require_obv_confirmation" value="1">
+          {% endif %}
           {% if require_volume_confirmation %}
             <input type="hidden" name="require_volume_confirmation" value="1">
           {% endif %}
@@ -489,9 +507,11 @@
                 <th>CMP</th>
                 <th>Closed Pairs</th>
                 <th>Valid Pairs</th>
-                <th>Low Sample</th>
+                <th>High Samples</th>
                 <th>Volume Confirmed</th>
                 <th>Volume Ratio</th>
+                <th>Daily EMA Stack</th>
+                <th>OBV 20D Rising</th>
                 <th>Weekly Tech Score</th>
                 <th>Weekly Tech Rating</th>
                 <th>Went Above BUY %</th>
@@ -522,9 +542,11 @@
                   <td>{{ row.get("latest_close", "")|number }}</td>
                   <td>{{ row.get("closed_pairs", "") }}</td>
                   <td>{{ row.get("valid_pairs", "") }}</td>
-                  <td>{{ row.get("low_sample", "") }}</td>
+                  <td>{{ "No" if row.get("low_sample", "") else "Yes" }}</td>
                   <td>{{ row.get("volume_confirmation", "") }}</td>
                   <td>{{ row.get("volume_confirmation_ratio", "")|number }}</td>
+                  <td>{{ row.get("daily_ema_stack_confirmation") if row.get("daily_ema_stack_confirmation") != "" else row.get("trend_confirmation", "") }}</td>
+                  <td>{{ row.get("daily_obv_confirmation") if row.get("daily_obv_confirmation") != "" else row.get("obv_confirmation", "") }}</td>
                   <td>{{ row.get("weekly_technical_rating", "")|number }}</td>
                   <td>{{ row.get("weekly_technical_rating_status", "") }}</td>
                   <td>{{ row.get("went_above_buy_price_rate_pct", "")|number }}</td>

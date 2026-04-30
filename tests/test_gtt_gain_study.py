@@ -18,6 +18,7 @@ from stock_screener.gtt_gain_study import (
 from stock_screener.web.charts import build_gtt_opportunity_chart
 from stock_screener.web.main import (
     _align_gtt_stock_stats_to_latest_universe,
+    _ensure_gtt_latest_signal_context,
     _apply_gtt_stock_filters,
     _ensure_gtt_weekly_technical_ratings,
     _apply_peak_speed_bucket_filter,
@@ -293,7 +294,7 @@ class GttGainStudyTests(unittest.TestCase):
         self.assertIn("Filter: fresh weekly BUY only", response.text)
         self.assertIn("Filter: fresh daily BUY only", response.text)
         self.assertIn("Filter: weekly technical rating is Strong Buy", response.text)
-        self.assertIn("20W EMA", response.text)
+        self.assertIn("Daily EMA", response.text)
         self.assertIn("GTT Peak Speed Buckets", response.text)
         self.assertNotIn("Apply Fresh weekly BUY only", response.text)
 
@@ -345,6 +346,8 @@ class GttGainStudyTests(unittest.TestCase):
                     "latest_week_signal": "NONE",
                     "close_above_ema20": True,
                     "ema20_above_ema50": True,
+                    "daily_ema_stack_confirmation": True,
+                    "daily_obv_confirmation": True,
                     "volume_confirmation": True,
                     "weekly_technical_rating_status": "Strong Buy",
                 },
@@ -354,6 +357,8 @@ class GttGainStudyTests(unittest.TestCase):
                     "latest_week_signal": "BUY",
                     "close_above_ema20": True,
                     "ema20_above_ema50": True,
+                    "daily_ema_stack_confirmation": True,
+                    "daily_obv_confirmation": False,
                     "volume_confirmation": False,
                     "weekly_technical_rating_status": "Buy",
                 },
@@ -363,6 +368,8 @@ class GttGainStudyTests(unittest.TestCase):
                     "latest_week_signal": "BUY",
                     "close_above_ema20": False,
                     "ema20_above_ema50": True,
+                    "daily_ema_stack_confirmation": False,
+                    "daily_obv_confirmation": True,
                     "volume_confirmation": True,
                     "weekly_technical_rating_status": "Sell",
                 },
@@ -384,6 +391,12 @@ class GttGainStudyTests(unittest.TestCase):
             trend_only=False,
             require_volume_confirmation=True,
         )
+        obv_confirmed = _apply_gtt_stock_filters(
+            frame,
+            open_buy_regime_only=False,
+            trend_only=False,
+            require_obv_confirmation=True,
+        )
         fresh_daily_buy = _apply_gtt_stock_filters(
             frame,
             open_buy_regime_only=False,
@@ -402,6 +415,7 @@ class GttGainStudyTests(unittest.TestCase):
         self.assertEqual(set(fresh_buy["symbol"]), {"BBB", "CCC"})
         self.assertEqual(set(dashboard_buy["symbol"]), {"BBB"})
         self.assertEqual(set(volume_confirmed["symbol"]), {"AAA", "CCC"})
+        self.assertEqual(set(obv_confirmed["symbol"]), {"AAA", "CCC"})
         self.assertEqual(set(fresh_daily_buy["symbol"]), {"AAA", "BBB"})
         self.assertEqual(set(buy_rated["symbol"]), {"BBB"})
 
@@ -529,6 +543,54 @@ class GttGainStudyTests(unittest.TestCase):
 
         self.assertTrue(pd.notna(enriched.iloc[0]["weekly_technical_rating"]))
         self.assertIn(enriched.iloc[0]["weekly_technical_rating_status"], {"Strong Buy", "Buy"})
+
+    def test_gtt_latest_signal_context_refreshes_stale_monday_week_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir)
+            storage = Storage(data_root)
+            storage.save_instruments(
+                pd.DataFrame(
+                    [
+                        {"exchange": "NSE", "tradingsymbol": "AAA", "name": "A Ltd", "instrument_type": "EQ", "segment": "NSE"},
+                    ]
+                )
+            )
+            candles = pd.DataFrame(
+                [
+                    {"date": "2026-04-20", "open": 100, "high": 104, "low": 99, "close": 103, "volume": 1000},
+                    {"date": "2026-04-21", "open": 103, "high": 106, "low": 101, "close": 105, "volume": 1200},
+                    {"date": "2026-04-22", "open": 105, "high": 108, "low": 104, "close": 107, "volume": 1100},
+                    {"date": "2026-04-23", "open": 107, "high": 109, "low": 105, "close": 106, "volume": 1150},
+                    {"date": "2026-04-24", "open": 106, "high": 112, "low": 105, "close": 111, "volume": 1300},
+                ]
+            )
+            storage.save_candles("NSE", "AAA", candles)
+
+            stale = pd.DataFrame(
+                [
+                    {
+                        "exchange": "NSE",
+                        "symbol": "AAA",
+                        "name": "A Ltd",
+                        "latest_week_date": "2026-04-27",
+                        "latest_week_signal": "BUY",
+                        "latest_signal": "BUY",
+                        "latest_signal_date": "2026-04-27",
+                        "is_latest_signal_buy": True,
+                    }
+                ]
+            )
+
+            refreshed = _ensure_gtt_latest_signal_context(
+                data_root,
+                stale,
+                {"strategy": {"weekly_anchor": "W-FRI", "use_completed_weeks_only": True}},
+            )
+
+        self.assertEqual(str(pd.to_datetime(refreshed.iloc[0]["latest_week_date"]).date()), "2026-04-24")
+        self.assertEqual(refreshed.iloc[0]["latest_week_signal"], "NONE")
+        self.assertEqual(refreshed.iloc[0]["latest_signal"], "NONE")
+        self.assertFalse(bool(refreshed.iloc[0]["is_latest_signal_buy"]))
 
     def test_gtt_study_processes_kite_instruments_not_stale_cached_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

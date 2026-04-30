@@ -8,6 +8,7 @@ import pandas as pd
 
 from stock_screener.data.storage import Storage
 from stock_screener.resample import resample_daily_to_weekly
+from stock_screener.strategy.daily_confirmation import latest_daily_confirmation
 from stock_screener.strategy.technical_ratings import latest_technical_rating
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
 from stock_screener.universe import build_universe
@@ -72,7 +73,7 @@ def run_gtt_gain_study(
         )
         daily = storage.load_candles(row_exchange, symbol, "1D")
         if daily.empty:
-            context_rows.append(_latest_signal_context(pd.DataFrame(), row_exchange, symbol, name))
+            context_rows.append(_latest_signal_context(pd.DataFrame(), pd.DataFrame(), row_exchange, symbol, name))
             _emit_progress(
                 progress_callback,
                 phase="Analyzing BUY-to-SELL daily highs",
@@ -86,7 +87,7 @@ def run_gtt_gain_study(
         daily = _prepare_daily(daily)
         weekly = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
         if weekly.empty:
-            context_rows.append(_latest_signal_context(pd.DataFrame(), row_exchange, symbol, name))
+            context_rows.append(_latest_signal_context(pd.DataFrame(), daily, row_exchange, symbol, name))
             _emit_progress(
                 progress_callback,
                 phase="Analyzing BUY-to-SELL daily highs",
@@ -98,7 +99,7 @@ def run_gtt_gain_study(
             continue
 
         strategy_output = run_weekly_buy_sell(weekly, config)
-        context_rows.append(_latest_signal_context(strategy_output, row_exchange, symbol, name))
+        context_rows.append(_latest_signal_context(strategy_output, daily, row_exchange, symbol, name))
         pairs, open_position = build_symbol_gtt_pairs(
             daily=daily,
             strategy_output=strategy_output,
@@ -412,7 +413,13 @@ def _open_position_row(daily: pd.DataFrame, active_buy: dict[str, Any]) -> dict[
     }
 
 
-def _latest_signal_context(strategy_output: pd.DataFrame, exchange: str, symbol: str, name: str) -> dict[str, Any]:
+def _latest_signal_context(
+    strategy_output: pd.DataFrame,
+    daily: pd.DataFrame,
+    exchange: str,
+    symbol: str,
+    name: str,
+) -> dict[str, Any]:
     if strategy_output.empty:
         return {
             "exchange": exchange,
@@ -425,6 +432,18 @@ def _latest_signal_context(strategy_output: pd.DataFrame, exchange: str, symbol:
             "close_above_ema20": False,
             "ema20_above_ema50": False,
             "trend_confirmation": False,
+            "daily_ema_20": pd.NA,
+            "daily_ema_50": pd.NA,
+            "daily_ema_100": pd.NA,
+            "daily_ema_200": pd.NA,
+            "daily_ema50_slope": pd.NA,
+            "daily_ema100_slope": pd.NA,
+            "daily_ema200_slope": pd.NA,
+            "daily_ema_stack_confirmation": False,
+            "daily_obv": pd.NA,
+            "daily_obv_slope_20d": pd.NA,
+            "daily_obv_confirmation": False,
+            "obv_confirmation": False,
             "volume_confirmation": False,
             "volume_confirmation_ratio": pd.NA,
             "latest_week_signal": "NONE",
@@ -452,6 +471,9 @@ def _latest_signal_context(strategy_output: pd.DataFrame, exchange: str, symbol:
     ema20_above_ema50 = _is_number(ema_20) and _is_number(ema_50) and float(ema_20) > float(ema_50)
     latest_signal = str(latest_signal_row.get("signal", "NONE")) if latest_signal_row is not None else "NONE"
     technical_rating = latest_technical_rating(frame)
+    daily_confirmation = latest_daily_confirmation(daily)
+    daily_ema_stack_confirmation = bool(daily_confirmation.get("daily_ema_stack_confirmation", False))
+    daily_obv_confirmation = bool(daily_confirmation.get("daily_obv_confirmation", False))
 
     return {
         "exchange": exchange,
@@ -463,7 +485,19 @@ def _latest_signal_context(strategy_output: pd.DataFrame, exchange: str, symbol:
         "ema_50": ema_50,
         "close_above_ema20": close_above_ema20,
         "ema20_above_ema50": ema20_above_ema50,
-        "trend_confirmation": close_above_ema20 and ema20_above_ema50,
+        "trend_confirmation": daily_ema_stack_confirmation,
+        "daily_ema_20": _float_or_na(daily_confirmation.get("daily_ema_20")),
+        "daily_ema_50": _float_or_na(daily_confirmation.get("daily_ema_50")),
+        "daily_ema_100": _float_or_na(daily_confirmation.get("daily_ema_100")),
+        "daily_ema_200": _float_or_na(daily_confirmation.get("daily_ema_200")),
+        "daily_ema50_slope": _float_or_na(daily_confirmation.get("daily_ema50_slope")),
+        "daily_ema100_slope": _float_or_na(daily_confirmation.get("daily_ema100_slope")),
+        "daily_ema200_slope": _float_or_na(daily_confirmation.get("daily_ema200_slope")),
+        "daily_ema_stack_confirmation": daily_ema_stack_confirmation,
+        "daily_obv": _float_or_na(daily_confirmation.get("daily_obv")),
+        "daily_obv_slope_20d": _float_or_na(daily_confirmation.get("daily_obv_slope_20d")),
+        "daily_obv_confirmation": daily_obv_confirmation,
+        "obv_confirmation": daily_obv_confirmation,
         "volume_confirmation": bool(latest.get("volume_confirmation", False)),
         "volume_confirmation_ratio": volume_confirmation_ratio,
         "latest_week_signal": str(latest.get("signal", "NONE")),
@@ -535,6 +569,18 @@ def _stock_stats_columns() -> list[str]:
         "close_above_ema20",
         "ema20_above_ema50",
         "trend_confirmation",
+        "daily_ema_20",
+        "daily_ema_50",
+        "daily_ema_100",
+        "daily_ema_200",
+        "daily_ema50_slope",
+        "daily_ema100_slope",
+        "daily_ema200_slope",
+        "daily_ema_stack_confirmation",
+        "daily_obv",
+        "daily_obv_slope_20d",
+        "daily_obv_confirmation",
+        "obv_confirmation",
         "volume_confirmation",
         "volume_confirmation_ratio",
         "latest_week_signal",

@@ -268,7 +268,7 @@
       <p>Stocks that passed the selected universe filters and current strategy rules.</p>
     </div>
 
-    {% if filtered or require_volume_confirmation or require_trend_confirmation or selected_min_pair_return %}
+    {% if filtered or require_volume_confirmation or require_trend_confirmation or require_obv_confirmation or selected_min_pair_return %}
       <form action="/" method="get" class="filter-panel compact-filters signal-quality-filters">
         {% if dashboard_token %}
           <input type="hidden" name="token" value="{{ dashboard_token }}">
@@ -287,7 +287,12 @@
 
         <label class="checkbox-field">
           <input type="checkbox" name="require_trend_confirmation" value="1" {% if require_trend_confirmation %}checked{% endif %}>
-          Close &gt; 20-week EMA and 20-week EMA &gt; 50-week EMA
+          Close &gt; EMA 20D &gt; EMA 50D &gt; EMA 100D &gt; EMA 200D, with EMA50D/100D/200D slopes &gt; 0
+        </label>
+
+        <label class="checkbox-field">
+          <input type="checkbox" name="require_obv_confirmation" value="1" {% if require_obv_confirmation %}checked{% endif %}>
+          OBV slope &gt; 0 over last 20 days
         </label>
 
         <label>
@@ -334,6 +339,9 @@
         {% if require_trend_confirmation %}
           <input type="hidden" name="require_trend_confirmation" value="1">
         {% endif %}
+        {% if require_obv_confirmation %}
+          <input type="hidden" name="require_obv_confirmation" value="1">
+        {% endif %}
         <input type="hidden" name="return_metric" value="{{ selected_return_metric }}">
         <input type="hidden" name="min_pair_return_pct" value="{{ selected_min_pair_return }}">
         <button class="button secondary" type="submit">Send BUY Signals To Telegram</button>
@@ -354,14 +362,15 @@
               <th>Close</th>
               <th>Volume</th>
               <th>Volume Confirmed</th>
-              <th>Trend Confirmed</th>
+              <th>Daily EMA Stack</th>
+              <th>OBV 20D Rising</th>
               <th>
-                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="11">
+                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="12">
                   Last Pair Return %
                 </button>
               </th>
               <th>
-                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="12">
+                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="13">
                   Median Last 3 Return %
                 </button>
               </th>
@@ -385,7 +394,8 @@
                 <td>{{ row.get("close", "") }}</td>
                 <td>{{ row.get("volume", "") }}</td>
                 <td>{{ row.get("volume_confirmation", "") }}</td>
-                <td>{{ row.get("trend_confirmation", "") }}</td>
+                <td>{{ row.get("daily_ema_stack_confirmation") if row.get("daily_ema_stack_confirmation") != "" else row.get("trend_confirmation", "") }}</td>
+                <td>{{ row.get("daily_obv_confirmation") if row.get("daily_obv_confirmation") != "" else row.get("obv_confirmation", "") }}</td>
                 <td>{{ row.get("prior_pair_return_last_1_pct") or "NA" }}</td>
                 <td>{{ row.get("median_pair_return_last_3_pct") or "NA" }}</td>
                 <td>

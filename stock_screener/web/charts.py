@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
 from uuid import uuid4
+
+from stock_screener.data.storage import Storage
+from stock_screener.resample import resample_daily_to_weekly
 
 
 def _add_signal_highlight(fig: go.Figure, signal_date: pd.Timestamp, color: str) -> None:
@@ -484,6 +488,129 @@ def build_gtt_opportunity_chart(stock_stats: pd.DataFrame, height: int = 540) ->
         rangemode="tozero",
     )
 
+    chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
+    return f'<div class="opportunity-chart-frame">{chart_html}</div>'
+
+
+def build_rotation_group_chart(
+    data_root: Path,
+    config: dict[str, Any],
+    group_id: str,
+    group_members: pd.DataFrame,
+    height: int = 460,
+    lookback_weeks: int = 78,
+) -> str:
+    if group_members.empty:
+        return ""
+
+    storage = Storage(data_root)
+    strategy_cfg = config.get("strategy", {})
+    weekly_anchor = strategy_cfg.get("weekly_anchor", "W-FRI")
+    use_completed_weeks_only = bool(strategy_cfg.get("use_completed_weeks_only", True))
+    fig = go.Figure()
+    member_rows = group_members.copy()
+    member_rows["symbol"] = member_rows["symbol"].astype(str)
+    member_rows["movement_status"] = member_rows.get("movement_status", "").astype(str)
+
+    status_colors = {
+        "Leader": "#11825f",
+        "Catch-up Candidate": "#d98f1d",
+        "Lagging": "#7a5af8",
+        "In Sync": "#4f8ecf",
+    }
+    status_rank = {"Leader": 3, "Catch-up Candidate": 2, "In Sync": 1, "Lagging": 0}
+    member_rows["_status_rank"] = member_rows["movement_status"].map(status_rank).fillna(-1)
+    member_rows = member_rows.sort_values(["_status_rank", "recent_return_8w_pct", "symbol"], ascending=[False, False, True])
+
+    plotted = 0
+    for _, row in member_rows.iterrows():
+        symbol = str(row.get("symbol", "")).upper()
+        exchange = str(row.get("exchange", "NSE")).upper()
+        if not symbol:
+            continue
+        daily = storage.load_candles(exchange, symbol, "1D")
+        if daily.empty:
+            continue
+        weekly = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
+        if weekly.empty or "close" not in weekly.columns:
+            continue
+        weekly = weekly.copy()
+        weekly["date"] = pd.to_datetime(weekly["date"], errors="coerce")
+        weekly = weekly.sort_values("date").dropna(subset=["date"]).tail(lookback_weeks)
+        closes = pd.to_numeric(weekly["close"], errors="coerce")
+        valid = closes.dropna()
+        if valid.empty:
+            continue
+        base = float(valid.iloc[0])
+        if base == 0:
+            continue
+        normalized = (closes / base) * 100.0
+        status = str(row.get("movement_status", "In Sync"))
+        latest_signal = str(row.get("latest_week_signal", "NONE"))
+        latest_signal_date = pd.to_datetime(row.get("latest_week_signal_date"), errors="coerce")
+        latest_signal_is_fresh = str(row.get("latest_week_signal_is_fresh", "")).strip().lower() in {"1", "true", "yes", "y"}
+        line_color = status_colors.get(status, "#64748b")
+        line_dash = "solid" if latest_signal_is_fresh else "dot"
+        hover_name = str(row.get("name", symbol))
+        fig.add_trace(
+            go.Scatter(
+                x=weekly["date"],
+                y=normalized,
+                mode="lines",
+                name=f"{symbol} · {status}",
+                line={"color": line_color, "width": 2.6 if status in {"Leader", "Catch-up Candidate"} else 1.8, "dash": line_dash},
+                hovertemplate=(
+                    f"<b>{symbol}</b> · {hover_name}<br>"
+                    f"Status: {status}<br>"
+                    f"Latest weekly signal: {latest_signal}<br>"
+                    f"Recent 8W return: {_format_float(row.get('recent_return_8w_pct'), 2, '%')}<br>"
+                    f"Group 8W return: {_format_float(row.get('group_return_8w_pct'), 2, '%')}<br>"
+                    f"Catch-up gap: {_format_float(row.get('catch_up_gap_8w_pct'), 2, '%')}<br>"
+                    "Date: %{x|%d %b %Y}<br>"
+                    "Normalized price: %{y:.2f}<extra></extra>"
+                ),
+            )
+        )
+        if latest_signal_is_fresh and latest_signal in {"BUY", "SELL"} and pd.notna(latest_signal_date):
+            weekly_lookup = pd.Series(normalized.values, index=weekly["date"])
+            if latest_signal_date in weekly_lookup.index:
+                signal_value = float(weekly_lookup.loc[latest_signal_date])
+                fig.add_trace(
+                    go.Scatter(
+                        x=[latest_signal_date],
+                        y=[signal_value],
+                        mode="markers+text",
+                        name=f"{symbol} {latest_signal}",
+                        text=[latest_signal],
+                        textposition="top center" if latest_signal == "SELL" else "bottom center",
+                        marker={
+                            "symbol": "triangle-up" if latest_signal == "BUY" else "triangle-down",
+                            "size": 14,
+                            "color": "#00b879" if latest_signal == "BUY" else "#ff0055",
+                            "line": {"color": "#073b30" if latest_signal == "BUY" else "#6f0027", "width": 1.5},
+                        },
+                        showlegend=False,
+                        hovertemplate=f"{symbol} {latest_signal}<br>%{{x|%d %b %Y}}<br>Normalized price: %{{y:.2f}}<extra></extra>",
+                    )
+                )
+        plotted += 1
+
+    if plotted == 0:
+        return ""
+
+    fig.update_layout(
+        title=f"Rotation Group {group_id}: normalized price trends and weekly signal state",
+        xaxis_title="Date",
+        yaxis_title="Normalized Price (Start = 100)",
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        margin={"l": 52, "r": 24, "t": 78, "b": 52},
+        height=height,
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
     return f'<div class="opportunity-chart-frame">{chart_html}</div>'
 

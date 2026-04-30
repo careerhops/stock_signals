@@ -127,6 +127,90 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(universe["tradingsymbol"].tolist(), ["VALID"])
         self.assertEqual(universe["name"].tolist(), ["VALID"])
 
+    def test_approximate_nse_traded_universe_keeps_equity_like_suffixes_and_excludes_debt_like_rows(self) -> None:
+        instruments = pd.DataFrame(
+            [
+                {
+                    "instrument_token": 1,
+                    "exchange": "NSE",
+                    "tradingsymbol": "TCS",
+                    "name": "TATA CONSULTANCY SERV LT",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 2,
+                    "exchange": "NSE",
+                    "tradingsymbol": "ABC-SM",
+                    "name": "ABC SME LIMITED",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 3,
+                    "exchange": "NSE",
+                    "tradingsymbol": "PGINVIT-IV",
+                    "name": "POWERGRID INFRA. INVITS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 4,
+                    "exchange": "NSE",
+                    "tradingsymbol": "ATLPP-E1",
+                    "name": "ATL RE.0.50 PPD UP",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 5,
+                    "exchange": "NSE",
+                    "tradingsymbol": "A2ZINFRA-BE",
+                    "name": "A2Z INFRA ENGINEERING",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 6,
+                    "exchange": "NSE",
+                    "tradingsymbol": "656KA30-SG",
+                    "name": "SDL KA 6.56% 2030",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+                {
+                    "instrument_token": 7,
+                    "exchange": "NSE",
+                    "tradingsymbol": "850NHAI29-N5",
+                    "name": "",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                },
+            ]
+        )
+
+        universe = build_universe(
+            instruments,
+            {
+                "universe": {
+                    "mode": "nse_all",
+                    "instrument_types": ["EQ"],
+                    "restrict_to_metadata_symbols": False,
+                    "approximate_nse_traded_universe": {
+                        "enabled": True,
+                        "require_nonblank_name": True,
+                        "allowed_series_suffixes": ["", "-SM", "-ST", "-BZ", "-IV", "-E1", "-P1", "-RR"],
+                    },
+                    "filters": {},
+                }
+            },
+        )
+
+        self.assertEqual(
+            universe["tradingsymbol"].tolist(),
+            ["ABC-SM", "ATLPP-E1", "PGINVIT-IV", "TCS"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

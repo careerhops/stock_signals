@@ -198,6 +198,68 @@ class DailyScanTests(unittest.TestCase):
             self.assertEqual(summary["symbols_scanned"], 1)
             self.assertEqual(audit["fetch_status"].tolist(), ["cached"])
 
+    def test_weekly_scan_handles_symbols_without_completed_monday_week(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            storage.save_instruments(
+                pd.DataFrame(
+                    [
+                        {
+                            "exchange": "NSE",
+                            "tradingsymbol": "NEWIPO",
+                            "instrument_type": "EQ",
+                            "segment": "NSE",
+                            "instrument_token": 999,
+                            "name": "NEW IPO LIMITED",
+                        }
+                    ]
+                )
+            )
+            storage.save_candles(
+                "NSE",
+                "NEWIPO",
+                pd.DataFrame(
+                    [
+                        {"date": "2026-04-28", "open": 100, "high": 104, "low": 98, "close": 103, "volume": 1000},
+                        {"date": "2026-04-29", "open": 103, "high": 107, "low": 101, "close": 106, "volume": 1200},
+                    ]
+                ),
+            )
+
+            config = {
+                "data": {
+                    "scan_timeframe": "1W",
+                    "history_years": 1,
+                    "data_root_env": "DATA_ROOT",
+                    "skip_kite_fetch": True,
+                },
+                "daily_signals": {"enabled": True, "max_signal_age_bars": 5},
+                "universe": {
+                    "mode": "nse_all",
+                    "instrument_types": ["EQ"],
+                    "restrict_to_metadata_symbols": False,
+                },
+                "strategy": {"weekly_anchor": "W-FRI", "use_completed_weeks_only": True},
+                "filters": {
+                    "enabled": True,
+                    "signal": {"direction": "BUY", "latest_only": True, "max_signal_age_bars": 1},
+                },
+                "notifications": {"enabled": False},
+            }
+
+            with patch.dict(os.environ, {"DATA_ROOT": temp_dir}):
+                summary = run_daily_scan(config)
+
+            weekly = storage.load_signals("latest_raw_signals.csv")
+            audit = storage.load_signals("latest_scan_details.csv")
+
+            self.assertEqual(summary["symbols_scanned"], 1)
+            self.assertEqual(summary["raw_signals"], 0)
+            self.assertEqual(len(weekly), 0)
+            self.assertEqual(audit["daily_rows"].tolist(), [2])
+            self.assertEqual(audit["strategy_rows"].tolist(), [0])
+            self.assertEqual(audit["latest_signal"].tolist(), ["NONE"])
+
 
 if __name__ == "__main__":
     unittest.main()
