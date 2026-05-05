@@ -257,7 +257,7 @@ class DailyScanTests(unittest.TestCase):
             self.assertEqual(summary["raw_signals"], 0)
             self.assertEqual(len(weekly), 0)
             self.assertEqual(audit["daily_rows"].tolist(), [2])
-            self.assertEqual(audit["strategy_rows"].tolist(), [0])
+            self.assertEqual(audit["strategy_rows"].tolist(), [1])
             self.assertEqual(audit["latest_signal"].tolist(), ["NONE"])
 
 

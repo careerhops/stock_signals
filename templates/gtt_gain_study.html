@@ -7,84 +7,21 @@
       <p>Measures the highest daily price reached between every weekly BUY signal and its next weekly SELL signal across the latest Kite NSE instruments universe.</p>
     </div>
 
-    <form action="/gtt-gain-study/run{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}" method="post" class="action-row">
+    <form action="/gtt-gain-study/run{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}" method="post" class="action-row">
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
       <button class="button" type="submit">Run GTT Gain Study</button>
       {% if workbook_exists %}
         <a class="button secondary" href="/gtt-gain-study/report">Download Excel Report</a>
       {% endif %}
-      <span>Uses cached daily Kite highs strictly between BUY date and SELL date. This does not fetch fresh Kite OHLC.</span>
+      <span>Runs on the full GTT study universe at the selected sensitivity. The page filters below only change what is shown after the run. Uses cached daily Kite highs strictly between BUY date and SELL date. This does not fetch fresh Kite OHLC.</span>
     </form>
 
-    <form action="/gtt-gain-study" method="get" class="filter-panel">
-      {% if dashboard_token %}
-        <input type="hidden" name="token" value="{{ dashboard_token }}">
-      {% endif %}
-      {% if open_buy_regime_only %}
-        <input type="hidden" name="open_buy_regime_only" value="1">
-      {% endif %}
-      {% if dashboard_buy_only %}
-        <input type="hidden" name="dashboard_buy_only" value="1">
-      {% endif %}
-      {% if fresh_weekly_buy_only %}
-        <input type="hidden" name="fresh_weekly_buy_only" value="1">
-      {% endif %}
-      {% if fresh_daily_buy_only %}
-        <input type="hidden" name="fresh_daily_buy_only" value="1">
-      {% endif %}
-      {% if trend_only %}
-        <input type="hidden" name="trend_only" value="1">
-      {% endif %}
-      {% if require_obv_confirmation %}
-        <input type="hidden" name="require_obv_confirmation" value="1">
-      {% endif %}
-      {% if require_volume_confirmation %}
-        <input type="hidden" name="require_volume_confirmation" value="1">
-      {% endif %}
-      {% if selected_technical_rating_status %}
-        <input type="hidden" name="technical_rating_status" value="{{ selected_technical_rating_status }}">
-      {% endif %}
-      {% if selected_peak_speed_bucket %}
-        <input type="hidden" name="peak_speed_bucket" value="{{ selected_peak_speed_bucket }}">
-      {% endif %}
-      <label>
-        Search stock
-        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company name">
-      </label>
-      <label>
-        Market Cap Bucket
-        <select name="market_cap_bucket">
-          <option value="">All</option>
-          {% for bucket in ["Large Cap", "Mid Cap", "Small Cap"] %}
-            <option value="{{ bucket }}" {% if selected_market_cap_bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label>
-        Min Market Cap (₹ Cr)
-        <input type="number" name="min_market_cap_cr" value="{{ selected_min_market_cap }}" placeholder="Min">
-      </label>
-      <label>
-        Max Market Cap (₹ Cr)
-        <input type="number" name="max_market_cap_cr" value="{{ selected_max_market_cap }}" placeholder="Max">
-      </label>
-      <label>
-        Min CMP (₹)
-        <input type="number" step="0.05" name="min_cmp" value="{{ selected_min_cmp }}" placeholder="e.g. 100">
-      </label>
-      <label>
-        Max CMP (₹)
-        <input type="number" step="0.05" name="max_cmp" value="{{ selected_max_cmp }}" placeholder="e.g. 1000">
-      </label>
-      <div class="filter-actions">
-        <button class="button secondary" type="submit">Apply Screener Filters</button>
-        <a class="table-link" href="/gtt-gain-study{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
-      </div>
-    </form>
+    <p class="filter-summary">Use the shared filter panel above for search, sensitivity, market cap, CMP, and the common confirmation filters. The GTT controls below are specific to GTT.</p>
 
     <p class="filter-summary">Active GTT filters: {{ active_gtt_filter_summary }}</p>
 
     {% if study_ran %}
-      <p class="success-note">GTT Gain Study completed. The latest Excel report is ready.</p>
+      <p class="success-note">GTT Gain Study completed at sensitivity {{ selected_sensitivity }}. The latest Excel report is ready.</p>
     {% endif %}
 
     {% if study_error %}
@@ -309,6 +246,7 @@
           {% if dashboard_token %}
             <input type="hidden" name="token" value="{{ dashboard_token }}">
           {% endif %}
+          <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
           {% if stock_search %}
             <input type="hidden" name="stock_search" value="{{ stock_search }}">
           {% endif %}
@@ -409,6 +347,7 @@
           {% if dashboard_token %}
             <input type="hidden" name="token" value="{{ dashboard_token }}">
           {% endif %}
+          <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
           <input type="hidden" name="stock_search" value="{{ stock_search }}">
           <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
           <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">

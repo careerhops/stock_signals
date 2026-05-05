@@ -8,6 +8,10 @@
     </div>
 
     <form action="/stocks/fetch" method="post" class="action-row">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
       <button class="button" type="submit">Fetch Latest Stock List</button>
       <span>This downloads the latest Kite instrument master and updates this table.</span>
     </form>
@@ -16,6 +20,7 @@
       {% if dashboard_token %}
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
       <button class="button secondary" type="submit">Fetch NSE Market Caps</button>
       <span>This downloads the NSE average market-cap Excel archive and updates market-cap metadata for the full list.</span>
     </form>
@@ -32,15 +37,28 @@
       <p class="warning-note">Market-cap fetch failed: {{ request.query_params.get("market_cap_error") }}</p>
     {% endif %}
 
+    <p class="filter-summary">Use the shared filter panel above for search, market cap, and CMP. This page keeps only the industry/category filter locally.</p>
+
     <form action="/stocks" method="get" class="filter-panel">
       {% if dashboard_token %}
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
-
-      <label>
-        Search
-        <input type="search" name="search" value="{{ search }}" placeholder="Symbol or company name">
-      </label>
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="search" value="{{ search }}">
+      <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
+      <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
+      <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+      <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+      <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
+      {% if shared_require_volume_confirmation %}
+        <input type="hidden" name="require_volume_confirmation" value="1">
+      {% endif %}
+      {% if shared_require_trend_confirmation %}
+        <input type="hidden" name="require_trend_confirmation" value="1">
+      {% endif %}
+      {% if shared_require_obv_confirmation %}
+        <input type="hidden" name="require_obv_confirmation" value="1">
+      {% endif %}
 
       <label>
         Industry / Category
@@ -51,49 +69,9 @@
         </select>
       </label>
 
-      <label>
-        Market Cap Bucket
-        <select name="market_cap_bucket">
-          <option value="">All</option>
-          {% for bucket in market_cap_bucket_options %}
-            <option value="{{ bucket }}" {% if selected_market_cap_bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
-          {% endfor %}
-        </select>
-      </label>
-
-      <label>
-        Min Market Cap (₹ Cr)
-        <span class="range-value" id="min_market_cap_value">
-          {{ selected_min_market_cap or market_cap_bounds.min or 0 }}
-        </span>
-        <input type="range"
-               id="min_market_cap_slider"
-               min="{{ market_cap_bounds.min or 0 }}"
-               max="{{ market_cap_bounds.max or 1000000 }}"
-               step="100"
-               value="{{ selected_min_market_cap or market_cap_bounds.min or 0 }}"
-               {% if not has_market_cap_metadata %}disabled{% endif %}>
-        <input id="min_market_cap_input" type="number" name="min_market_cap_cr" value="{{ selected_min_market_cap }}" placeholder="Min">
-      </label>
-
-      <label>
-        Max Market Cap (₹ Cr)
-        <span class="range-value" id="max_market_cap_value">
-          {{ selected_max_market_cap or market_cap_bounds.max or 1000000 }}
-        </span>
-        <input type="range"
-               id="max_market_cap_slider"
-               min="{{ market_cap_bounds.min or 0 }}"
-               max="{{ market_cap_bounds.max or 1000000 }}"
-               step="100"
-               value="{{ selected_max_market_cap or market_cap_bounds.max or 1000000 }}"
-               {% if not has_market_cap_metadata %}disabled{% endif %}>
-        <input id="max_market_cap_input" type="number" name="max_market_cap_cr" value="{{ selected_max_market_cap }}" placeholder="Max">
-      </label>
-
       <div class="filter-actions">
         <button class="button" type="submit">Apply Filters</button>
-        <a class="table-link" href="/stocks{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+        <a class="table-link" href="/stocks{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Clear</a>
       </div>
     </form>
 
@@ -143,10 +121,18 @@
                 <td>
                   {% if row.get("is_watchlisted") %}
                     <form action="/watchlist/remove/{{ row.get('exchange', '') }}/{{ row.get('tradingsymbol', '') }}" method="post">
+                      {% if dashboard_token %}
+                        <input type="hidden" name="token" value="{{ dashboard_token }}">
+                      {% endif %}
+                      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
                       <button class="mini-button muted" type="submit">Remove</button>
                     </form>
                   {% else %}
                     <form action="/watchlist/add/{{ row.get('exchange', '') }}/{{ row.get('tradingsymbol', '') }}" method="post">
+                      {% if dashboard_token %}
+                        <input type="hidden" name="token" value="{{ dashboard_token }}">
+                      {% endif %}
+                      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
                       <button class="mini-button" type="submit">Add</button>
                     </form>
                   {% endif %}

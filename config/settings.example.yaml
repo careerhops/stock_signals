@@ -72,6 +72,12 @@ daily_signals:
   enabled: true
   max_signal_age_bars: 5
 
+shortlist:
+  relative_strength_lookback_weeks: 12
+  default_volume_ratio: 1.5
+  default_max_distance_from_demand_pct: 8.0
+  default_min_risk_reward_ratio: 2.0
+
 rotation_study:
   lookback_weeks: 260
   min_history_weeks: 104

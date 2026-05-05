@@ -4,82 +4,41 @@
   <section class="panel">
     <div class="panel-heading">
       <h2>Run Screener</h2>
-      <p>Search and filters use saved results. Refresh Kite data once after market close, then recalculate from cache as needed.</p>
+      <p>Use the shared filter panel above for search, sensitivity, market cap, CMP, and the common confirmation filters. Refresh Kite data once after market close, then recalculate from cache as needed.</p>
     </div>
-
-    <form action="/" method="get" class="filter-panel">
-      {% if dashboard_token %}
-        <input type="hidden" name="token" value="{{ dashboard_token }}">
-      {% endif %}
-
-      <label>
-        Search Stock
-        <input type="search"
-               name="stock_search"
-               value="{{ stock_search }}"
-               placeholder="Symbol or company, e.g. TCS">
-      </label>
-
-      <label>
-        Market Cap Bucket
-        <select name="market_cap_bucket">
-          <option value="">All</option>
-          {% for bucket in ["Large Cap", "Mid Cap", "Small Cap"] %}
-            <option value="{{ bucket }}" {% if selected_market_cap_bucket == bucket %}selected{% endif %}>{{ bucket }}</option>
-          {% endfor %}
-        </select>
-      </label>
-
-      <label>
-        Min Market Cap (₹ Cr)
-        <input type="number"
-               name="min_market_cap_cr"
-               value="{{ selected_min_market_cap }}"
-               placeholder="{{ market_cap_bounds.min or 'Min' }}">
-      </label>
-
-      <label>
-        Max Market Cap (₹ Cr)
-        <input type="number"
-               name="max_market_cap_cr"
-               value="{{ selected_max_market_cap }}"
-               placeholder="{{ market_cap_bounds.max or 'Max' }}">
-      </label>
-
-      <label>
-        Min CMP (₹)
-        <input type="number"
-               step="0.05"
-               name="min_cmp"
-               value="{{ selected_min_cmp }}"
-               placeholder="e.g. 100">
-      </label>
-
-      <label>
-        Max CMP (₹)
-        <input type="number"
-               step="0.05"
-               name="max_cmp"
-               value="{{ selected_max_cmp }}"
-               placeholder="e.g. 1000">
-      </label>
-
-      <div class="filter-actions">
-        <button class="button secondary" type="submit">Apply Filters Only</button>
-        <a class="table-link" href="/{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
-      </div>
-    </form>
 
     <form action="/run-screener" method="post" class="action-row">
       {% if dashboard_token %}
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
       <input type="hidden" name="stock_search" value="{{ stock_search }}">
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
       <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
       <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
       <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
       <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
       <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
+      {% if require_volume_confirmation %}
+        <input type="hidden" name="require_volume_confirmation" value="1">
+      {% endif %}
+      {% if require_trend_confirmation %}
+        <input type="hidden" name="require_trend_confirmation" value="1">
+      {% endif %}
+      {% if require_obv_confirmation %}
+        <input type="hidden" name="require_obv_confirmation" value="1">
+      {% endif %}
+      <input type="hidden" name="return_metric" value="{{ selected_return_metric }}">
+      <input type="hidden" name="min_pair_return_pct" value="{{ selected_min_pair_return }}">
+      {% if require_htf_alignment %}
+        <input type="hidden" name="require_htf_alignment" value="1">
+      {% endif %}
+      <input type="hidden" name="min_breakout_volume_ratio" value="{{ selected_min_breakout_volume_ratio }}">
+      {% if require_relative_strength %}
+        <input type="hidden" name="require_relative_strength" value="1">
+      {% endif %}
+      <input type="hidden" name="min_relative_strength_pct" value="{{ selected_min_relative_strength_pct }}">
+      <input type="hidden" name="max_distance_from_demand_pct" value="{{ selected_max_distance_from_demand_pct }}">
+      <input type="hidden" name="min_risk_reward_ratio" value="{{ selected_min_risk_reward_ratio }}">
       <button class="button secondary" type="submit" name="refresh_data" value="0">Recalculate From Cached OHLC</button>
       <button class="button" type="submit" name="refresh_data" value="1">Refresh Kite Data + Run Screener</button>
       <span>Use refresh once daily after market close. Searches and filters do not call Kite.</span>
@@ -249,6 +208,7 @@
               <strong>{{ row.get("symbol") or row.get("tradingsymbol", "") }}</strong>
               <small>{{ row.get("exchange", "") }} · {{ row.get("name", "") }}</small>
               <small>₹ Cr {{ row.get("market_cap_cr", "") }} · {{ row.get("date", "") }}</small>
+              <small>Score {{ row.get("shortlist_score", "") }} · RS {{ row.get("relative_strength_12w_pct")|number(1) }}% · R:R {{ row.get("risk_reward_ratio")|number(1) }}</small>
               {% if row.get("has_large_deal") %}
                 <small><span class="deal-marker">Large deal</span> {{ row.get("large_deal_summary", "") }}</small>
               {% endif %}
@@ -268,7 +228,7 @@
       <p>Stocks that passed the selected universe filters and current strategy rules.</p>
     </div>
 
-    {% if filtered or require_volume_confirmation or require_trend_confirmation or require_obv_confirmation or selected_min_pair_return %}
+    {% if filtered or require_volume_confirmation or require_trend_confirmation or require_obv_confirmation or selected_min_pair_return or require_htf_alignment or selected_min_breakout_volume_ratio or require_relative_strength or selected_min_relative_strength_pct or selected_max_distance_from_demand_pct or selected_min_risk_reward_ratio %}
       <form action="/" method="get" class="filter-panel compact-filters signal-quality-filters">
         {% if dashboard_token %}
           <input type="hidden" name="token" value="{{ dashboard_token }}">
@@ -281,45 +241,62 @@
         <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
 
         <label class="checkbox-field">
-          <input type="checkbox" name="require_volume_confirmation" value="1" {% if require_volume_confirmation %}checked{% endif %}>
-          Volume confirmed
-        </label>
-
-        <label class="checkbox-field">
-          <input type="checkbox" name="require_trend_confirmation" value="1" {% if require_trend_confirmation %}checked{% endif %}>
-          Close &gt; EMA 20D &gt; EMA 50D &gt; EMA 100D &gt; EMA 200D, with EMA50D/100D/200D slopes &gt; 0
-        </label>
-
-        <label class="checkbox-field">
-          <input type="checkbox" name="require_obv_confirmation" value="1" {% if require_obv_confirmation %}checked{% endif %}>
-          OBV slope &gt; 0 over last 20 days
+          <input type="checkbox" name="require_htf_alignment" value="1" {% if require_htf_alignment %}checked{% endif %}>
+          Higher timeframe aligned (monthly structure regime = BUY)
         </label>
 
         <label>
-          Return Metric
-          <select name="return_metric">
-            <option value="median_3" {% if selected_return_metric == "median_3" %}selected{% endif %}>Median last 3 BUY-SELL pairs</option>
-            <option value="last_1" {% if selected_return_metric == "last_1" %}selected{% endif %}>Last completed BUY-SELL pair</option>
-          </select>
-        </label>
-
-        <label>
-          Min Return %
+          Min breakout volume (x)
           <input type="number"
                  step="0.1"
-                 name="min_pair_return_pct"
-                 value="{{ selected_min_pair_return }}"
-                 placeholder="e.g. 5">
+                 name="min_breakout_volume_ratio"
+                 value="{{ selected_min_breakout_volume_ratio }}"
+                 placeholder="e.g. 1.5">
+        </label>
+
+        <label class="checkbox-field">
+          <input type="checkbox" name="require_relative_strength" value="1" {% if require_relative_strength %}checked{% endif %}>
+          Relative strength vs benchmark
+        </label>
+
+        <label>
+          Min RS spread %
+          <input type="number"
+                 step="0.1"
+                 name="min_relative_strength_pct"
+                 value="{{ selected_min_relative_strength_pct }}"
+                 placeholder="e.g. 0">
+        </label>
+
+        <label>
+          Max distance from demand %
+          <input type="number"
+                 step="0.1"
+                 name="max_distance_from_demand_pct"
+                 value="{{ selected_max_distance_from_demand_pct }}"
+                 placeholder="e.g. 8">
+        </label>
+
+        <label>
+          Min risk-reward
+          <input type="number"
+                 step="0.1"
+                 name="min_risk_reward_ratio"
+                 value="{{ selected_min_risk_reward_ratio }}"
+                 placeholder="e.g. 2">
         </label>
 
         <div class="filter-actions">
-          <button class="button" type="submit">Apply BUY Quality Filters</button>
+          <button class="button" type="submit">Apply Weekly Shortlist Filters</button>
           <a class="table-link" href="/{% if base_filter_query %}?{{ base_filter_query }}{% endif %}">Clear quality filters</a>
         </div>
       </form>
 
       {% if signal_quality_warning %}
         <p class="warning-note">{{ signal_quality_warning }}</p>
+      {% endif %}
+      {% if shortlist_warning %}
+        <p class="warning-note">{{ shortlist_warning }}</p>
       {% endif %}
 
       {% if filtered %}
@@ -344,6 +321,16 @@
         {% endif %}
         <input type="hidden" name="return_metric" value="{{ selected_return_metric }}">
         <input type="hidden" name="min_pair_return_pct" value="{{ selected_min_pair_return }}">
+        {% if require_htf_alignment %}
+          <input type="hidden" name="require_htf_alignment" value="1">
+        {% endif %}
+        <input type="hidden" name="min_breakout_volume_ratio" value="{{ selected_min_breakout_volume_ratio }}">
+        {% if require_relative_strength %}
+          <input type="hidden" name="require_relative_strength" value="1">
+        {% endif %}
+        <input type="hidden" name="min_relative_strength_pct" value="{{ selected_min_relative_strength_pct }}">
+        <input type="hidden" name="max_distance_from_demand_pct" value="{{ selected_max_distance_from_demand_pct }}">
+        <input type="hidden" name="min_risk_reward_ratio" value="{{ selected_min_risk_reward_ratio }}">
         <button class="button secondary" type="submit">Send BUY Signals To Telegram</button>
         <span>{{ filtered_count }} stocks will be sent. Long lists include a short chat summary plus a CSV file.</span>
       </form>
@@ -359,21 +346,32 @@
               <th>Market Cap (₹ Cr)</th>
               <th>Bucket</th>
               <th>Signal</th>
+              <th>
+                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="7">
+                  Shortlist Score
+                </button>
+              </th>
               <th>Close</th>
               <th>Volume</th>
-              <th>Volume Confirmed</th>
-              <th>Daily EMA Stack</th>
-              <th>OBV 20D Rising</th>
-              <th>
-                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="12">
-                  Last Pair Return %
-                </button>
-              </th>
+              <th>Volume x</th>
+              <th>HTF Align</th>
+              <th>RS Benchmark</th>
               <th>
                 <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="13">
-                  Median Last 3 Return %
+                  RS 12W Spread %
                 </button>
               </th>
+              <th>
+                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="14">
+                  Distance From Demand %
+                </button>
+              </th>
+              <th>
+                <button class="sort-button" type="button" data-sort-table="weekly-buy-signals-table" data-sort-column="16">
+                  Risk-Reward
+                </button>
+              </th>
+              <th>Expected Target %</th>
               <th>Large Deals</th>
             </tr>
           </thead>
@@ -391,13 +389,17 @@
                 <td>{{ row.get("market_cap_cr", "") }}</td>
                 <td>{{ row.get("market_cap_bucket", "") }}</td>
                 <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("shortlist_score", "") }}</td>
                 <td>{{ row.get("close", "") }}</td>
                 <td>{{ row.get("volume", "") }}</td>
-                <td>{{ row.get("volume_confirmation", "") }}</td>
-                <td>{{ row.get("daily_ema_stack_confirmation") if row.get("daily_ema_stack_confirmation") != "" else row.get("trend_confirmation", "") }}</td>
-                <td>{{ row.get("daily_obv_confirmation") if row.get("daily_obv_confirmation") != "" else row.get("obv_confirmation", "") }}</td>
-                <td>{{ row.get("prior_pair_return_last_1_pct") or "NA" }}</td>
-                <td>{{ row.get("median_pair_return_last_3_pct") or "NA" }}</td>
+                <td>{{ row.get("volume_confirmation_ratio")|number(2) }}</td>
+                <td>{{ row.get("htf_alignment_confirmation", "") }}</td>
+                <td>{{ row.get("relative_strength_benchmark", "") }}</td>
+                <td>{{ row.get("relative_strength_12w_pct")|number(2) }}</td>
+                <td>{{ row.get("distance_from_demand_pct")|number(2) }}</td>
+                <td>{{ row.get("risk_pct_to_demand_zone")|number(2) }}</td>
+                <td>{{ row.get("risk_reward_ratio")|number(2) }}</td>
+                <td>{{ row.get("expected_target_return_pct")|number(2) }}</td>
                 <td>
                   {% if row.get("has_large_deal") %}
                     <span class="deal-marker">Large deal</span>

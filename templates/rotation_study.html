@@ -10,19 +10,32 @@
       </p>
     </div>
 
-    <form action="/rotation-study/run{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}" method="post" class="action-row">
+    <form action="/rotation-study/run{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}" method="post" class="action-row">
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
       <button class="button" type="submit">Run Rotation Study</button>
       <span>Uses cached 5-year daily Kite history, resampled to weekly, without changing the screener, backtest, or GTT logic.</span>
     </form>
 
-    <form action="/rotation-study" method="get" class="filter-panel">
+    <form action="/rotation-study" method="get" class="filter-panel compact-filters">
       {% if dashboard_token %}
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
-      <label>
-        Search stock
-        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company name">
-      </label>
+      <input type="hidden" name="stock_search" value="{{ stock_search }}">
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <input type="hidden" name="market_cap_bucket" value="{{ selected_market_cap_bucket }}">
+      <input type="hidden" name="min_market_cap_cr" value="{{ selected_min_market_cap }}">
+      <input type="hidden" name="max_market_cap_cr" value="{{ selected_max_market_cap }}">
+      <input type="hidden" name="min_cmp" value="{{ selected_min_cmp }}">
+      <input type="hidden" name="max_cmp" value="{{ selected_max_cmp }}">
+      {% if shared_require_volume_confirmation or require_volume_confirmation %}
+        <input type="hidden" name="require_volume_confirmation" value="1">
+      {% endif %}
+      {% if shared_require_trend_confirmation or require_trend_confirmation %}
+        <input type="hidden" name="require_trend_confirmation" value="1">
+      {% endif %}
+      {% if shared_require_obv_confirmation or require_obv_confirmation %}
+        <input type="hidden" name="require_obv_confirmation" value="1">
+      {% endif %}
       <label>
         Group ID
         <input type="search" name="group_id" value="{{ selected_group_id }}" placeholder="e.g. G001">
@@ -38,12 +51,12 @@
       </label>
       <div class="filter-actions">
         <button class="button secondary" type="submit">Apply Rotation Filters</button>
-        <a class="table-link" href="/rotation-study{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+        <a class="table-link" href="/rotation-study{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Clear</a>
       </div>
     </form>
 
     {% if study_ran %}
-      <p class="success-note">Rotation Study completed. Latest grouped behaviour results are loaded.</p>
+      <p class="success-note">Rotation Study completed at sensitivity {{ selected_sensitivity }}. Latest grouped behaviour results are loaded.</p>
     {% endif %}
 
     {% if study_error %}

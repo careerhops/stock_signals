@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 
 
@@ -11,9 +13,13 @@ def resample_daily_to_weekly(
     if daily.empty:
         return daily
 
+    today = pd.Timestamp(date.today()).normalize()
     frame = daily.copy()
     frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame[frame["date"].dt.normalize() <= today]
     frame = frame.sort_values("date").reset_index(drop=True)
+    if frame.empty:
+        return frame
 
     # TradingView's weekly chart for NSE symbols is Monday-labeled and the
     # current in-progress week is visible on the chart. To match that behavior,
@@ -53,6 +59,8 @@ def resample_daily_to_weekly(
     )
 
     if use_completed_weeks_only and not weekly.empty:
-        weekly = weekly.iloc[:-1].copy()
+        last_week_end = pd.Timestamp(weekly.iloc[-1]["date"]).normalize()
+        if today < last_week_end:
+            weekly = weekly.iloc[:-1].copy()
 
     return weekly.reset_index(drop=True)

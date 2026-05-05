@@ -47,13 +47,29 @@
       {% if dashboard_token %}
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <input type="hidden" name="stock_search" value="{{ shared_stock_search | default('') }}">
+      <input type="hidden" name="market_cap_bucket" value="{{ shared_market_cap_bucket | default('') }}">
+      <input type="hidden" name="min_market_cap_cr" value="{{ shared_min_market_cap_cr | default('') }}">
+      <input type="hidden" name="max_market_cap_cr" value="{{ shared_max_market_cap_cr | default('') }}">
+      <input type="hidden" name="min_cmp" value="{{ shared_min_cmp | default('') }}">
+      <input type="hidden" name="max_cmp" value="{{ shared_max_cmp | default('') }}">
+      {% if shared_require_volume_confirmation %}
+        <input type="hidden" name="require_volume_confirmation" value="1">
+      {% endif %}
+      {% if shared_require_trend_confirmation %}
+        <input type="hidden" name="require_trend_confirmation" value="1">
+      {% endif %}
+      {% if shared_require_obv_confirmation %}
+        <input type="hidden" name="require_obv_confirmation" value="1">
+      {% endif %}
       <label>
         Search Symbol Or Name
         <input type="search" name="symbol_search" value="{{ symbol_search }}" placeholder="E2E, JIOFIN, TCS">
       </label>
       <div class="filter-actions">
         <button class="button" type="submit">Search</button>
-        <a class="table-link" href="/signal-qa{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+        <a class="table-link" href="/signal-qa{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Clear</a>
       </div>
     </form>
 
@@ -62,7 +78,7 @@
       <div class="symbol-list qa-candidate-list">
         {% for row in candidates %}
           <a class="symbol-row {% if row.get('exchange') == selected_exchange and row.get('symbol') == selected_symbol %}active{% endif %}"
-             href="/signal-qa?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol', '') }}{% if symbol_search %}&symbol_search={{ symbol_search }}{% endif %}{% if dashboard_token %}&token={{ dashboard_token }}{% endif %}">
+             href="/signal-qa?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol', '') }}{% if symbol_search %}&symbol_search={{ symbol_search }}{% endif %}{% if selected_sensitivity %}&sensitivity={{ selected_sensitivity }}{% endif %}{% if dashboard_token %}&token={{ dashboard_token }}{% endif %}">
             <span>
               <strong>{{ row.get("symbol", "") }}</strong>
               <small>{{ row.get("exchange", "") }} · {{ row.get("name", row.get("company_name", "")) }}</small>

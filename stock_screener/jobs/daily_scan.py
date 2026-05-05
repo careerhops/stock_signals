@@ -14,6 +14,7 @@ from stock_screener.filters import apply_filters
 from stock_screener.notifications.telegram import build_telegram_message, send_telegram_message
 from stock_screener.resample import resample_daily_to_weekly
 from stock_screener.strategy.daily_confirmation import add_latest_daily_confirmation_columns
+from stock_screener.strategy.weekly_shortlist import shortlist_benchmark_symbols
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
 from stock_screener.universe import build_universe
 
@@ -70,6 +71,7 @@ def run_daily_scan(
         emit_progress(phase="Loading Kite instruments", completed=0, total=0, current_symbol="")
         instruments = provider.instruments()
         storage.save_instruments(instruments)
+        _refresh_shortlist_benchmark_candles(provider, storage, instruments, history_years=int(config.get("data", {}).get("history_years", 10)))
 
     universe = build_universe(instruments, config)
     emit_progress(
@@ -308,6 +310,38 @@ def notify_failure(config: dict[str, Any], error: Exception) -> None:
         send_telegram_message(config, message)
     except Exception as notify_error:
         print(f"Failed sending failure notification: {notify_error}")
+
+
+def _refresh_shortlist_benchmark_candles(
+    provider: KiteDataProvider,
+    storage: Storage,
+    instruments: pd.DataFrame,
+    history_years: int,
+) -> None:
+    if instruments.empty:
+        return
+
+    wanted = set(shortlist_benchmark_symbols())
+    benchmark_rows = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NSE")
+        & (instruments["tradingsymbol"].astype(str).isin(wanted))
+    ].drop_duplicates(subset=["tradingsymbol"])
+    if benchmark_rows.empty:
+        return
+
+    today = date.today()
+    for _, instrument in benchmark_rows.iterrows():
+        symbol = str(instrument["tradingsymbol"])
+        token = int(instrument["instrument_token"])
+        existing = storage.load_candles("NSE_INDEX", symbol, "1D")
+        from_date = _fetch_start_date(existing, history_years)
+        if from_date > today:
+            continue
+        try:
+            new_daily = provider.daily_candles(token, from_date, today)
+        except Exception:
+            continue
+        storage.merge_and_save_candles("NSE_INDEX", symbol, new_daily, "1D")
 
 
 if __name__ == "__main__":

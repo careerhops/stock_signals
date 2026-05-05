@@ -3,11 +3,12 @@
 {% block content %}
   <section class="panel compact">
     <p>
-      <a class="table-link" href="/{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Back to dashboard</a>
+      <a class="table-link" href="/{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Back to dashboard</a>
     </p>
     <h2>{{ exchange }}:{{ symbol }}</h2>
     <p>
       Timeframe: {{ scan_timeframe }}.
+      Sensitivity: <strong>{{ selected_sensitivity }}</strong>.
       Latest signal: <strong>{{ latest_summary.signal }}</strong>
       {% if latest_summary.date %} on {{ latest_summary.date }}{% endif %}
       {% if latest_summary.close %} at close {{ latest_summary.close }}{% endif %}.

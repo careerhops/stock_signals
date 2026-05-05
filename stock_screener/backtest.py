@@ -20,6 +20,15 @@ class BacktestResult:
 
 
 def run_buy_sell_backtest(config: dict[str, Any], storage: Storage, exchange: str = "NSE") -> BacktestResult:
+    return run_buy_sell_backtest_for_symbols(config, storage, exchange=exchange, symbols=None)
+
+
+def run_buy_sell_backtest_for_symbols(
+    config: dict[str, Any],
+    storage: Storage,
+    exchange: str = "NSE",
+    symbols: set[str] | None = None,
+) -> BacktestResult:
     candle_dir = storage.candles_dir / exchange / "1D"
     if not candle_dir.exists():
         return BacktestResult(_empty_summary(exchange), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
@@ -31,6 +40,7 @@ def run_buy_sell_backtest(config: dict[str, Any], storage: Storage, exchange: st
 
     instruments = storage.load_instruments()
     name_map = _instrument_name_map(instruments, exchange)
+    selected_symbols = {str(symbol).upper() for symbol in symbols} if symbols else None
     trade_frames: list[pd.DataFrame] = []
     open_position_rows: list[dict[str, Any]] = []
     symbols_processed = 0
@@ -38,6 +48,8 @@ def run_buy_sell_backtest(config: dict[str, Any], storage: Storage, exchange: st
 
     for candle_path in sorted(candle_dir.glob("*.csv")):
         symbol = candle_path.stem
+        if selected_symbols is not None and symbol.upper() not in selected_symbols:
+            continue
         daily = storage.load_candles(exchange, symbol, "1D")
         if daily.empty:
             continue
@@ -70,6 +82,12 @@ def run_buy_sell_backtest(config: dict[str, Any], storage: Storage, exchange: st
         symbols_processed=symbols_processed,
         symbols_with_closed_trades=symbols_with_closed_trades,
     )
+    if selected_symbols is not None:
+        summary["symbol_scope"] = "fresh_weekly_signals"
+        summary["symbols_requested"] = len(selected_symbols)
+    else:
+        summary["symbol_scope"] = "full_universe"
+        summary["symbols_requested"] = 0
 
     return BacktestResult(summary, stock_stats, trades, open_positions)
 

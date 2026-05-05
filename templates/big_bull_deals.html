@@ -13,6 +13,10 @@
     </p>
 
     <form action="/big-bull-deals/fetch" method="post" class="action-row">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
       <button class="button" type="submit">Fetch NSE Large Deals</button>
       <span>Fetches the latest NSE Large Deals page data. Supabase stores each NSE deal date only once.</span>
     </form>
@@ -31,10 +35,13 @@
       <p class="warning-note">Fetch failed: {{ request.query_params.get("fetch_error") }}</p>
     {% endif %}
 
+    <p class="filter-summary">Active sensitivity: {{ selected_sensitivity }}</p>
+
     <form action="/big-bull-deals" method="get" class="filter-panel compact-filters">
       {% if dashboard_token %}
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
 
       <label>
         Action
@@ -72,7 +79,7 @@
 
       <div class="filter-actions">
         <button class="button" type="submit">Apply Filters</button>
-        <a class="table-link" href="/big-bull-deals{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Clear</a>
+        <a class="table-link" href="/big-bull-deals{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Clear</a>
       </div>
     </form>
 

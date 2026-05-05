@@ -4,10 +4,15 @@
   <section class="panel">
     <div class="panel-heading">
       <h2>BUY-to-SELL Backtest</h2>
-      <p>Measures every completed BUY signal followed by the next SELL signal using locally stored weekly OHLC data.</p>
+      <p>Measures every completed BUY signal followed by the next SELL signal using locally stored weekly OHLC data. Sensitivity and shared stock filters come from the common filter panel above.</p>
     </div>
 
-    <form action="/backtest/run{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}" method="post" class="action-row">
+    <form action="/backtest/run{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}" method="post" class="action-row">
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="fresh_weekly_signal_only" value="1" {% if fresh_weekly_signal_only %}checked{% endif %}>
+        Backtest fresh weekly BUY/SELL signals only
+      </label>
       <button class="button" type="submit">Run Backtest Report</button>
       {% if workbook_exists %}
         <a class="button secondary" href="/backtest/report">Download Excel Report</a>
@@ -15,8 +20,13 @@
       <span>Closed trades are counted only when a BUY has a later SELL.</span>
     </form>
 
+    <p class="filter-summary">Active sensitivity: {{ selected_sensitivity }}</p>
+    {% if fresh_weekly_signal_only %}
+      <p class="filter-summary">Universe filter: latest weekly BUY and SELL signal symbols only.</p>
+    {% endif %}
+
     {% if backtest_ran %}
-      <p class="success-note">Backtest completed. The latest Excel report is ready.</p>
+      <p class="success-note">Backtest completed at sensitivity {{ selected_sensitivity }}. The latest Excel report is ready.</p>
     {% endif %}
 
     {% if backtest_error %}

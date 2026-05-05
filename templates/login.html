@@ -7,6 +7,8 @@
       <p>Use this once per day before the evening scan. Zerodha requires the official login and TOTP flow; the app saves the access token after login.</p>
     </div>
 
+    <p class="filter-summary">Active sensitivity: {{ selected_sensitivity }}</p>
+
     <div class="login-status">
       <span>Status</span>
       <strong>{{ "Token saved" if token_status.exists else "Token missing" }}</strong>

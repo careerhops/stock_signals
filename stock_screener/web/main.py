@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import os
 from pathlib import Path
 from threading import Lock
@@ -17,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from kiteconnect import KiteConnect
 
 from stock_screener.auth.kite_token import load_access_token, save_access_token, token_status
-from stock_screener.backtest import run_buy_sell_backtest, save_backtest_outputs
+from stock_screener.backtest import run_buy_sell_backtest, run_buy_sell_backtest_for_symbols, save_backtest_outputs
 from stock_screener.backtest_report import write_backtest_workbook
 from stock_screener.config import get_data_root, load_config, require_env
 from stock_screener.data.kite import KiteDataProvider
@@ -41,8 +42,15 @@ from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
 from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram, send_gtt_stock_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
 from stock_screener.rotation_study import load_rotation_study_outputs, run_rotation_study, save_rotation_study_outputs
+from stock_screener.signal_outcome_report import write_signal_outcome_workbook
+from stock_screener.signal_outcome_study import (
+    load_signal_outcome_outputs,
+    run_signal_outcome_study,
+    save_signal_outcome_outputs,
+)
 from stock_screener.signal_qa import build_signal_quality_report, strategy_rows_for_display
 from stock_screener.strategy.technical_ratings import latest_technical_rating
+from stock_screener.strategy.weekly_shortlist import enrich_weekly_signal_shortlist_frame
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
 from stock_screener.symbols import normalize_nse_symbol
 from stock_screener.universe import build_universe
@@ -80,6 +88,8 @@ templates.env.filters["number"] = _template_number
 
 SCAN_JOBS: dict[str, dict[str, Any]] = {}
 SCAN_JOBS_LOCK = Lock()
+SCAN_JOBS_DIR = BASE_DIR / "data" / "scan_jobs"
+SCAN_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 BIG_BULL_DEALS_CACHE: dict[str, Any] = {
     "fetched_at": 0.0,
     "rows": pd.DataFrame(),
@@ -99,15 +109,37 @@ GTT_PEAK_SPEED_BUCKETS = [
 GTT_TECHNICAL_RATING_FILTERS = ["Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell"]
 
 
+def _scan_job_path(job_id: str) -> Path:
+    return SCAN_JOBS_DIR / f"{job_id}.json"
+
+
+def _json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value, default=str))
+
+
 def _set_scan_job(job_id: str, **updates: Any) -> None:
     with SCAN_JOBS_LOCK:
         current = SCAN_JOBS.setdefault(job_id, {})
         current.update(updates)
+        safe_payload = _json_safe(current)
+    _scan_job_path(job_id).write_text(json.dumps(safe_payload), encoding="utf-8")
 
 
 def _get_scan_job(job_id: str) -> dict[str, Any]:
     with SCAN_JOBS_LOCK:
-        return dict(SCAN_JOBS.get(job_id, {}))
+        current = SCAN_JOBS.get(job_id, {})
+        if current:
+            return dict(current)
+    path = _scan_job_path(job_id)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    with SCAN_JOBS_LOCK:
+        SCAN_JOBS[job_id] = dict(payload)
+    return dict(payload)
 
 
 def _has_meaningful_text(series: pd.Series) -> pd.Series:
@@ -195,6 +227,47 @@ def _request_float(request: Request, name: str) -> float | None:
 
 def _request_bool(request: Request, name: str) -> bool:
     return request.query_params.get(name, "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _request_int(
+    request: Request,
+    name: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    value = request.query_params.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _apply_request_sensitivity(config: dict[str, Any], request: Request) -> tuple[dict[str, Any], int, int]:
+    base_sensitivity = int(config.get("strategy", {}).get("sensitivity", 3))
+    selected_sensitivity = _request_int(request, "sensitivity", base_sensitivity, minimum=1, maximum=20)
+    if selected_sensitivity == base_sensitivity:
+        return config, base_sensitivity, selected_sensitivity
+    adjusted = deepcopy(config)
+    adjusted.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
+    return adjusted, base_sensitivity, selected_sensitivity
+
+
+def _parse_sensitivity_text(value: str, default: int | None = None) -> int | None:
+    value = value.strip()
+    if not value:
+        return default
+    try:
+        return max(1, min(20, int(value)))
+    except ValueError:
+        return default
 
 
 def _optional_float(value: str) -> float | None:
@@ -296,6 +369,78 @@ def _apply_signal_quality_filters(
         filtered = filtered[pd.to_numeric(filtered[metric_column], errors="coerce") >= min_pair_return]
 
     return filtered
+
+
+def _apply_weekly_shortlist_filters(
+    frame: pd.DataFrame,
+    require_htf_alignment: bool,
+    min_breakout_volume_ratio: float | None,
+    require_relative_strength: bool,
+    min_relative_strength_pct: float | None,
+    max_distance_from_demand_pct: float | None,
+    min_risk_reward_ratio: float | None,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    filtered = frame.copy()
+    if require_htf_alignment:
+        if "htf_alignment_confirmation" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        filtered = filtered[_truthy_series(filtered["htf_alignment_confirmation"])]
+
+    if min_breakout_volume_ratio is not None:
+        if "volume_confirmation_ratio" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        filtered = filtered[pd.to_numeric(filtered["volume_confirmation_ratio"], errors="coerce") >= float(min_breakout_volume_ratio)]
+
+    if require_relative_strength or min_relative_strength_pct is not None:
+        if "relative_strength_12w_pct" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        threshold = float(min_relative_strength_pct) if min_relative_strength_pct is not None else 0.0
+        filtered = filtered[pd.to_numeric(filtered["relative_strength_12w_pct"], errors="coerce") >= threshold]
+
+    if max_distance_from_demand_pct is not None:
+        if "distance_from_demand_pct" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        distance = pd.to_numeric(filtered["distance_from_demand_pct"], errors="coerce")
+        filtered = filtered[distance <= float(max_distance_from_demand_pct)]
+
+    if min_risk_reward_ratio is not None:
+        if "risk_reward_ratio" not in filtered.columns:
+            return filtered.iloc[0:0].copy()
+        rr = pd.to_numeric(filtered["risk_reward_ratio"], errors="coerce")
+        filtered = filtered[rr >= float(min_risk_reward_ratio)]
+
+    return filtered
+
+
+def _weekly_shortlist_filter_warning(
+    frame: pd.DataFrame,
+    require_htf_alignment: bool,
+    min_breakout_volume_ratio: float | None,
+    require_relative_strength: bool,
+    min_relative_strength_pct: float | None,
+    max_distance_from_demand_pct: float | None,
+    min_risk_reward_ratio: float | None,
+) -> str:
+    missing_columns = []
+    if require_htf_alignment and "htf_alignment_confirmation" not in frame.columns:
+        missing_columns.append("higher timeframe alignment")
+    if min_breakout_volume_ratio is not None and "volume_confirmation_ratio" not in frame.columns:
+        missing_columns.append("breakout volume ratio")
+    if (require_relative_strength or min_relative_strength_pct is not None) and "relative_strength_12w_pct" not in frame.columns:
+        missing_columns.append("relative strength vs benchmark")
+    if max_distance_from_demand_pct is not None and "distance_from_demand_pct" not in frame.columns:
+        missing_columns.append("distance from demand zone")
+    if min_risk_reward_ratio is not None and "risk_reward_ratio" not in frame.columns:
+        missing_columns.append("risk-reward ratio")
+    if not missing_columns:
+        return ""
+    return (
+        "Shortlist columns are missing from the weekly BUY list. "
+        "Run the screener after a Kite refresh so the shortlist metrics are rebuilt."
+    )
 
 
 def _signal_quality_filter_warning(
@@ -494,6 +639,21 @@ def _daily_buy_symbols(data_root: Path) -> set[str]:
     if "signal" in filtered.columns:
         filtered = filtered[filtered["signal"].astype(str).str.upper() == "BUY"]
     return _symbols_from_frame(filtered)
+
+
+def _fresh_weekly_signal_symbols(data_root: Path) -> set[str]:
+    raw = Storage(data_root).load_signals("latest_raw_signals.csv")
+    if raw.empty or "date" not in raw.columns:
+        return set()
+    frame = raw.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    latest_date = frame["date"].max()
+    if pd.isna(latest_date):
+        return set()
+    frame = frame[frame["date"] == latest_date]
+    if "signal" in frame.columns:
+        frame = frame[frame["signal"].astype(str).str.upper().isin({"BUY", "SELL"})]
+    return _symbols_from_frame(frame)
 
 
 def _latest_kite_universe_symbols(data_root: Path, config: dict[str, Any]) -> set[str]:
@@ -870,6 +1030,7 @@ def _gtt_display_summary(
 def _gtt_filter_query(
     token: str = "",
     stock_search: str = "",
+    sensitivity: str = "",
     market_cap_bucket: str = "",
     min_market_cap_cr: str = "",
     max_market_cap_cr: str = "",
@@ -893,6 +1054,8 @@ def _gtt_filter_query(
         params.append(f"token={quote(token)}")
     if stock_search:
         params.append(f"stock_search={quote(stock_search)}")
+    if sensitivity:
+        params.append(f"sensitivity={quote(sensitivity)}")
     if market_cap_bucket:
         params.append(f"market_cap_bucket={quote(market_cap_bucket)}")
     if min_market_cap_cr:
@@ -932,6 +1095,7 @@ def _gtt_filter_query(
 
 def _gtt_filter_summary(
     stock_search: str,
+    sensitivity_text: str,
     market_cap_bucket: str,
     min_market_cap_text: str,
     max_market_cap_text: str,
@@ -953,6 +1117,8 @@ def _gtt_filter_summary(
     filters = []
     if stock_search:
         filters.append(f"Search: {stock_search}")
+    if sensitivity_text:
+        filters.append(f"Sensitivity: {sensitivity_text}")
     if market_cap_bucket:
         filters.append(f"Market cap bucket: {market_cap_bucket}")
     if min_market_cap_text:
@@ -1025,6 +1191,7 @@ def _dashboard_link_suffix(request: Request) -> str:
     for name in (
         "token",
         "stock_search",
+        "sensitivity",
         "market_cap_bucket",
         "min_market_cap_cr",
         "max_market_cap_cr",
@@ -1035,6 +1202,12 @@ def _dashboard_link_suffix(request: Request) -> str:
         "require_obv_confirmation",
         "return_metric",
         "min_pair_return_pct",
+        "require_htf_alignment",
+        "min_breakout_volume_ratio",
+        "require_relative_strength",
+        "min_relative_strength_pct",
+        "max_distance_from_demand_pct",
+        "min_risk_reward_ratio",
     ):
         value = request.query_params.get(name, "").strip()
         if value:
@@ -1045,6 +1218,7 @@ def _dashboard_link_suffix(request: Request) -> str:
 def _dashboard_filter_query(
     token: str = "",
     stock_search: str = "",
+    sensitivity: str = "",
     market_cap_bucket: str = "",
     min_market_cap_cr: str = "",
     max_market_cap_cr: str = "",
@@ -1055,12 +1229,20 @@ def _dashboard_filter_query(
     require_obv_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_pct: str = "",
+    require_htf_alignment: bool = False,
+    min_breakout_volume_ratio: str = "",
+    require_relative_strength: bool = False,
+    min_relative_strength_pct: str = "",
+    max_distance_from_demand_pct: str = "",
+    min_risk_reward_ratio: str = "",
 ) -> str:
     params = []
     if token:
         params.append(f"token={quote(token)}")
     if stock_search:
         params.append(f"stock_search={quote(stock_search)}")
+    if sensitivity:
+        params.append(f"sensitivity={quote(sensitivity)}")
     if market_cap_bucket:
         params.append(f"market_cap_bucket={quote(market_cap_bucket)}")
     if min_market_cap_cr:
@@ -1081,7 +1263,176 @@ def _dashboard_filter_query(
         params.append(f"return_metric={quote(return_metric)}")
     if min_pair_return_pct:
         params.append(f"min_pair_return_pct={quote(min_pair_return_pct)}")
+    if require_htf_alignment:
+        params.append("require_htf_alignment=1")
+    if min_breakout_volume_ratio:
+        params.append(f"min_breakout_volume_ratio={quote(min_breakout_volume_ratio)}")
+    if require_relative_strength:
+        params.append("require_relative_strength=1")
+    if min_relative_strength_pct:
+        params.append(f"min_relative_strength_pct={quote(min_relative_strength_pct)}")
+    if max_distance_from_demand_pct:
+        params.append(f"max_distance_from_demand_pct={quote(max_distance_from_demand_pct)}")
+    if min_risk_reward_ratio:
+        params.append(f"min_risk_reward_ratio={quote(min_risk_reward_ratio)}")
     return "&".join(params)
+
+
+def _common_filter_context(
+    request: Request,
+    selected_sensitivity: int | str | None,
+    config: dict[str, Any],
+    data_root: Path,
+) -> dict[str, Any]:
+    token = request.query_params.get("token", "").strip()
+    stock_search = request.query_params.get("stock_search", "").strip()
+    sensitivity_text = str(selected_sensitivity or request.query_params.get("sensitivity", "").strip() or "")
+    market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
+    min_market_cap_cr = request.query_params.get("min_market_cap_cr", "").strip()
+    max_market_cap_cr = request.query_params.get("max_market_cap_cr", "").strip()
+    min_cmp = request.query_params.get("min_cmp", "").strip()
+    max_cmp = request.query_params.get("max_cmp", "").strip()
+    require_volume_confirmation = _request_bool(request, "require_volume_confirmation")
+    require_trend_confirmation = _request_bool(request, "require_trend_confirmation")
+    require_obv_confirmation = _request_bool(request, "require_obv_confirmation")
+    query = _dashboard_filter_query(
+        token=token,
+        stock_search=stock_search,
+        sensitivity=sensitivity_text,
+        market_cap_bucket=market_cap_bucket,
+        min_market_cap_cr=min_market_cap_cr,
+        max_market_cap_cr=max_market_cap_cr,
+        min_cmp=min_cmp,
+        max_cmp=max_cmp,
+        require_volume_confirmation=require_volume_confirmation,
+        require_trend_confirmation=require_trend_confirmation,
+        require_obv_confirmation=require_obv_confirmation,
+    )
+    summary = _gtt_filter_summary(
+        stock_search=stock_search,
+        sensitivity_text=sensitivity_text,
+        market_cap_bucket=market_cap_bucket,
+        min_market_cap_text=min_market_cap_cr,
+        max_market_cap_text=max_market_cap_cr,
+        min_cmp_text=min_cmp,
+        max_cmp_text=max_cmp,
+        require_volume_confirmation=require_volume_confirmation,
+        require_obv_confirmation=require_obv_confirmation,
+        require_screener_trend_confirmation=require_trend_confirmation,
+    )
+    storage = Storage(data_root)
+    metadata = _combined_symbol_metadata(config, storage)
+    market_cap_bucket_options: list[str] = []
+    market_cap_bounds = {"min": "", "max": ""}
+    if not metadata.empty:
+        if "market_cap_bucket" in metadata.columns:
+            market_cap_bucket_options = sorted(
+                [bucket for bucket in metadata["market_cap_bucket"].dropna().unique() if str(bucket).strip()]
+            )
+        if "market_cap_cr" in metadata.columns and metadata["market_cap_cr"].notna().any():
+            market_cap_bounds = {
+                "min": int(metadata["market_cap_cr"].min()),
+                "max": int(metadata["market_cap_cr"].max()),
+            }
+    return {
+        "common_filter_query": query,
+        "common_filter_summary": summary,
+        "show_shared_filter_form": True,
+        "shared_filter_action": request.url.path,
+        "shared_token": token,
+        "shared_stock_search": stock_search,
+        "shared_sensitivity": sensitivity_text,
+        "shared_market_cap_bucket": market_cap_bucket,
+        "shared_min_market_cap_cr": min_market_cap_cr,
+        "shared_max_market_cap_cr": max_market_cap_cr,
+        "shared_min_cmp": min_cmp,
+        "shared_max_cmp": max_cmp,
+        "shared_require_volume_confirmation": require_volume_confirmation,
+        "shared_require_trend_confirmation": require_trend_confirmation,
+        "shared_require_obv_confirmation": require_obv_confirmation,
+        "shared_market_cap_bucket_options": market_cap_bucket_options,
+        "shared_market_cap_bounds": market_cap_bounds,
+    }
+
+
+def _common_filtered_symbols_from_request(
+    data_root: Path,
+    config: dict[str, Any],
+    request: Request,
+) -> set[tuple[str, str]] | None:
+    stock_search = request.query_params.get("stock_search", "").strip()
+    market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
+    min_market_cap = _request_float(request, "min_market_cap_cr")
+    max_market_cap = _request_float(request, "max_market_cap_cr")
+    min_cmp = _request_float(request, "min_cmp")
+    max_cmp = _request_float(request, "max_cmp")
+    require_volume_confirmation = _request_bool(request, "require_volume_confirmation")
+    require_trend_confirmation = _request_bool(request, "require_trend_confirmation")
+    require_obv_confirmation = _request_bool(request, "require_obv_confirmation")
+
+    common_filters_active = any(
+        [
+            stock_search,
+            market_cap_bucket,
+            min_market_cap is not None,
+            max_market_cap is not None,
+            min_cmp is not None,
+            max_cmp is not None,
+            require_volume_confirmation,
+            require_trend_confirmation,
+            require_obv_confirmation,
+        ]
+    )
+    if not common_filters_active:
+        return None
+
+    storage = Storage(data_root)
+    raw = storage.load_signals("latest_raw_signals.csv")
+    if raw.empty or not {"exchange", "symbol", "date"}.issubset(raw.columns):
+        return set()
+
+    latest = raw.copy()
+    latest["date_sort"] = pd.to_datetime(latest["date"], errors="coerce")
+    latest = latest.sort_values("date_sort").groupby(["exchange", "symbol"], dropna=False).tail(1).copy()
+    latest = latest.drop(columns=["date_sort"], errors="ignore")
+
+    metadata = _combined_symbol_metadata(config, storage)
+    latest = _enrich_with_symbol_metadata(latest, metadata, "symbol")
+    latest = _apply_market_cap_filters(latest, min_market_cap, max_market_cap, market_cap_bucket)
+    latest = _apply_cmp_filters(latest, min_cmp, max_cmp, "close")
+    latest = _apply_stock_search(latest, stock_search)
+    latest = _apply_signal_quality_filters(
+        latest,
+        require_volume_confirmation,
+        require_trend_confirmation,
+        require_obv_confirmation,
+        "median_3",
+        None,
+    )
+    if latest.empty:
+        return set()
+    return {
+        (str(row.get("exchange", "")).upper(), str(row.get("symbol", "")).upper())
+        for _, row in latest.iterrows()
+        if str(row.get("symbol", "")).strip()
+    }
+
+
+def _filter_frame_by_symbol_scope(frame: pd.DataFrame, symbol_scope: set[tuple[str, str]] | None) -> pd.DataFrame:
+    if symbol_scope is None or frame.empty:
+        return frame
+    symbol_column = _symbol_column(frame)
+    if not symbol_column or "exchange" not in frame.columns:
+        return frame
+    working = frame.copy()
+    keys = list(
+        zip(
+            working["exchange"].astype(str).str.upper(),
+            working[symbol_column].astype(str).str.upper(),
+        )
+    )
+    mask = pd.Series([key in symbol_scope for key in keys], index=working.index)
+    return working[mask].reset_index(drop=True)
 
 
 def _buy_signal_filter_summary(
@@ -1096,6 +1447,12 @@ def _buy_signal_filter_summary(
     require_obv_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return_text: str = "",
+    require_htf_alignment: bool = False,
+    min_breakout_volume_ratio_text: str = "",
+    require_relative_strength: bool = False,
+    min_relative_strength_pct_text: str = "",
+    max_distance_from_demand_pct_text: str = "",
+    min_risk_reward_ratio_text: str = "",
 ) -> str:
     filters = []
     if stock_search:
@@ -1119,6 +1476,17 @@ def _buy_signal_filter_summary(
     if min_pair_return_text:
         metric_label = "Last completed BUY-SELL return" if return_metric == "last_1" else "Median last 3 BUY-SELL returns"
         filters.append(f"{metric_label} >= {min_pair_return_text}%")
+    if require_htf_alignment:
+        filters.append("Monthly structure aligned: Yes")
+    if min_breakout_volume_ratio_text:
+        filters.append(f"Breakout volume >= {min_breakout_volume_ratio_text}x")
+    if require_relative_strength or min_relative_strength_pct_text:
+        threshold = min_relative_strength_pct_text or "0"
+        filters.append(f"Relative strength vs benchmark >= {threshold}%")
+    if max_distance_from_demand_pct_text:
+        filters.append(f"Distance from demand <= {max_distance_from_demand_pct_text}%")
+    if min_risk_reward_ratio_text:
+        filters.append(f"Risk-reward >= {min_risk_reward_ratio_text}")
     return "; ".join(filters) if filters else "None"
 
 
@@ -1129,23 +1497,29 @@ def _manual_screener_config(
     max_market_cap: float | None,
     market_cap_bucket: str,
     stock_search: str,
+    sensitivity: int | None = None,
 ) -> dict:
     config = deepcopy(base_config)
     universe_cfg = config.setdefault("universe", {})
-    filters_cfg = universe_cfg.setdefault("filters", {})
 
     metadata_path = storage.symbol_metadata_path()
     if metadata_path.exists():
         universe_cfg["metadata_file"] = str(metadata_path)
 
-    filters_cfg["min_market_cap_cr"] = min_market_cap
-    filters_cfg["max_market_cap_cr"] = max_market_cap
-    filters_cfg["market_cap_bucket"] = market_cap_bucket or None
-    filters_cfg["stock_search"] = stock_search.strip() or None
+    # The screener run should always build weekly BUY/SELL signals for the full
+    # active universe first. UI filters like market cap, CMP, and search are
+    # applied later to the saved signal list for display, charts, and exports.
+    filters_cfg = universe_cfg.setdefault("filters", {})
+    filters_cfg["min_market_cap_cr"] = None
+    filters_cfg["max_market_cap_cr"] = None
+    filters_cfg["market_cap_bucket"] = None
+    filters_cfg["stock_search"] = None
 
     signal_cfg = config.setdefault("filters", {}).setdefault("signal", {})
     signal_cfg["direction"] = "BUY"
     signal_cfg["latest_only"] = True
+    if sensitivity is not None:
+        config.setdefault("strategy", {})["sensitivity"] = max(1, min(20, int(sensitivity)))
 
     config.setdefault("notifications", {})["enabled"] = False
     return config
@@ -1165,6 +1539,12 @@ def _load_visible_buy_signals(
     require_obv_confirmation: bool = False,
     return_metric: str = "",
     min_pair_return: float | None = None,
+    require_htf_alignment: bool = False,
+    min_breakout_volume_ratio: float | None = None,
+    require_relative_strength: bool = False,
+    min_relative_strength_pct: float | None = None,
+    max_distance_from_demand_pct: float | None = None,
+    min_risk_reward_ratio: float | None = None,
 ) -> pd.DataFrame:
     metadata = _combined_symbol_metadata(config, storage)
     filtered = storage.load_signals("latest_filtered.csv")
@@ -1180,12 +1560,32 @@ def _load_visible_buy_signals(
         return_metric,
         min_pair_return,
     )
+    filtered = enrich_weekly_signal_shortlist_frame(filtered, storage, config)
+    filtered = _apply_weekly_shortlist_filters(
+        filtered,
+        require_htf_alignment,
+        min_breakout_volume_ratio,
+        require_relative_strength,
+        min_relative_strength_pct,
+        max_distance_from_demand_pct,
+        min_risk_reward_ratio,
+    )
 
     if not filtered.empty and "date" in filtered.columns:
         filtered = filtered.copy()
         filtered["date_sort"] = pd.to_datetime(filtered["date"], errors="coerce")
-        sort_columns = ["date_sort"]
-        sort_ascending = [False]
+        sort_columns = []
+        sort_ascending = []
+        if "shortlist_score" in filtered.columns:
+            filtered["shortlist_score"] = pd.to_numeric(filtered["shortlist_score"], errors="coerce")
+            sort_columns.append("shortlist_score")
+            sort_ascending.append(False)
+        if "relative_strength_12w_pct" in filtered.columns:
+            filtered["relative_strength_12w_pct"] = pd.to_numeric(filtered["relative_strength_12w_pct"], errors="coerce")
+            sort_columns.append("relative_strength_12w_pct")
+            sort_ascending.append(False)
+        sort_columns.append("date_sort")
+        sort_ascending.append(False)
         symbol_column = _symbol_column(filtered)
         if symbol_column:
             sort_columns.append(symbol_column)
@@ -1358,6 +1758,19 @@ def _rotation_study_error_url(error: Exception, query_suffix: str) -> str:
     return f"/rotation-study?study_error={quote(str(error)[:500])}{query_suffix}"
 
 
+def _signal_outcome_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/signal-outcome-study?"
+        f"study_ran=1&signals={summary.get('current_signal_universe_count', 0)}"
+        f"&pairs={summary.get('historical_pairs_analyzed', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _signal_outcome_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/signal-outcome-study?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
 def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: str) -> None:
     _set_scan_job(
         job_id,
@@ -1523,6 +1936,73 @@ def _run_rotation_study_job(job_id: str, config: dict[str, Any], data_root: Path
             phase="Failed",
             error=str(exc),
             redirect_url=_rotation_study_error_url(exc, query_suffix),
+        )
+
+
+def _run_signal_outcome_job(
+    job_id: str,
+    config: dict[str, Any],
+    data_root: Path,
+    query_suffix: str,
+    signal_scope: str,
+    target_gain_pct: float,
+) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Signal Outcome Study",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def outcome_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        raw_percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(raw_percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_signal_outcome_study(
+            config,
+            storage,
+            exchange="NSE",
+            signal_scope=signal_scope,
+            target_gain_pct=target_gain_pct,
+            progress_callback=outcome_progress_callback,
+        )
+        save_signal_outcome_outputs(result, _signal_outcome_study_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("current_signal_universe_count", 0)),
+            total=int(result.summary.get("current_signal_universe_count", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_signal_outcome_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_signal_outcome_error_url(exc, query_suffix),
         )
 
 
@@ -1743,6 +2223,23 @@ def _latest_rotation_study_paths(data_root: Path) -> dict[str, Path]:
     }
 
 
+def _signal_outcome_study_dir(data_root: Path) -> Path:
+    path = data_root / "signal_outcome_study"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _latest_signal_outcome_paths(data_root: Path) -> dict[str, Path]:
+    directory = _signal_outcome_study_dir(data_root)
+    return {
+        "summary": directory / "latest_summary.csv",
+        "signal_universe": directory / "latest_signal_universe.csv",
+        "stock_stats": directory / "latest_stock_stats.csv",
+        "pair_details": directory / "latest_pair_details.csv",
+        "workbook": directory / "signal_outcome_study_report.xlsx",
+    }
+
+
 def _rotation_group_chart_rows(
     data_root: Path,
     config: dict[str, Any],
@@ -1812,31 +2309,40 @@ def _load_latest_backtest(data_root: Path) -> dict[str, Any]:
     }
 
 
-def _fetch_and_store_big_bull_deals() -> RedirectResponse:
+def _fetch_and_store_big_bull_deals(dashboard_token: str = "", sensitivity: str = "") -> RedirectResponse:
+    params: list[str] = []
     try:
         result = fetch_and_store_current_large_deals()
-        return RedirectResponse(
-            (
-                "/big-bull-deals?"
-                f"refreshed=1&rows={result['stored']}"
-                f"&fetched={result['fetched']}"
-                f"&skipped_existing_dates={result.get('skipped_existing_dates', 0)}"
-            ),
-            status_code=303,
+        params.extend(
+            [
+                "refreshed=1",
+                f"rows={result['stored']}",
+                f"fetched={result['fetched']}",
+                f"skipped_existing_dates={result.get('skipped_existing_dates', 0)}",
+            ]
         )
     except Exception as exc:
-        message = quote(str(exc)[:500])
-        return RedirectResponse(f"/big-bull-deals?fetch_error={message}", status_code=303)
+        params.append(f"fetch_error={quote(str(exc)[:500])}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity:
+        params.append(f"sensitivity={quote(sensitivity)}")
+    return RedirectResponse(f"/big-bull-deals?{'&'.join(params)}", status_code=303)
 
 
 @app.post("/big-bull-deals/fetch")
-def fetch_big_bull_deals_post() -> RedirectResponse:
-    return _fetch_and_store_big_bull_deals()
+async def fetch_big_bull_deals_post(request: Request) -> RedirectResponse:
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity = str(form.get("sensitivity", "")).strip()
+    return _fetch_and_store_big_bull_deals(dashboard_token, sensitivity)
 
 
 @app.get("/big-bull-deals/fetch")
-def fetch_big_bull_deals_get() -> RedirectResponse:
-    return _fetch_and_store_big_bull_deals()
+def fetch_big_bull_deals_get(request: Request) -> RedirectResponse:
+    dashboard_token = request.query_params.get("token", "").strip()
+    sensitivity = request.query_params.get("sensitivity", "").strip()
+    return _fetch_and_store_big_bull_deals(dashboard_token, sensitivity)
 
 
 @app.get("/health", response_class=PlainTextResponse)
@@ -1854,10 +2360,14 @@ def backtest_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    common_symbol_scope = _common_filtered_symbols_from_request(data_root, config, request)
     latest = _load_latest_backtest(data_root)
-    stock_stats = latest["stock_stats"].head(100)
-    trades = latest["trades"].head(100)
+    stock_stats = _filter_frame_by_symbol_scope(latest["stock_stats"], common_symbol_scope).head(100)
+    trades = _filter_frame_by_symbol_scope(latest["trades"], common_symbol_scope).head(100)
+    fresh_weekly_signal_only = _request_bool(request, "fresh_weekly_signal_only")
 
     return templates.TemplateResponse(
         "backtest.html",
@@ -1865,37 +2375,62 @@ def backtest_page(request: Request) -> HTMLResponse:
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
             "summary": latest["summary"],
             "stock_stats": _records(stock_stats),
             "trades": _records(trades),
             "workbook_exists": latest["workbook_exists"],
             "backtest_ran": request.query_params.get("backtest_ran", ""),
             "backtest_error": request.query_params.get("backtest_error", ""),
+            "fresh_weekly_signal_only": fresh_weekly_signal_only,
+            **common_filter_context,
         },
     )
 
 
 @app.post("/backtest/run")
-def run_backtest_from_dashboard(request: Request) -> RedirectResponse:
+async def run_backtest_from_dashboard(request: Request) -> RedirectResponse:
     config = load_config()
+    form = await request.form()
+    selected_sensitivity = _parse_sensitivity_text(
+        str(form.get("sensitivity", "")),
+        int(config.get("strategy", {}).get("sensitivity", 3)),
+    ) or int(config.get("strategy", {}).get("sensitivity", 3))
+    if selected_sensitivity != int(config.get("strategy", {}).get("sensitivity", 3)):
+        config = deepcopy(config)
+        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
     data_root = get_data_root(config)
     storage = Storage(data_root)
     dashboard_token = request.query_params.get("token", "").strip()
+    fresh_weekly_signal_only = str(form.get("fresh_weekly_signal_only", "")).strip().lower() in {"1", "true", "on", "yes"}
 
     try:
-        result = run_buy_sell_backtest(config, storage, exchange="NSE")
+        symbols = _fresh_weekly_signal_symbols(data_root) if fresh_weekly_signal_only else None
+        if fresh_weekly_signal_only and not symbols:
+            raise RuntimeError("No fresh weekly BUY/SELL signals are available in latest_raw_signals.csv.")
+        result = (
+            run_buy_sell_backtest_for_symbols(config, storage, exchange="NSE", symbols=symbols)
+            if symbols is not None
+            else run_buy_sell_backtest(config, storage, exchange="NSE")
+        )
         save_backtest_outputs(result, _backtest_dir(data_root), run_id="latest")
         write_backtest_workbook(result, _latest_backtest_paths(data_root)["workbook"])
         redirect_url = (
             "/backtest?"
             f"backtest_ran=1&closed_trades={result.summary.get('closed_trades', 0)}"
             f"&symbols_processed={result.summary.get('symbols_processed', 0)}"
+            f"&sensitivity={selected_sensitivity}"
         )
+        if fresh_weekly_signal_only:
+            redirect_url += "&fresh_weekly_signal_only=1"
         if dashboard_token:
             redirect_url += f"&token={quote(dashboard_token)}"
         return RedirectResponse(redirect_url, status_code=303)
     except Exception as exc:
-        redirect_url = f"/backtest?backtest_error={quote(str(exc)[:500])}"
+        redirect_url = f"/backtest?backtest_error={quote(str(exc)[:500])}&sensitivity={selected_sensitivity}"
+        if fresh_weekly_signal_only:
+            redirect_url += "&fresh_weekly_signal_only=1"
         if dashboard_token:
             redirect_url += f"&token={quote(dashboard_token)}"
         return RedirectResponse(redirect_url, status_code=303)
@@ -1924,7 +2459,9 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_gtt_gain_outputs(_gtt_gain_dir(data_root))
     latest_stock_stats = _align_gtt_stock_stats_to_latest_universe(data_root, latest.stock_stats, config)
     latest_stock_stats = _ensure_gtt_weekly_technical_ratings(data_root, latest_stock_stats, config)
@@ -1932,6 +2469,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     metadata = _combined_symbol_metadata(config, Storage(data_root))
     latest_stock_stats = _enrich_with_symbol_metadata(latest_stock_stats, metadata, "symbol")
     stock_search = request.query_params.get("stock_search", "").strip()
+    sensitivity_text = str(selected_sensitivity)
     selected_market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
     min_market_cap_text = request.query_params.get("min_market_cap_cr", "").strip()
     max_market_cap_text = request.query_params.get("max_market_cap_cr", "").strip()
@@ -2048,6 +2586,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     gtt_filter_query = _gtt_filter_query(
         token=request.query_params.get("token", ""),
         stock_search=stock_search,
+        sensitivity=sensitivity_text,
         market_cap_bucket=selected_market_cap_bucket,
         min_market_cap_cr=min_market_cap_text,
         max_market_cap_cr=max_market_cap_text,
@@ -2068,6 +2607,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     )
     active_gtt_filter_summary = _gtt_filter_summary(
         stock_search,
+        sensitivity_text,
         selected_market_cap_bucket,
         min_market_cap_text,
         max_market_cap_text,
@@ -2093,6 +2633,8 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
             "summary": display_summary,
             "stock_stats": _records(stock_stats),
             "stock_symbols_csv": _comma_separated_symbols(stock_stats),
@@ -2134,18 +2676,28 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "study_error": request.query_params.get("study_error", ""),
             "telegram_sent": request.query_params.get("telegram_sent", ""),
             "telegram_error": request.query_params.get("telegram_error", ""),
+            **common_filter_context,
         },
     )
 
 
 @app.post("/gtt-gain-study/run")
-def run_gtt_gain_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+async def run_gtt_gain_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
     config = load_config()
+    form = await request.form()
+    selected_sensitivity = _parse_sensitivity_text(
+        str(form.get("sensitivity", "")),
+        int(config.get("strategy", {}).get("sensitivity", 3)),
+    ) or int(config.get("strategy", {}).get("sensitivity", 3))
+    if selected_sensitivity != int(config.get("strategy", {}).get("sensitivity", 3)):
+        config = deepcopy(config)
+        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
     data_root = get_data_root(config)
     dashboard_token = request.query_params.get("token", "").strip()
     params = []
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
+    params.append(f"sensitivity={selected_sensitivity}")
     query_suffix = ("&" + "&".join(params)) if params else ""
 
     try:
@@ -2186,7 +2738,10 @@ def rotation_study_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    common_symbol_scope = _common_filtered_symbols_from_request(data_root, config, request)
     latest = load_rotation_study_outputs(_rotation_study_dir(data_root))
 
     selected_group_id = request.query_params.get("group_id", "").strip().upper()
@@ -2197,6 +2752,12 @@ def rotation_study_page(request: Request) -> HTMLResponse:
     all_members = latest.members.copy()
     members = all_members.copy()
     candidates = latest.candidates.copy()
+    all_members = _filter_frame_by_symbol_scope(all_members, common_symbol_scope)
+    members = _filter_frame_by_symbol_scope(members, common_symbol_scope)
+    candidates = _filter_frame_by_symbol_scope(candidates, common_symbol_scope)
+    if not groups.empty and not all_members.empty and "group_id" in groups.columns and "group_id" in all_members.columns:
+        valid_group_ids = set(all_members["group_id"].astype(str))
+        groups = groups[groups["group_id"].astype(str).isin(valid_group_ids)].reset_index(drop=True)
 
     if selected_group_id and not members.empty:
         members = members[members["group_id"].astype(str).str.upper() == selected_group_id]
@@ -2227,6 +2788,8 @@ def rotation_study_page(request: Request) -> HTMLResponse:
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
             "summary": latest.summary,
             "groups": _records(groups),
             "members": _records(members),
@@ -2241,18 +2804,28 @@ def rotation_study_page(request: Request) -> HTMLResponse:
             "groups_found": request.query_params.get("groups_found", ""),
             "candidates_found": request.query_params.get("candidates", ""),
             "group_chart_rows": group_chart_rows,
+            **common_filter_context,
         },
     )
 
 
 @app.post("/rotation-study/run")
-def run_rotation_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+async def run_rotation_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
     config = load_config()
+    form = await request.form()
+    selected_sensitivity = _parse_sensitivity_text(
+        str(form.get("sensitivity", "")),
+        int(config.get("strategy", {}).get("sensitivity", 3)),
+    ) or int(config.get("strategy", {}).get("sensitivity", 3))
+    if selected_sensitivity != int(config.get("strategy", {}).get("sensitivity", 3)):
+        config = deepcopy(config)
+        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
     data_root = get_data_root(config)
     dashboard_token = request.query_params.get("token", "").strip()
     params = []
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
+    params.append(f"sensitivity={selected_sensitivity}")
     query_suffix = ("&" + "&".join(params)) if params else ""
 
     try:
@@ -2265,6 +2838,140 @@ def run_rotation_study_from_dashboard(request: Request, background_tasks: Backgr
     return RedirectResponse(redirect_url, status_code=303)
 
 
+@app.get("/signal-outcome-study", response_class=HTMLResponse)
+def signal_outcome_study_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    study_error = request.query_params.get("study_error", "")
+    try:
+        common_symbol_scope = _common_filtered_symbols_from_request(data_root, config, request)
+        latest = load_signal_outcome_outputs(_signal_outcome_study_dir(data_root))
+        latest_signal_universe = _filter_frame_by_symbol_scope(latest.signal_universe, common_symbol_scope)
+        latest_stock_stats = _filter_frame_by_symbol_scope(latest.stock_stats, common_symbol_scope)
+        latest_pair_details = _filter_frame_by_symbol_scope(latest.pair_details, common_symbol_scope)
+    except Exception as exc:
+        latest_summary: dict[str, Any] = {}
+        latest_signal_universe = pd.DataFrame()
+        latest_stock_stats = pd.DataFrame()
+        latest_pair_details = pd.DataFrame()
+        study_error = study_error or f"Could not load Signal Outcome Study: {exc}"
+    else:
+        latest_summary = latest.summary
+
+    signal_scope = request.query_params.get("signal_scope", "").strip().lower() or str(latest_summary.get("signal_scope", "buy") or "buy")
+    if signal_scope not in {"buy", "sell", "both"}:
+        signal_scope = "buy"
+    target_gain_text = request.query_params.get("target_gain_pct", "").strip()
+    if not target_gain_text:
+        target_gain_text = str(latest_summary.get("target_gain_pct", config.get("signal_outcome_study", {}).get("target_gain_pct", 10.0)))
+    stock_stats_count = len(latest_stock_stats)
+    stock_symbols_csv = ""
+    if not latest_stock_stats.empty and "symbol" in latest_stock_stats.columns:
+        stock_symbols_csv = ",".join(
+            latest_stock_stats["symbol"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .loc[lambda series: series != ""]
+            .drop_duplicates()
+            .tolist()
+        )
+
+    return templates.TemplateResponse(
+        "signal_outcome_study.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": latest_summary,
+            "signal_universe": _records(latest_signal_universe.head(150)),
+            "stock_stats": _records(latest_stock_stats.head(150)),
+            "stock_stats_count": stock_stats_count,
+            "pair_details": _records(latest_pair_details.head(400)),
+            "signal_scope": signal_scope,
+            "target_gain_pct": target_gain_text,
+            "stock_symbols_csv": stock_symbols_csv,
+            "signal_outcome_job": request.query_params.get("signal_outcome_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": study_error,
+            **common_filter_context,
+        },
+    )
+
+
+@app.post("/signal-outcome-study/run")
+async def run_signal_outcome_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    form = await request.form()
+    selected_sensitivity = _parse_sensitivity_text(
+        str(form.get("sensitivity", "")),
+        int(config.get("strategy", {}).get("sensitivity", 3)),
+    ) or int(config.get("strategy", {}).get("sensitivity", 3))
+    if selected_sensitivity != int(config.get("strategy", {}).get("sensitivity", 3)):
+        config = deepcopy(config)
+        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
+    data_root = get_data_root(config)
+    dashboard_token = request.query_params.get("token", "").strip()
+    signal_scope = str(form.get("signal_scope", "buy")).strip().lower() or "buy"
+    if signal_scope not in {"buy", "sell", "both"}:
+        signal_scope = "buy"
+    target_gain_pct = _optional_float(str(form.get("target_gain_pct", "")).strip()) or 10.0
+    params = []
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    params.append(f"sensitivity={selected_sensitivity}")
+    params.append(f"signal_scope={quote(signal_scope)}")
+    params.append(f"target_gain_pct={quote(str(target_gain_pct))}")
+    query_suffix = ("&" + "&".join(params)) if params else ""
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(
+            _run_signal_outcome_job,
+            job_id,
+            config,
+            data_root,
+            query_suffix,
+            signal_scope,
+            float(target_gain_pct),
+        )
+        redirect_url = f"/signal-outcome-study?signal_outcome_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = _signal_outcome_error_url(exc, query_suffix)
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/signal-outcome-study/report")
+def download_signal_outcome_study_report() -> FileResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    study_dir = _signal_outcome_study_dir(data_root)
+    workbook_path = _latest_signal_outcome_paths(data_root)["workbook"]
+    result = load_signal_outcome_outputs(study_dir)
+    if result.stock_stats.empty and not workbook_path.exists():
+        raise HTTPException(status_code=404, detail="Signal outcome study report has not been generated yet.")
+    if not result.stock_stats.empty:
+        write_signal_outcome_workbook(result, workbook_path)
+    return FileResponse(
+        workbook_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="signal_outcome_study_report.xlsx",
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     if not _is_allowed(request):
@@ -2275,7 +2982,9 @@ def dashboard(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     storage = Storage(data_root)
     _ensure_market_cap_metadata(config, storage)
     filtered = storage.load_signals("latest_filtered.csv")
@@ -2297,10 +3006,22 @@ def dashboard(request: Request) -> HTMLResponse:
     if selected_return_metric not in {"last_1", "median_3"}:
         selected_return_metric = "median_3"
     min_pair_return = _request_float(request, "min_pair_return_pct")
+    require_htf_alignment = _request_bool(request, "require_htf_alignment")
+    min_breakout_volume_ratio_text = request.query_params.get("min_breakout_volume_ratio", "").strip()
+    min_breakout_volume_ratio = _optional_float(min_breakout_volume_ratio_text)
+    require_relative_strength = _request_bool(request, "require_relative_strength")
+    min_relative_strength_pct_text = request.query_params.get("min_relative_strength_pct", "").strip()
+    min_relative_strength_pct = _optional_float(min_relative_strength_pct_text)
+    max_distance_from_demand_pct_text = request.query_params.get("max_distance_from_demand_pct", "").strip()
+    max_distance_from_demand_pct = _optional_float(max_distance_from_demand_pct_text)
+    min_risk_reward_ratio_text = request.query_params.get("min_risk_reward_ratio", "").strip()
+    min_risk_reward_ratio = _optional_float(min_risk_reward_ratio_text)
     filter_link_suffix = _dashboard_link_suffix(request)
     active_filter_parts = []
     if stock_search:
         active_filter_parts.append(f"Search: {stock_search}")
+    if selected_sensitivity != base_sensitivity:
+        active_filter_parts.append(f"Sensitivity: {selected_sensitivity}")
     if selected_market_cap_bucket:
         active_filter_parts.append(selected_market_cap_bucket)
     if min_market_cap is not None:
@@ -2320,6 +3041,17 @@ def dashboard(request: Request) -> HTMLResponse:
     if min_pair_return is not None:
         metric_label = "last pair return" if selected_return_metric == "last_1" else "median last 3 pair return"
         active_filter_parts.append(f"{metric_label} >= {request.query_params.get('min_pair_return_pct')}%")
+    if require_htf_alignment:
+        active_filter_parts.append("Monthly structure aligned")
+    if min_breakout_volume_ratio is not None:
+        active_filter_parts.append(f"Breakout volume >= {min_breakout_volume_ratio_text}x")
+    if require_relative_strength or min_relative_strength_pct is not None:
+        threshold = min_relative_strength_pct_text or "0"
+        active_filter_parts.append(f"Relative strength vs benchmark >= {threshold}%")
+    if max_distance_from_demand_pct is not None:
+        active_filter_parts.append(f"Distance from demand <= {max_distance_from_demand_pct_text}%")
+    if min_risk_reward_ratio is not None:
+        active_filter_parts.append(f"Risk-reward >= {min_risk_reward_ratio_text}")
 
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     raw = _enrich_with_symbol_metadata(raw, metadata, "symbol")
@@ -2344,6 +3076,8 @@ def dashboard(request: Request) -> HTMLResponse:
     daily_raw = _apply_stock_search(daily_raw, stock_search)
     scan_details = _apply_stock_search(scan_details, stock_search)
 
+    filtered = enrich_weekly_signal_shortlist_frame(filtered, storage, config)
+
     signal_quality_warning = _signal_quality_filter_warning(
         filtered,
         require_volume_confirmation,
@@ -2358,6 +3092,24 @@ def dashboard(request: Request) -> HTMLResponse:
         require_obv_confirmation,
         selected_return_metric,
         min_pair_return,
+    )
+    shortlist_warning = _weekly_shortlist_filter_warning(
+        filtered,
+        require_htf_alignment,
+        min_breakout_volume_ratio,
+        require_relative_strength,
+        min_relative_strength_pct,
+        max_distance_from_demand_pct,
+        min_risk_reward_ratio,
+    )
+    filtered = _apply_weekly_shortlist_filters(
+        filtered,
+        require_htf_alignment,
+        min_breakout_volume_ratio,
+        require_relative_strength,
+        min_relative_strength_pct,
+        max_distance_from_demand_pct,
+        min_risk_reward_ratio,
     )
     large_deals = _load_big_bull_deals(data_root)
     filtered = _apply_large_deal_markers(filtered, large_deals)
@@ -2374,6 +3126,14 @@ def dashboard(request: Request) -> HTMLResponse:
     if not filtered_symbols.empty:
         sort_columns = []
         sort_ascending = []
+        if "shortlist_score" in filtered_symbols.columns:
+            filtered_symbols["shortlist_score"] = pd.to_numeric(filtered_symbols["shortlist_score"], errors="coerce")
+            sort_columns.append("shortlist_score")
+            sort_ascending.append(False)
+        if "relative_strength_12w_pct" in filtered_symbols.columns:
+            filtered_symbols["relative_strength_12w_pct"] = pd.to_numeric(filtered_symbols["relative_strength_12w_pct"], errors="coerce")
+            sort_columns.append("relative_strength_12w_pct")
+            sort_ascending.append(False)
         if "date" in filtered_symbols.columns:
             filtered_symbols["date_sort"] = pd.to_datetime(filtered_symbols["date"], errors="coerce")
             sort_columns.append("date_sort")
@@ -2463,6 +3223,8 @@ def dashboard(request: Request) -> HTMLResponse:
             "selected_exchange": selected_exchange or "",
             "selected_symbol": selected_symbol or "",
             "stock_search": stock_search,
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
             "latest_summary": latest_summary,
             "latest_daily_summary": latest_daily_summary,
             "chart_html": chart_html,
@@ -2480,9 +3242,17 @@ def dashboard(request: Request) -> HTMLResponse:
             "selected_return_metric": selected_return_metric,
             "selected_min_pair_return": request.query_params.get("min_pair_return_pct", ""),
             "signal_quality_warning": signal_quality_warning,
+            "shortlist_warning": shortlist_warning,
+            "require_htf_alignment": require_htf_alignment,
+            "selected_min_breakout_volume_ratio": min_breakout_volume_ratio_text,
+            "require_relative_strength": require_relative_strength,
+            "selected_min_relative_strength_pct": min_relative_strength_pct_text,
+            "selected_max_distance_from_demand_pct": max_distance_from_demand_pct_text,
+            "selected_min_risk_reward_ratio": min_risk_reward_ratio_text,
             "base_filter_query": _dashboard_filter_query(
                 token=request.query_params.get("token", ""),
                 stock_search=stock_search,
+                sensitivity=str(selected_sensitivity),
                 market_cap_bucket=selected_market_cap_bucket,
                 min_market_cap_cr=request.query_params.get("min_market_cap_cr", ""),
                 max_market_cap_cr=request.query_params.get("max_market_cap_cr", ""),
@@ -2492,6 +3262,7 @@ def dashboard(request: Request) -> HTMLResponse:
             "full_filter_query": _dashboard_filter_query(
                 token=request.query_params.get("token", ""),
                 stock_search=stock_search,
+                sensitivity=str(selected_sensitivity),
                 market_cap_bucket=selected_market_cap_bucket,
                 min_market_cap_cr=request.query_params.get("min_market_cap_cr", ""),
                 max_market_cap_cr=request.query_params.get("max_market_cap_cr", ""),
@@ -2502,6 +3273,12 @@ def dashboard(request: Request) -> HTMLResponse:
                 require_obv_confirmation=require_obv_confirmation,
                 return_metric=selected_return_metric if request.query_params.get("min_pair_return_pct", "") else "",
                 min_pair_return_pct=request.query_params.get("min_pair_return_pct", ""),
+                require_htf_alignment=require_htf_alignment,
+                min_breakout_volume_ratio=min_breakout_volume_ratio_text,
+                require_relative_strength=require_relative_strength,
+                min_relative_strength_pct=min_relative_strength_pct_text,
+                max_distance_from_demand_pct=max_distance_from_demand_pct_text,
+                min_risk_reward_ratio=min_risk_reward_ratio_text,
             ),
             "market_cap_bounds": market_cap_bounds,
             "has_metadata": not metadata.empty,
@@ -2513,6 +3290,7 @@ def dashboard(request: Request) -> HTMLResponse:
             "symbols_scanned": request.query_params.get("symbols_scanned", ""),
             "refresh_mode": request.query_params.get("refresh_mode", ""),
             "active_filter_summary": " · ".join(active_filter_parts),
+            **common_filter_context,
         },
     )
 
@@ -2535,13 +3313,26 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
 
     dashboard_token = str(form.get("token", "")).strip()
     stock_search = str(form.get("stock_search", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
     market_cap_bucket = str(form.get("market_cap_bucket", "")).strip()
     min_market_cap_text = str(form.get("min_market_cap_cr", "")).strip()
     max_market_cap_text = str(form.get("max_market_cap_cr", "")).strip()
     min_cmp_text = str(form.get("min_cmp", "")).strip()
     max_cmp_text = str(form.get("max_cmp", "")).strip()
+    require_volume_confirmation = str(form.get("require_volume_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    require_trend_confirmation = str(form.get("require_trend_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    require_obv_confirmation = str(form.get("require_obv_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
+    return_metric = str(form.get("return_metric", "median_3")).strip() or "median_3"
+    min_pair_return_text = str(form.get("min_pair_return_pct", "")).strip()
+    require_htf_alignment = str(form.get("require_htf_alignment", "")).strip().lower() in {"1", "true", "on", "yes"}
+    min_breakout_volume_ratio_text = str(form.get("min_breakout_volume_ratio", "")).strip()
+    require_relative_strength = str(form.get("require_relative_strength", "")).strip().lower() in {"1", "true", "on", "yes"}
+    min_relative_strength_pct_text = str(form.get("min_relative_strength_pct", "")).strip()
+    max_distance_from_demand_pct_text = str(form.get("max_distance_from_demand_pct", "")).strip()
+    min_risk_reward_ratio_text = str(form.get("min_risk_reward_ratio", "")).strip()
     min_market_cap = _optional_float(min_market_cap_text)
     max_market_cap = _optional_float(max_market_cap_text)
+    sensitivity = _parse_sensitivity_text(sensitivity_text)
     market_cap_filter_requested = bool(market_cap_bucket or min_market_cap_text or max_market_cap_text)
     refresh_data = str(form.get("refresh_data", "0")).strip().lower() in {"1", "true", "on", "yes"}
 
@@ -2550,6 +3341,8 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
         params.append(f"token={quote(dashboard_token)}")
     if stock_search:
         params.append(f"stock_search={quote(stock_search)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
     if market_cap_bucket:
         params.append(f"market_cap_bucket={quote(market_cap_bucket)}")
     if min_market_cap_text:
@@ -2560,6 +3353,28 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
         params.append(f"min_cmp={quote(min_cmp_text)}")
     if max_cmp_text:
         params.append(f"max_cmp={quote(max_cmp_text)}")
+    if require_volume_confirmation:
+        params.append("require_volume_confirmation=1")
+    if require_trend_confirmation:
+        params.append("require_trend_confirmation=1")
+    if require_obv_confirmation:
+        params.append("require_obv_confirmation=1")
+    if return_metric:
+        params.append(f"return_metric={quote(return_metric)}")
+    if min_pair_return_text:
+        params.append(f"min_pair_return_pct={quote(min_pair_return_text)}")
+    if require_htf_alignment:
+        params.append("require_htf_alignment=1")
+    if min_breakout_volume_ratio_text:
+        params.append(f"min_breakout_volume_ratio={quote(min_breakout_volume_ratio_text)}")
+    if require_relative_strength:
+        params.append("require_relative_strength=1")
+    if min_relative_strength_pct_text:
+        params.append(f"min_relative_strength_pct={quote(min_relative_strength_pct_text)}")
+    if max_distance_from_demand_pct_text:
+        params.append(f"max_distance_from_demand_pct={quote(max_distance_from_demand_pct_text)}")
+    if min_risk_reward_ratio_text:
+        params.append(f"min_risk_reward_ratio={quote(min_risk_reward_ratio_text)}")
     query_suffix = ("&" + "&".join(params)) if params else ""
 
     try:
@@ -2576,6 +3391,7 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
             max_market_cap,
             market_cap_bucket,
             stock_search,
+            sensitivity,
         )
         scan_config.setdefault("data", {})["skip_kite_fetch"] = not refresh_data
         job_id = uuid4().hex
@@ -2609,11 +3425,21 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
     if return_metric not in {"last_1", "median_3"}:
         return_metric = "median_3"
     min_pair_return_text = str(form.get("min_pair_return_pct", "")).strip()
+    require_htf_alignment = str(form.get("require_htf_alignment", "")).strip().lower() in {"1", "true", "on", "yes"}
+    min_breakout_volume_ratio_text = str(form.get("min_breakout_volume_ratio", "")).strip()
+    require_relative_strength = str(form.get("require_relative_strength", "")).strip().lower() in {"1", "true", "on", "yes"}
+    min_relative_strength_pct_text = str(form.get("min_relative_strength_pct", "")).strip()
+    max_distance_from_demand_pct_text = str(form.get("max_distance_from_demand_pct", "")).strip()
+    min_risk_reward_ratio_text = str(form.get("min_risk_reward_ratio", "")).strip()
     min_market_cap = _optional_float(min_market_cap_text)
     max_market_cap = _optional_float(max_market_cap_text)
     min_cmp = _optional_float(min_cmp_text)
     max_cmp = _optional_float(max_cmp_text)
     min_pair_return = _optional_float(min_pair_return_text)
+    min_breakout_volume_ratio = _optional_float(min_breakout_volume_ratio_text)
+    min_relative_strength_pct = _optional_float(min_relative_strength_pct_text)
+    max_distance_from_demand_pct = _optional_float(max_distance_from_demand_pct_text)
+    min_risk_reward_ratio = _optional_float(min_risk_reward_ratio_text)
 
     filter_query = _dashboard_filter_query(
         token=dashboard_token,
@@ -2628,6 +3454,12 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
         require_obv_confirmation=require_obv_confirmation,
         return_metric=return_metric if min_pair_return_text else "",
         min_pair_return_pct=min_pair_return_text,
+        require_htf_alignment=require_htf_alignment,
+        min_breakout_volume_ratio=min_breakout_volume_ratio_text,
+        require_relative_strength=require_relative_strength,
+        min_relative_strength_pct=min_relative_strength_pct_text,
+        max_distance_from_demand_pct=max_distance_from_demand_pct_text,
+        min_risk_reward_ratio=min_risk_reward_ratio_text,
     )
 
     try:
@@ -2645,6 +3477,12 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             require_obv_confirmation,
             return_metric,
             min_pair_return,
+            require_htf_alignment,
+            min_breakout_volume_ratio,
+            require_relative_strength,
+            min_relative_strength_pct,
+            max_distance_from_demand_pct,
+            min_risk_reward_ratio,
         )
         if visible_buy_signals.empty:
             raise RuntimeError("No weekly BUY signals are available to send.")
@@ -2665,6 +3503,12 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             require_obv_confirmation,
             return_metric,
             min_pair_return_text,
+            require_htf_alignment,
+            min_breakout_volume_ratio_text,
+            require_relative_strength,
+            min_relative_strength_pct_text,
+            max_distance_from_demand_pct_text,
+            min_risk_reward_ratio_text,
         )
         send_buy_signal_list_to_telegram(config, visible_buy_signals, filters_text=filters_text)
         status_query = "telegram_sent=1"
@@ -2787,6 +3631,7 @@ def signal_qa_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
     storage = Storage(data_root)
     _ensure_market_cap_metadata(config, storage)
@@ -2838,6 +3683,8 @@ def signal_qa_page(request: Request) -> HTMLResponse:
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
             "report": report,
             "checks": report["checks"],
             "issues": report["issues"][:200],
@@ -2859,28 +3706,52 @@ def signal_qa_page(request: Request) -> HTMLResponse:
 
 
 @app.post("/watchlist/add/{exchange}/{symbol}")
-def add_watchlist(exchange: str, symbol: str) -> RedirectResponse:
+async def add_watchlist(request: Request, exchange: str, symbol: str) -> RedirectResponse:
     config = load_config()
     storage = Storage(get_data_root(config))
     storage.add_to_watchlist(exchange, symbol)
-    return RedirectResponse("/stocks?watchlist_added=1", status_code=303)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip() or request.query_params.get("token", "").strip()
+    sensitivity = str(form.get("sensitivity", "")).strip() or request.query_params.get("sensitivity", "").strip()
+    params = ["watchlist_added=1"]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity:
+        params.append(f"sensitivity={quote(sensitivity)}")
+    return RedirectResponse(f"/stocks?{'&'.join(params)}", status_code=303)
 
 
 @app.post("/watchlist/remove/{exchange}/{symbol}")
-def remove_watchlist(exchange: str, symbol: str) -> RedirectResponse:
+async def remove_watchlist(request: Request, exchange: str, symbol: str) -> RedirectResponse:
     config = load_config()
     storage = Storage(get_data_root(config))
     storage.remove_from_watchlist(exchange, symbol)
-    return RedirectResponse("/?watchlist_removed=1", status_code=303)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip() or request.query_params.get("token", "").strip()
+    sensitivity = str(form.get("sensitivity", "")).strip() or request.query_params.get("sensitivity", "").strip()
+    params = ["watchlist_removed=1"]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity:
+        params.append(f"sensitivity={quote(sensitivity)}")
+    return RedirectResponse(f"/stocks?{'&'.join(params)}", status_code=303)
 
 
 @app.post("/stocks/fetch")
-def fetch_stocks() -> RedirectResponse:
+async def fetch_stocks(request: Request) -> RedirectResponse:
     config = load_config()
     data_root = get_data_root(config)
     access_token = load_access_token(data_root)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity = str(form.get("sensitivity", "")).strip()
     if not access_token:
-        return RedirectResponse("/login?message=kite_token_missing", status_code=303)
+        params = ["message=kite_token_missing"]
+        if dashboard_token:
+            params.append(f"token={quote(dashboard_token)}")
+        if sensitivity:
+            params.append(f"sensitivity={quote(sensitivity)}")
+        return RedirectResponse(f"/login?{'&'.join(params)}", status_code=303)
 
     provider = KiteDataProvider(access_token=access_token)
     provider.validate_session()
@@ -2888,7 +3759,12 @@ def fetch_stocks() -> RedirectResponse:
     storage = Storage(data_root)
     storage.save_instruments(instruments)
 
-    return RedirectResponse("/stocks?refreshed=1", status_code=303)
+    params = ["refreshed=1"]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity:
+        params.append(f"sensitivity={quote(sensitivity)}")
+    return RedirectResponse(f"/stocks?{'&'.join(params)}", status_code=303)
 
 
 @app.post("/stocks/fetch-market-caps")
@@ -2899,6 +3775,7 @@ async def fetch_market_caps(request: Request) -> RedirectResponse:
     universe_cfg = config.get("universe", {})
     form = await request.form()
     dashboard_token = str(form.get("token", "")).strip()
+    sensitivity = str(form.get("sensitivity", "")).strip()
     market_cap_cfg = universe_cfg.get("market_cap_source", {})
     local_path = _resolve_project_path(str(market_cap_cfg.get("local_path", "")))
     source_url = market_cap_cfg.get("url", DEFAULT_NSE_MARKET_CAP_URL)
@@ -2928,6 +3805,8 @@ async def fetch_market_caps(request: Request) -> RedirectResponse:
 
     if dashboard_token:
         redirect_url += f"&token={quote(dashboard_token)}"
+    if sensitivity:
+        redirect_url += f"&sensitivity={quote(sensitivity)}"
     return RedirectResponse(redirect_url, status_code=303)
 
 
@@ -2941,7 +3820,9 @@ def login_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
 
     return templates.TemplateResponse(
         "login.html",
@@ -2950,6 +3831,9 @@ def login_page(request: Request) -> HTMLResponse:
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "token_status": token_status(data_root),
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            **common_filter_context,
         },
     )
 
@@ -2964,7 +3848,9 @@ def stocks_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     storage = Storage(data_root)
     _ensure_market_cap_metadata(config, storage)
     instruments = storage.load_instruments()
@@ -3050,6 +3936,8 @@ def stocks_page(request: Request) -> HTMLResponse:
             "stocks": _records(stocks),
             "stock_count": len(stocks),
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
             "industry_options": industry_options,
             "selected_industries": request.query_params.getlist("industry"),
             "market_cap_bucket_options": market_cap_bucket_options,
@@ -3062,6 +3950,7 @@ def stocks_page(request: Request) -> HTMLResponse:
             "has_market_cap_metadata": has_market_cap_metadata,
             "active_stock_filters": active_stock_filters,
             "market_cap_filter_requested": market_cap_filter_requested,
+            **common_filter_context,
         },
     )
 
@@ -3076,6 +3965,7 @@ def big_bull_deals_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
     default_from, default_to = default_last_7_days_range()
     from_date = request.query_params.get("from_date", default_from.isoformat())
@@ -3119,6 +4009,8 @@ def big_bull_deals_page(request: Request) -> HTMLResponse:
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
             "deals": _records(deals),
             "deal_count": len(deals),
             "action": request.query_params.get("action", ""),
@@ -3143,6 +4035,7 @@ def stock_chart(request: Request, exchange: str, symbol: str) -> HTMLResponse:
         )
 
     config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
     storage = Storage(data_root)
     daily = storage.load_candles(exchange, symbol, "1D")
@@ -3171,6 +4064,8 @@ def stock_chart(request: Request, exchange: str, symbol: str) -> HTMLResponse:
             "chart_html": chart_html,
             "latest_summary": latest_summary,
             "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
         },
     )
 
