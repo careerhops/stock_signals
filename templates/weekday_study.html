@@ -1,0 +1,283 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Weekday Study</h2>
+      <p>Measures which weekday historically shows the strongest average buy pressure and sell pressure for stocks in the latest weekly BUY/SELL signal list.</p>
+    </div>
+
+    <form action="/weekday-study/run{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}" method="post" class="action-row">
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <button class="button" type="submit">Run Weekday Study</button>
+      <span>Runs only on the latest weekly BUY/SELL list from <strong>latest_raw_signals.csv</strong>, not on the full NSE universe.</span>
+    </form>
+
+    {% if study_ran %}
+      <p class="success-note">Weekday Study completed. Processed {{ summary.get("symbols_processed", 0) }} stocks.</p>
+    {% endif %}
+
+    {% if study_error %}
+      <p class="warning-note">Weekday Study failed: {{ study_error }}</p>
+    {% endif %}
+
+    {% if weekday_job %}
+      <div class="scan-progress" id="weekday-progress" data-job-id="{{ weekday_job }}">
+        <div class="scan-progress-header">
+          <strong id="weekday-progress-title">Weekday Study is running</strong>
+          <span id="weekday-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="weekday-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="weekday-progress-detail">Preparing the latest weekly BUY/SELL signal list...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if weekday_job %}
+    <script>
+      const weekdayProgressBox = document.getElementById("weekday-progress");
+      const weekdayProgressTitle = document.getElementById("weekday-progress-title");
+      const weekdayProgressPercent = document.getElementById("weekday-progress-percent");
+      const weekdayProgressFill = document.getElementById("weekday-progress-fill");
+      const weekdayProgressDetail = document.getElementById("weekday-progress-detail");
+
+      async function pollWeekdayProgress() {
+        if (!weekdayProgressBox) return;
+        const jobId = weekdayProgressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            weekdayProgressTitle.textContent = "Weekday Study status unavailable";
+            weekdayProgressDetail.textContent = status.error || "Could not find the job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          weekdayProgressFill.style.width = `${percent}%`;
+          weekdayProgressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          weekdayProgressTitle.textContent = status.status === "queued" ? "Weekday Study queued" : "Weekday Study is running";
+          weekdayProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} stocks${current}`;
+
+          if (status.status === "completed") {
+            weekdayProgressTitle.textContent = "Weekday Study completed";
+            weekdayProgressFill.style.width = "100%";
+            weekdayProgressPercent.textContent = "100%";
+            weekdayProgressDetail.textContent = "Loading latest weekday results...";
+            window.location.href = status.redirect_url || "/weekday-study";
+            return;
+          }
+
+          if (status.status === "failed") {
+            weekdayProgressTitle.textContent = "Weekday Study failed";
+            weekdayProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          weekdayProgressTitle.textContent = "Waiting for Weekday Study";
+          weekdayProgressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollWeekdayProgress, 1000);
+      }
+
+      pollWeekdayProgress();
+    </script>
+  {% endif %}
+
+  <section class="summary-grid">
+    <div class="metric">
+      <span>Latest weekly BUY signals</span>
+      <strong>{{ buy_signal_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>Latest weekly SELL signals</span>
+      <strong>{{ sell_signal_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>Signal universe</span>
+      <strong>{{ signal_universe_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>Profiled stocks</span>
+      <strong>{{ summary.get("stocks_with_weekday_profile", 0) }}</strong>
+    </div>
+    <div class="metric">
+      <span>Most common buy weekday</span>
+      <strong>{{ summary.get("top_buy_weekday", "") or "-" }}</strong>
+    </div>
+    <div class="metric">
+      <span>Most common sell weekday</span>
+      <strong>{{ summary.get("top_sell_weekday", "") or "-" }}</strong>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Weekday Pressure Table</h2>
+      <p>Blank weekday values mean the study has not been run yet for the current weekly signal set or the stock had insufficient daily history.</p>
+    </div>
+
+    <form action="/weekday-study" method="get" class="filter-panel compact-filters">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+
+      <label>
+        Weekly signal
+        <select name="signal">
+          <option value="">All</option>
+          <option value="BUY" {% if selected_signal == "BUY" %}selected{% endif %}>BUY</option>
+          <option value="SELL" {% if selected_signal == "SELL" %}selected{% endif %}>SELL</option>
+        </select>
+      </label>
+
+      <label>
+        Best buy weekday
+        <select name="best_buy_weekday">
+          <option value="">All</option>
+          {% for weekday in weekday_options %}
+            <option value="{{ weekday }}" {% if selected_buy_weekday == weekday %}selected{% endif %}>{{ weekday }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        Best sell weekday
+        <select name="best_sell_weekday">
+          <option value="">All</option>
+          {% for weekday in weekday_options %}
+            <option value="{{ weekday }}" {% if selected_sell_weekday == weekday %}selected{% endif %}>{{ weekday }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <div class="filter-actions">
+        <button class="button" type="submit">Apply Filters</button>
+        <a class="table-link" href="/weekday-study{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Clear</a>
+      </div>
+    </form>
+
+    <p class="filter-summary">Showing {{ stock_stats_count }} stocks from the current weekly BUY/SELL list.</p>
+
+    {% if stock_stats %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Weekly Signal</th>
+              <th>Signal Date</th>
+              <th>Best Buy Weekday</th>
+              <th>Buy Pressure Score</th>
+              <th>Best Sell Weekday</th>
+              <th>Sell Pressure Score</th>
+              <th>Sample Days</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in stock_stats %}
+              <tr>
+                <td><a class="table-link" href="/weekday-study?symbol={{ row.get('symbol', '') }}{% if dashboard_token %}&token={{ dashboard_token }}{% endif %}{% if selected_sensitivity %}&sensitivity={{ selected_sensitivity }}{% endif %}">{{ row.get("symbol", "") }}</a></td>
+                <td>{{ row.get("name", "") }}</td>
+                <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("signal_date", "") }}</td>
+                <td>{{ row.get("best_buy_weekday", "") }}</td>
+                <td>{{ row.get("best_buy_pressure_score")|number(0) }}</td>
+                <td>{{ row.get("best_sell_weekday", "") }}</td>
+                <td>{{ row.get("best_sell_pressure_score")|number(0) }}</td>
+                <td>{{ row.get("sample_days", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No stocks match the current filters.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Selected Stock Detail</h2>
+      <p>Per-weekday breakdown for the selected stock.</p>
+    </div>
+
+    {% if selected_row %}
+      <div class="summary-grid">
+        <div class="metric">
+          <span>Symbol</span>
+          <strong>{{ selected_row.get("symbol", "") }}</strong>
+        </div>
+        <div class="metric">
+          <span>Weekly signal</span>
+          <strong>{{ selected_row.get("signal", "") }}</strong>
+        </div>
+        <div class="metric">
+          <span>Best buy weekday</span>
+          <strong>{{ selected_row.get("best_buy_weekday", "") or "-" }}</strong>
+        </div>
+        <div class="metric">
+          <span>Best sell weekday</span>
+          <strong>{{ selected_row.get("best_sell_weekday", "") or "-" }}</strong>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if weekday_details %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Weekday</th>
+              <th>Sample Days</th>
+              <th>Up Days</th>
+              <th>Down Days</th>
+              <th>Avg Return %</th>
+              <th>Avg Traded Value</th>
+              <th>Avg Buy Pressure</th>
+              <th>Avg Sell Pressure</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in weekday_details %}
+              <tr>
+                <td>{{ row.get("weekday", "") }}</td>
+                <td>{{ row.get("sample_days", 0) }}</td>
+                <td>{{ row.get("up_days", 0) }}</td>
+                <td>{{ row.get("down_days", 0) }}</td>
+                <td>{{ row.get("avg_return_pct")|number(2) }}</td>
+                <td>{{ row.get("avg_traded_value")|number(0) }}</td>
+                <td>{{ row.get("avg_buy_pressure")|number(0) }}</td>
+                <td>{{ row.get("avg_sell_pressure")|number(0) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">Select a stock to see the weekday breakdown.</p>
+    {% endif %}
+  </section>
+{% endblock %}

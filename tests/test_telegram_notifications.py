@@ -27,6 +27,8 @@ class TelegramNotificationTests(unittest.TestCase):
                     "close": 5239.75,
                     "has_large_deal": True,
                     "large_deal_summary": "1 BUY",
+                    "best_buy_weekday": "Wednesday",
+                    "best_sell_weekday": "Monday",
                 }
             ]
         )
@@ -37,6 +39,8 @@ class TelegramNotificationTests(unittest.TestCase):
         self.assertIn("NSE:E2E-BE", message)
         self.assertIn("E2E Networks Limited", message)
         self.assertIn("Close: 5239.75", message)
+        self.assertIn("Buy day: Wednesday", message)
+        self.assertIn("Sell day: Monday", message)
         self.assertIn("Large Deal: Yes (1 BUY)", message)
 
     def test_buy_signal_list_message_includes_selected_filters(self) -> None:
@@ -97,6 +101,8 @@ class TelegramNotificationTests(unittest.TestCase):
                     "has_large_deal": True,
                     "large_deal_summary": "2 BUY",
                     "large_deal_latest_date": "2026-04-17",
+                    "best_buy_weekday": "Thursday",
+                    "best_sell_weekday": "Tuesday",
                 }
             ]
         )
@@ -105,8 +111,12 @@ class TelegramNotificationTests(unittest.TestCase):
 
         self.assertIn("recent_large_deal", csv_text)
         self.assertIn("large_deal_summary", csv_text)
+        self.assertIn("best_buy_weekday_5y", csv_text)
+        self.assertIn("best_sell_weekday_5y", csv_text)
         self.assertIn("Yes", csv_text)
         self.assertIn("2 BUY", csv_text)
+        self.assertIn("Thursday", csv_text)
+        self.assertIn("Tuesday", csv_text)
 
     def test_buy_signal_html_report_is_readable_and_interactive(self) -> None:
         signals = pd.DataFrame(

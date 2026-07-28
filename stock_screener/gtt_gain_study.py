@@ -73,7 +73,17 @@ def run_gtt_gain_study(
         )
         daily = storage.load_candles(row_exchange, symbol, "1D")
         if daily.empty:
-            context_rows.append(_latest_signal_context(pd.DataFrame(), pd.DataFrame(), row_exchange, symbol, name))
+            context_rows.append(
+                _latest_signal_context(
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    row_exchange,
+                    symbol,
+                    name,
+                    include_daily_quality_metrics=False,
+                    include_technical_rating=False,
+                )
+            )
             _emit_progress(
                 progress_callback,
                 phase="Analyzing BUY-to-SELL daily highs",
@@ -87,7 +97,17 @@ def run_gtt_gain_study(
         daily = _prepare_daily(daily)
         weekly = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
         if weekly.empty:
-            context_rows.append(_latest_signal_context(pd.DataFrame(), daily, row_exchange, symbol, name))
+            context_rows.append(
+                _latest_signal_context(
+                    pd.DataFrame(),
+                    daily,
+                    row_exchange,
+                    symbol,
+                    name,
+                    include_daily_quality_metrics=False,
+                    include_technical_rating=False,
+                )
+            )
             _emit_progress(
                 progress_callback,
                 phase="Analyzing BUY-to-SELL daily highs",
@@ -99,7 +119,17 @@ def run_gtt_gain_study(
             continue
 
         strategy_output = run_weekly_buy_sell(weekly, config)
-        context_rows.append(_latest_signal_context(strategy_output, daily, row_exchange, symbol, name))
+        context_rows.append(
+            _latest_signal_context(
+                strategy_output,
+                daily,
+                row_exchange,
+                symbol,
+                name,
+                include_daily_quality_metrics=False,
+                include_technical_rating=False,
+            )
+        )
         pairs, open_position = build_symbol_gtt_pairs(
             daily=daily,
             strategy_output=strategy_output,
@@ -419,19 +449,24 @@ def _latest_signal_context(
     exchange: str,
     symbol: str,
     name: str,
+    include_daily_quality_metrics: bool = True,
+    include_technical_rating: bool = True,
 ) -> dict[str, Any]:
     if strategy_output.empty:
+        latest_daily_close = pd.NA
+        if not daily.empty and "close" in daily.columns:
+            latest_daily_close = _float_or_na(daily.iloc[-1].get("close"))
         return {
             "exchange": exchange,
             "symbol": symbol,
             "name": name,
             "latest_week_date": pd.NA,
-            "latest_close": pd.NA,
+            "latest_close": latest_daily_close,
             "ema_20": pd.NA,
             "ema_50": pd.NA,
             "close_above_ema20": False,
             "ema20_above_ema50": False,
-            "trend_confirmation": False,
+            "trend_confirmation": pd.NA,
             "daily_ema_20": pd.NA,
             "daily_ema_50": pd.NA,
             "daily_ema_100": pd.NA,
@@ -439,12 +474,12 @@ def _latest_signal_context(
             "daily_ema50_slope": pd.NA,
             "daily_ema100_slope": pd.NA,
             "daily_ema200_slope": pd.NA,
-            "daily_ema_stack_confirmation": False,
+            "daily_ema_stack_confirmation": pd.NA,
             "daily_obv": pd.NA,
             "daily_obv_slope_20d": pd.NA,
-            "daily_obv_confirmation": False,
-            "obv_confirmation": False,
-            "volume_confirmation": False,
+            "daily_obv_confirmation": pd.NA,
+            "obv_confirmation": pd.NA,
+            "volume_confirmation": pd.NA,
             "volume_confirmation_ratio": pd.NA,
             "latest_week_signal": "NONE",
             "latest_signal": "NONE",
@@ -454,6 +489,10 @@ def _latest_signal_context(
             "weekly_technical_rating_status": "NA",
             "weekly_ma_rating": pd.NA,
             "weekly_oscillator_rating": pd.NA,
+            "lorentzian_trades": pd.NA,
+            "lorentzian_win_loss_ratio": pd.NA,
+            "lorentzian_win_rate": pd.NA,
+            "lorentzian_early_signal_flips": pd.NA,
         }
 
     frame = strategy_output.copy()
@@ -463,18 +502,27 @@ def _latest_signal_context(
     signal_rows = frame[frame.get("signal", "NONE").astype(str).isin(["BUY", "SELL"])]
     latest_signal_row = signal_rows.iloc[-1] if not signal_rows.empty else None
 
-    latest_close = _float_or_na(latest.get("close"))
+    latest_daily_close = _float_or_na(daily.iloc[-1].get("close")) if not daily.empty else pd.NA
+    latest_close = latest_daily_close if _is_number(latest_daily_close) else _float_or_na(latest.get("close"))
     ema_20 = _float_or_na(latest.get("ema_20"))
     ema_50 = _float_or_na(latest.get("ema_50"))
     volume_confirmation_ratio = _float_or_na(latest.get("volume_confirmation_ratio"))
     close_above_ema20 = _is_number(latest_close) and _is_number(ema_20) and float(latest_close) > float(ema_20)
     ema20_above_ema50 = _is_number(ema_20) and _is_number(ema_50) and float(ema_20) > float(ema_50)
     latest_signal = str(latest_signal_row.get("signal", "NONE")) if latest_signal_row is not None else "NONE"
-    technical_rating = latest_technical_rating(frame)
-    daily_confirmation = latest_daily_confirmation(daily)
-    daily_ema_stack_confirmation = bool(daily_confirmation.get("daily_ema_stack_confirmation", False))
-    daily_obv_confirmation = bool(daily_confirmation.get("daily_obv_confirmation", False))
+    if include_technical_rating:
+        technical_rating = latest_technical_rating(frame)
+    else:
+        technical_rating = {}
 
+    if include_daily_quality_metrics:
+        daily_confirmation = latest_daily_confirmation(daily)
+        daily_ema_stack_confirmation = bool(daily_confirmation.get("daily_ema_stack_confirmation", False))
+        daily_obv_confirmation = bool(daily_confirmation.get("daily_obv_confirmation", False))
+    else:
+        daily_confirmation = {}
+        daily_ema_stack_confirmation = pd.NA
+        daily_obv_confirmation = pd.NA
     return {
         "exchange": exchange,
         "symbol": symbol,
@@ -498,7 +546,7 @@ def _latest_signal_context(
         "daily_obv_slope_20d": _float_or_na(daily_confirmation.get("daily_obv_slope_20d")),
         "daily_obv_confirmation": daily_obv_confirmation,
         "obv_confirmation": daily_obv_confirmation,
-        "volume_confirmation": bool(latest.get("volume_confirmation", False)),
+        "volume_confirmation": bool(latest.get("volume_confirmation", False)) if include_daily_quality_metrics else pd.NA,
         "volume_confirmation_ratio": volume_confirmation_ratio,
         "latest_week_signal": str(latest.get("signal", "NONE")),
         "latest_signal": latest_signal,
@@ -508,6 +556,10 @@ def _latest_signal_context(
         "weekly_technical_rating_status": str(technical_rating.get("rating_status", "NA")),
         "weekly_ma_rating": _float_or_na(technical_rating.get("ma_rating")),
         "weekly_oscillator_rating": _float_or_na(technical_rating.get("oscillator_rating")),
+        "lorentzian_trades": pd.NA,
+        "lorentzian_win_loss_ratio": pd.NA,
+        "lorentzian_win_rate": pd.NA,
+        "lorentzian_early_signal_flips": pd.NA,
     }
 
 
@@ -518,16 +570,24 @@ def _merge_latest_context(stats: pd.DataFrame, latest_context: pd.DataFrame | No
 
     context = latest_context.copy()
     context = context.drop_duplicates(subset=["exchange", "symbol"], keep="last")
-    stat_columns = ["exchange", "symbol"] + _metric_columns()
+    stat_columns = ["exchange", "symbol"] + [
+        column
+        for column in _stock_stats_columns()
+        if column not in {"exchange", "symbol", "name"} and column not in context.columns
+    ]
     merged = context.merge(
         stats[[column for column in stat_columns if column in stats.columns]],
         on=["exchange", "symbol"],
         how="left",
     )
     for column in _count_columns():
-        merged[column] = pd.to_numeric(merged.get(column), errors="coerce").fillna(0).astype(int)
+        merged[column] = pd.to_numeric(_series_or_default(merged, column, 0), errors="coerce").fillna(0).astype(int)
+    for column in ("lorentzian_trades", "lorentzian_early_signal_flips"):
+        merged[column] = pd.to_numeric(_series_or_default(merged, column, 0), errors="coerce").fillna(0).astype(int)
     for column in _rate_columns():
-        merged[column] = pd.to_numeric(merged.get(column), errors="coerce").fillna(0.0)
+        merged[column] = pd.to_numeric(_series_or_default(merged, column, 0.0), errors="coerce").fillna(0.0)
+    for column in ("lorentzian_win_loss_ratio", "lorentzian_win_rate"):
+        merged[column] = pd.to_numeric(_series_or_default(merged, column, pd.NA), errors="coerce")
     for column in ("median_max_gain_pct", "avg_max_gain_pct", "best_max_gain_pct", "median_days_to_peak", "avg_days_to_peak"):
         if column not in merged.columns:
             merged[column] = pd.NA
@@ -591,6 +651,10 @@ def _stock_stats_columns() -> list[str]:
         "weekly_technical_rating_status",
         "weekly_ma_rating",
         "weekly_oscillator_rating",
+        "lorentzian_trades",
+        "lorentzian_win_loss_ratio",
+        "lorentzian_win_rate",
+        "lorentzian_early_signal_flips",
         "closed_pairs",
         "valid_pairs",
         "pairs_without_daily_window",
@@ -698,6 +762,12 @@ def _suggested_target(max_gain: pd.Series, style: str) -> float | pd.NA:
         return max(0.0, min(value, 10.0))
     value = float(max_gain.quantile(0.75))
     return max(0.0, min(value, 20.0))
+
+
+def _series_or_default(frame: pd.DataFrame, column: str, default: Any) -> pd.Series:
+    if column in frame.columns:
+        return frame[column]
+    return pd.Series([default] * len(frame), index=frame.index)
 
 
 def _prepare_daily(daily: pd.DataFrame) -> pd.DataFrame:

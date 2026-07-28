@@ -1,0 +1,466 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">ADX / DI SCAN</p>
+      <h1>Daily DI+ crossing above DI-</h1>
+      <p class="lede">Runs the PineScript-style ADX, DI+, and DI- calculation on the full local NSE daily universe and currently uses only the DI+ crossing above DI- signal for screening. ADX values remain visible for reference.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/adx-di/run" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        ADX Length
+        <input type="number" name="length" min="2" value="{{ length }}">
+      </label>
+      <label>
+        Threshold
+        <input type="number" name="threshold" min="0" step="0.5" value="{{ threshold }}">
+      </label>
+      <label>
+        Cross Lookback Bars
+        <input type="number" name="cross_lookback_bars" min="1" value="{{ cross_lookback_bars }}">
+      </label>
+      <label>
+        Trend Fast MA
+        <input type="number" name="trend_fast_ma_length" min="2" value="{{ trend_fast_ma_length }}">
+      </label>
+      <label>
+        Trend Slow MA
+        <input type="number" name="trend_slow_ma_length" min="3" value="{{ trend_slow_ma_length }}">
+      </label>
+      <label>
+        Volume Avg Days
+        <input type="number" name="volume_avg_lookback" min="2" value="{{ volume_avg_lookback }}">
+      </label>
+      <label>
+        Min Volume Ratio (x)
+        <input type="number" name="min_volume_ratio" min="0" step="0.1" value="{{ min_volume_ratio }}">
+      </label>
+      <label>
+        Breakout Lookback
+        <input type="number" name="breakout_lookback_days" min="2" value="{{ breakout_lookback_days }}">
+      </label>
+      <label>
+        RS Lookback Days
+        <input type="number" name="rs_lookback_days" min="1" value="{{ rs_lookback_days }}">
+      </label>
+      <label>
+        Min RS Spread %
+        <input type="number" name="min_rs_spread_pct" step="0.1" value="{{ min_rs_spread_pct }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run DI+ / DI- Scan</button>
+      </div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">DI+ / DI- Scan completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="adx-di-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="adx-di-progress-title">DI+ / DI- Scan is running</strong>
+          <span id="adx-di-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="adx-di-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="adx-di-progress-detail">Scanning local daily candles for DI+ crossing above DI-...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if study_job %}
+    <script>
+      const adxDiProgressBox = document.getElementById("adx-di-progress");
+      const adxDiProgressTitle = document.getElementById("adx-di-progress-title");
+      const adxDiProgressPercent = document.getElementById("adx-di-progress-percent");
+      const adxDiProgressFill = document.getElementById("adx-di-progress-fill");
+      const adxDiProgressDetail = document.getElementById("adx-di-progress-detail");
+
+      async function pollAdxDiProgress() {
+        if (!adxDiProgressBox) return;
+        const jobId = adxDiProgressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            adxDiProgressTitle.textContent = "DI+ / DI- status unavailable";
+            adxDiProgressDetail.textContent = status.error || "Could not find the job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          adxDiProgressFill.style.width = `${percent}%`;
+          adxDiProgressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          adxDiProgressTitle.textContent = status.status === "queued" ? "DI+ / DI- Scan queued" : "DI+ / DI- Scan is running";
+          adxDiProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} symbols${current}`;
+
+          if (status.status === "completed") {
+            adxDiProgressTitle.textContent = "DI+ / DI- Scan completed";
+            adxDiProgressFill.style.width = "100%";
+            adxDiProgressPercent.textContent = "100%";
+            adxDiProgressDetail.textContent = "Loading results...";
+            window.location.href = status.redirect_url || "/adx-di";
+            return;
+          }
+
+          if (status.status === "failed") {
+            adxDiProgressTitle.textContent = "DI+ / DI- Scan failed";
+            adxDiProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          adxDiProgressTitle.textContent = "Waiting for DI+ / DI- Scan";
+          adxDiProgressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollAdxDiProgress, 1000);
+      }
+
+      pollAdxDiProgress();
+    </script>
+  {% endif %}
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Symbols Matching Filter</span>
+      <strong>{{ stock_stats_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Universe Scanned</span>
+      <strong>{{ summary.get("symbols_processed", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Average Latest ADX</span>
+      <strong>{% if avg_latest_adx is not none %}{{ avg_latest_adx|number }}{% else %}-{% endif %}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Highest Latest ADX</span>
+      <strong>{% if max_latest_adx is not none %}{{ max_latest_adx|number }}{% else %}-{% endif %}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/adx-di" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="length" value="{{ length }}">
+      <input type="hidden" name="threshold" value="{{ threshold }}">
+      <input type="hidden" name="cross_lookback_bars" value="{{ cross_lookback_bars }}">
+      <input type="hidden" name="trend_fast_ma_length" value="{{ trend_fast_ma_length }}">
+      <input type="hidden" name="trend_slow_ma_length" value="{{ trend_slow_ma_length }}">
+      <input type="hidden" name="volume_avg_lookback" value="{{ volume_avg_lookback }}">
+      <input type="hidden" name="min_volume_ratio" value="{{ min_volume_ratio }}">
+      <input type="hidden" name="breakout_lookback_days" value="{{ breakout_lookback_days }}">
+      <input type="hidden" name="rs_lookback_days" value="{{ rs_lookback_days }}">
+      <input type="hidden" name="min_rs_spread_pct" value="{{ min_rs_spread_pct }}">
+      <input type="hidden" name="matches_only" value="0">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="matches_only" value="1" {% if matches_only %}checked{% endif %}>
+        Show only DI+ crossing above DI- signals
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_trend_filter" value="1" {% if require_trend_filter %}checked{% endif %}>
+        Trend filter
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_volume_filter" value="1" {% if require_volume_filter %}checked{% endif %}>
+        Volume filter
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_breakout_filter" value="1" {% if require_breakout_filter %}checked{% endif %}>
+        Breakout filter
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_rs_filter" value="1" {% if require_rs_filter %}checked{% endif %}>
+        Relative strength filter
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="copy-symbols-panel">
+      <div class="copy-symbols-heading">
+        <div>
+          <h2>Filtered Symbols</h2>
+          <p>Comma-separated list of the visible stocks after the DI+ / DI- crossover filter.</p>
+        </div>
+        <div class="copy-symbols-actions">
+          <button class="button secondary" type="button" data-copy-target="adx-di-symbols-csv">Copy Symbols</button>
+        </div>
+      </div>
+      <textarea id="adx-di-symbols-csv" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Sector / Industry Mix</h2>
+      <p>Uses symbol metadata to group the currently visible DI+ rows. When a known sector benchmark mapping exists, it is shown as the sector. Otherwise the raw industry label is used.</p>
+    </div>
+    {% if sector_chart_html %}
+      <div class="chart-frame">
+        {{ sector_chart_html | safe }}
+      </div>
+    {% else %}
+      <p class="empty">No sector metadata available for the currently visible symbols.</p>
+    {% endif %}
+    {% if sector_summary %}
+      <div class="table-wrap signal-history">
+        <table>
+          <thead>
+            <tr>
+              <th>Sector</th>
+              <th>Stocks</th>
+              <th>Share %</th>
+              <th>Avg Quality</th>
+              <th>Avg RS Spread %</th>
+              <th>Avg Cross Vol Ratio</th>
+              <th>Leading Stocks</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in sector_summary %}
+              <tr>
+                <td>{{ row.get("sector_label", "") }}</td>
+                <td>{{ row.get("stock_count", "") }}</td>
+                <td>{{ row.get("share_pct", "")|number }}</td>
+                <td>{{ row.get("avg_quality_score", "")|number }}</td>
+                <td>{{ row.get("avg_rs_spread_pct", "")|number }}</td>
+                <td>{{ row.get("avg_cross_volume_ratio", "")|number }}</td>
+                <td>{{ row.get("leading_symbols_csv", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Sector Leaders</h2>
+      <p>Leaders are ranked within each sector by quality score, RS spread, cross volume ratio, DI+ minus DI- range, and market cap.</p>
+    </div>
+    {% if sector_leaders %}
+      <div class="table-wrap signal-history">
+        <table>
+          <thead>
+            <tr>
+              <th>Sector</th>
+              <th>Rank</th>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Industry</th>
+              <th>Quality Score</th>
+              <th>RS Spread %</th>
+              <th>Cross Vol Ratio</th>
+              <th>DI+ - DI-</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in sector_leaders %}
+              <tr>
+                <td>{{ row.get("sector_label", "") }}</td>
+                <td>{{ row.get("sector_rank", "") }}</td>
+                <td>{{ row.get("symbol_display", row.get("symbol", "")) }}</td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("industry", "") }}</td>
+                <td>{{ row.get("quality_score", "")|number(0) }}</td>
+                <td>{{ row.get("relative_strength_spread_pct", "")|number }}</td>
+                <td>{{ row.get("cross_volume_ratio", "")|number }}</td>
+                <td>{{ row.get("di_plus_minus_range", "")|number }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No leaders available because the filtered list is empty.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+          <h2>ADX / DI Chart</h2>
+          <p>Price candles on top, volume overlay, then DI+, DI-, ADX, the threshold line, and DI+ crossover markers below.</p>
+    </div>
+    <form method="get" action="/adx-di" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="length" value="{{ length }}">
+      <input type="hidden" name="threshold" value="{{ threshold }}">
+      <input type="hidden" name="cross_lookback_bars" value="{{ cross_lookback_bars }}">
+      <input type="hidden" name="trend_fast_ma_length" value="{{ trend_fast_ma_length }}">
+      <input type="hidden" name="trend_slow_ma_length" value="{{ trend_slow_ma_length }}">
+      <input type="hidden" name="volume_avg_lookback" value="{{ volume_avg_lookback }}">
+      <input type="hidden" name="min_volume_ratio" value="{{ min_volume_ratio }}">
+      <input type="hidden" name="breakout_lookback_days" value="{{ breakout_lookback_days }}">
+      <input type="hidden" name="rs_lookback_days" value="{{ rs_lookback_days }}">
+      <input type="hidden" name="min_rs_spread_pct" value="{{ min_rs_spread_pct }}">
+      <input type="hidden" name="stock_search" value="{{ stock_search }}">
+      {% if matches_only %}
+        <input type="hidden" name="matches_only" value="1">
+      {% endif %}
+      {% if require_trend_filter %}
+        <input type="hidden" name="require_trend_filter" value="1">
+      {% endif %}
+      {% if require_volume_filter %}
+        <input type="hidden" name="require_volume_filter" value="1">
+      {% endif %}
+      {% if require_breakout_filter %}
+        <input type="hidden" name="require_breakout_filter" value="1">
+      {% endif %}
+      {% if require_rs_filter %}
+        <input type="hidden" name="require_rs_filter" value="1">
+      {% endif %}
+      <label>
+        Stock
+        <select name="chart_symbol">
+          <option value="">Choose</option>
+          {% for option in chart_symbol_options %}
+            <option value="{{ option.value }}" {% if chart_symbol == option.value %}selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Load Chart</button>
+      </div>
+    </form>
+    {% if chart_html %}
+      <div class="chart-frame">
+        {{ chart_html | safe }}
+      </div>
+      <p class="empty">{% if chart_symbol_display %}<strong>{{ chart_symbol_display }}</strong>{% if chart_name %} · {{ chart_name }}{% endif %}{% endif %}</p>
+    {% else %}
+      <p class="empty">{{ chart_message }}</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>DI+ / DI- Stocks</h2>
+      <p>Daily values from the same PineScript-style calculation used by the scan, with DI+ crossover as the active screener signal.</p>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Sector</th>
+            <th>Industry</th>
+            <th>Current Price</th>
+            <th>Current Price Date</th>
+            <th>DI+</th>
+            <th>DI-</th>
+            <th>ADX</th>
+            <th>ADX - DI-</th>
+            <th>DI+ &gt; DI-</th>
+            <th>DI+ Crosses In Window</th>
+            <th>Recent DI+ Cross Dates</th>
+            <th>Latest DI+ Cross Date</th>
+            <th>Trend Pass</th>
+            <th>Cross Vol Ratio</th>
+            <th>Volume Pass</th>
+            <th>Breakout Level</th>
+            <th>Breakout Ext %</th>
+            <th>Breakout Pass</th>
+            <th>RS Spread %</th>
+            <th>RS Pass</th>
+            <th>Quality Score</th>
+            <th>DI+ Signal</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol_display", row.get("symbol", "")) }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("sector_label", "") }}</td>
+              <td>{{ row.get("industry", "") }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_close_date", "") }}</td>
+              <td>{{ row.get("latest_di_plus", "")|number }}</td>
+              <td>{{ row.get("latest_di_minus", "")|number }}</td>
+              <td>{{ row.get("latest_adx", "")|number }}</td>
+              <td>{{ row.get("adx_minus_di_minus_gap", "")|number }}</td>
+              <td>{% if row.get("di_plus_above_di_minus") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("di_plus_crosses_in_lookback_bars", "") }}</td>
+              <td>{{ row.get("recent_di_plus_cross_dates_csv", "") }}</td>
+              <td>{{ row.get("latest_di_plus_cross_date", "") }}</td>
+              <td>{% if row.get("trend_filter_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("cross_volume_ratio", "")|number }}</td>
+              <td>{% if row.get("volume_filter_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("breakout_level", "")|number }}</td>
+              <td>{{ row.get("breakout_extension_pct", "")|number }}</td>
+              <td>{% if row.get("breakout_filter_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("relative_strength_spread_pct", "")|number }}</td>
+              <td>{% if row.get("rs_filter_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("quality_score", "") }}</td>
+              <td>{% if row.get("di_plus_cross_above_di_minus_recent") %}Yes{% else %}No{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const targetId = button.getAttribute("data-copy-target");
+        const target = targetId ? document.getElementById(targetId) : null;
+        if (!target) return;
+        const text = String(target.value || "").trim();
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1200);
+        } catch (error) {
+          target.focus();
+          target.select();
+          const original = button.textContent;
+          button.textContent = "Select and copy";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1600);
+        }
+      });
+    });
+  </script>
+{% endblock %}

@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">RESISTANCE BREAK SCAN</p>
+      <h1>Stocks with repeated resistance breakouts on heavy volume</h1>
+      <p class="lede">Uses pivot-based resistance similar to the attached Support and Resistance Pine script, then filters for stocks where the close crossed above resistance at least the chosen number of times with bar volume above the chosen multiple of prior average volume.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/resistance-breaks/run" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        Left bars
+        <input type="number" name="left_bars" min="1" value="{{ left_bars }}">
+      </label>
+      <label>
+        Right bars
+        <input type="number" name="right_bars" min="1" value="{{ right_bars }}">
+      </label>
+      <label>
+        Volume average window
+        <input type="number" name="volume_avg_window" min="2" value="{{ volume_avg_window }}">
+      </label>
+      <label>
+        Volume multiplier
+        <input type="number" name="volume_multiplier" min="0.1" step="0.1" value="{{ volume_multiplier }}">
+      </label>
+      <label>
+        Minimum breakout count
+        <input type="number" name="min_break_count" min="1" value="{{ min_break_count }}">
+      </label>
+      <label>
+        Recent breakout window (days)
+        <input type="number" name="recent_window_days" min="1" value="{{ recent_window_days }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Resistance Break Scan</button>
+      </div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Resistance Break Scan completed.</p>
+    {% endif %}
+    {% if study_job %}
+      <div class="scan-progress" id="resistance-breaks-progress" data-job-id="{{ study_job }}">
+        <div class="progress-header">
+          <strong id="resistance-breaks-progress-title">Resistance Break Scan is running</strong>
+          <span id="resistance-breaks-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="resistance-breaks-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="resistance-breaks-progress-detail">Scanning local daily candles for repeated resistance breakouts...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("resistance-breaks-progress");
+          if (!box) return;
+          const jobId = box.dataset.jobId;
+          const title = document.getElementById("resistance-breaks-progress-title");
+          const percent = document.getElementById("resistance-breaks-progress-percent");
+          const fill = document.getElementById("resistance-breaks-progress-fill");
+          const detail = document.getElementById("resistance-breaks-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${jobId}`);
+              if (!response.ok) return;
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "Resistance Break Scan queued" : (status.phase || "Resistance Break Scan is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              detail.textContent = status.current_symbol ? `${status.phase || "Running"}: ${status.current_symbol}` : (status.phase || "Running");
+              if (status.status === "completed") {
+                window.location.href = status.redirect_url || "/resistance-breaks";
+                return;
+              }
+              if (status.status === "failed") {
+                window.location.href = status.redirect_url || "/resistance-breaks?study_error=Scan+failed";
+                return;
+              }
+              window.setTimeout(poll, 1500);
+            } catch (error) {
+              title.textContent = "Resistance Break status unavailable";
+              detail.textContent = "Refresh the page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 800);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Matching Stocks</span>
+      <strong>{{ stock_stats_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Universe Scanned</span>
+      <strong>{{ summary.get("symbols_processed", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Average Break Count</span>
+      <strong>{% if avg_break_count is not none %}{{ "%.2f"|format(avg_break_count) }}{% else %}-{% endif %}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Maximum Break Count</span>
+      <strong>{{ max_break_count if max_break_count is not none else "-" }}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/resistance-breaks" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="left_bars" value="{{ left_bars }}">
+      <input type="hidden" name="right_bars" value="{{ right_bars }}">
+      <input type="hidden" name="volume_avg_window" value="{{ volume_avg_window }}">
+      <input type="hidden" name="volume_multiplier" value="{{ volume_multiplier }}">
+      <input type="hidden" name="min_break_count" value="{{ min_break_count }}">
+      <input type="hidden" name="recent_window_days" value="{{ recent_window_days }}">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="matches_only" value="1" {% if matches_only %}checked{% endif %}>
+        Matching stocks only
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+
+    {% if stock_symbols_csv %}
+      <div class="copy-block">
+        <div class="copy-row">
+          <div>
+            <h3>Matching symbols</h3>
+            <p>Comma-separated list of visible stocks after the resistance-break filter.</p>
+          </div>
+          <button class="button secondary" type="button" data-copy-target="resistance-break-symbols-csv">Copy Symbols</button>
+        </div>
+        <textarea id="resistance-break-symbols-csv" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+      </div>
+    {% endif %}
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Current Price</th>
+            <th>Current Price Date</th>
+            <th>Break Count</th>
+            <th>Window (Days)</th>
+            <th>Latest Resistance</th>
+            <th>Resistance Zone Date</th>
+            <th>52W High</th>
+            <th>Close > Resistance</th>
+            <th>Resistance Within 25% Of ATH</th>
+            <th>Latest Break Date</th>
+            <th>Latest Break Volume Ratio</th>
+            <th>Recent Break Dates</th>
+            <th>Pass</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_close_date", "") }}</td>
+              <td>{{ row.get("volume_confirmed_resistance_break_count", "") }}</td>
+              <td>{{ row.get("recent_breakout_window_days", "") }}</td>
+              <td>{{ row.get("latest_resistance_level", "")|number }}</td>
+              <td>{{ row.get("selected_resistance_zone_date", "") }}</td>
+              <td>{{ row.get("latest_52w_high", "")|number }}</td>
+              <td>{% if row.get("close_above_recent_resistance") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("resistance_within_25pct_of_ath") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("latest_break_date", "") }}</td>
+              <td>{{ row.get("latest_break_volume_ratio", "")|number }}</td>
+              <td>{{ row.get("recent_break_dates_csv", "") }}</td>
+              <td>{% if row.get("passes_volume_confirmed_resistance_breaks") %}Yes{% else %}No{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Recent breakout events</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Close</th>
+            <th>Resistance</th>
+            <th>Volume</th>
+            <th>Average Volume</th>
+            <th>Volume Ratio</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in breakout_events %}
+            <tr>
+              <td>{{ row.get("date", "") }}</td>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("close", "")|number }}</td>
+              <td>{{ row.get("resistance_level", "")|number }}</td>
+              <td>{{ row.get("volume", "")|number }}</td>
+              <td>{{ row.get("avg_volume", "")|number }}</td>
+              <td>{{ row.get("volume_ratio", "")|number }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

@@ -1,0 +1,370 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Strategy Lab</h2>
+      <p>Tests multiple daily technical strategies on the weekly BUY/SELL signal cohorts generated since the chosen start date. BUY signals are evaluated as long setups and SELL signals as short setups.</p>
+    </div>
+
+    <form action="/strategy-lab/run{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}" method="post" class="action-row">
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <label>
+        Start date
+        <input type="date" name="start_date" value="{{ start_date }}">
+      </label>
+      <button class="button" type="submit">Run Strategy Lab</button>
+      <span>Uses weekly signal events from <strong>latest_raw_signals.csv</strong> and daily candles for trade simulation.</span>
+    </form>
+
+    {% if study_ran %}
+      <p class="success-note">Strategy Lab completed on {{ summary.get("signal_events", 0) }} signal events.</p>
+    {% endif %}
+
+    {% if study_error %}
+      <p class="warning-note">Strategy Lab failed: {{ study_error }}</p>
+    {% endif %}
+
+    {% if lab_job %}
+      <div class="scan-progress" id="lab-progress" data-job-id="{{ lab_job }}">
+        <div class="scan-progress-header">
+          <strong id="lab-progress-title">Strategy Lab is running</strong>
+          <span id="lab-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="lab-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="lab-progress-detail">Preparing weekly BUY/SELL cohorts...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if lab_job %}
+    <script>
+      const labProgressBox = document.getElementById("lab-progress");
+      const labProgressTitle = document.getElementById("lab-progress-title");
+      const labProgressPercent = document.getElementById("lab-progress-percent");
+      const labProgressFill = document.getElementById("lab-progress-fill");
+      const labProgressDetail = document.getElementById("lab-progress-detail");
+
+      async function pollLabProgress() {
+        if (!labProgressBox) return;
+        const jobId = labProgressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            labProgressTitle.textContent = "Strategy Lab status unavailable";
+            labProgressDetail.textContent = status.error || "Could not find the job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          labProgressFill.style.width = `${percent}%`;
+          labProgressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          labProgressTitle.textContent = status.status === "queued" ? "Strategy Lab queued" : "Strategy Lab is running";
+          labProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} symbols${current}`;
+
+          if (status.status === "completed") {
+            labProgressTitle.textContent = "Strategy Lab completed";
+            labProgressFill.style.width = "100%";
+            labProgressPercent.textContent = "100%";
+            labProgressDetail.textContent = "Loading strategy results...";
+            window.location.href = status.redirect_url || "/strategy-lab";
+            return;
+          }
+
+          if (status.status === "failed") {
+            labProgressTitle.textContent = "Strategy Lab failed";
+            labProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          labProgressTitle.textContent = "Waiting for Strategy Lab";
+          labProgressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollLabProgress, 1000);
+      }
+
+      pollLabProgress();
+    </script>
+  {% endif %}
+
+  <section class="summary-grid">
+    <div class="metric">
+      <span>Signal events</span>
+      <strong>{{ summary.get("signal_events", 0) }}</strong>
+    </div>
+    <div class="metric">
+      <span>BUY signals</span>
+      <strong>{{ buy_signal_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>SELL signals</span>
+      <strong>{{ sell_signal_count }}</strong>
+    </div>
+    <div class="metric">
+      <span>Best strategy</span>
+      <strong>{{ summary.get("best_strategy_name", "") or "-" }}</strong>
+    </div>
+    <div class="metric">
+      <span>Best technical</span>
+      <strong>{{ summary.get("best_technical_strategy_name", "") or "-" }}</strong>
+    </div>
+    <div class="metric">
+      <span>Best avg return</span>
+      <strong>{{ summary.get("best_strategy_avg_return_pct")|number(2) }}%</strong>
+    </div>
+    <div class="metric">
+      <span>Best profit factor</span>
+      <strong>{{ summary.get("best_strategy_profit_factor")|number(2) }}</strong>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Next Week Candidates</h2>
+      <p>These are the current weekly BUY/SELL stocks ranked by the best-performing technical filters from the lab. Higher bias score means stronger agreement between trend, RSI regime, momentum capture, MACD direction, and volume support.</p>
+    </div>
+
+    <div class="summary-grid">
+      <div class="metric">
+        <span>Current BUY candidates</span>
+        <strong>{{ buy_candidates|length }}</strong>
+      </div>
+      <div class="metric">
+        <span>Current SELL candidates</span>
+        <strong>{{ sell_candidates|length }}</strong>
+      </div>
+      <div class="metric">
+        <span>Best custom filter</span>
+        <strong>{{ summary.get("best_custom_strategy_name", "") or "-" }}</strong>
+      </div>
+      <div class="metric">
+        <span>Best technical filter</span>
+        <strong>{{ summary.get("best_technical_strategy_name", "") or "-" }}</strong>
+      </div>
+    </div>
+
+    <div class="panel-heading">
+      <h3>BUY List</h3>
+    </div>
+    {% if buy_candidates %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Close</th>
+              <th>RSI 14</th>
+              <th>Vol Ratio</th>
+              <th>EMA Trend</th>
+              <th>RSI Regime</th>
+              <th>Momentum Capture</th>
+              <th>Bias Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in buy_candidates %}
+              <tr>
+                <td>{{ row.get("symbol", "") }}</td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("close")|number(2) }}</td>
+                <td>{{ row.get("rsi14")|number(1) }}</td>
+                <td>{{ row.get("vol_ratio")|number(2) }}</td>
+                <td>{{ "Yes" if row.get("ema_trend") else "No" }}</td>
+                <td>{{ "Yes" if row.get("rsi_regime") else "No" }}</td>
+                <td>{{ "Yes" if row.get("momentum_capture") else "No" }}</td>
+                <td>{{ row.get("bias_score", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No current BUY candidates are available yet.</p>
+    {% endif %}
+
+    <div class="panel-heading">
+      <h3>SELL List</h3>
+    </div>
+    {% if sell_candidates %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Close</th>
+              <th>RSI 14</th>
+              <th>Vol Ratio</th>
+              <th>EMA Trend</th>
+              <th>RSI Regime</th>
+              <th>Momentum Capture</th>
+              <th>Bias Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in sell_candidates %}
+              <tr>
+                <td>{{ row.get("symbol", "") }}</td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("close")|number(2) }}</td>
+                <td>{{ row.get("rsi14")|number(1) }}</td>
+                <td>{{ row.get("vol_ratio")|number(2) }}</td>
+                <td>{{ "Yes" if row.get("ema_trend") else "No" }}</td>
+                <td>{{ "Yes" if row.get("rsi_regime") else "No" }}</td>
+                <td>{{ "Yes" if row.get("momentum_capture") else "No" }}</td>
+                <td>{{ row.get("bias_score", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No current SELL candidates are available yet.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Strategy Comparison</h2>
+      <p>The comparison uses the same weekly signal cohort for every strategy. The custom strategy is <strong>Momentum Capture 3D</strong>, which requires daily EMA trend alignment plus RSI regime confirmation, then exits after 3 trading days.</p>
+    </div>
+
+    {% if strategy_stats %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Family</th>
+              <th>Trades</th>
+              <th>Coverage %</th>
+              <th>Win Rate %</th>
+              <th>Avg Return %</th>
+              <th>Median Return %</th>
+              <th>Total Return %</th>
+              <th>Profit Factor</th>
+              <th>Avg Hold Days</th>
+              <th>Avg Entry Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in strategy_stats %}
+              <tr>
+                <td><a class="table-link" href="/strategy-lab?strategy={{ row.get('strategy_name', '') }}&start_date={{ start_date }}{% if dashboard_token %}&token={{ dashboard_token }}{% endif %}{% if selected_sensitivity %}&sensitivity={{ selected_sensitivity }}{% endif %}">{{ row.get("strategy_name", "") }}</a></td>
+                <td>{{ row.get("strategy_family", "") }}</td>
+                <td>{{ row.get("trades", 0) }}</td>
+                <td>{{ row.get("coverage_pct")|number(1) }}</td>
+                <td>{{ row.get("win_rate_pct")|number(1) }}</td>
+                <td>{{ row.get("avg_return_pct")|number(2) }}</td>
+                <td>{{ row.get("median_return_pct")|number(2) }}</td>
+                <td>{{ row.get("total_return_pct")|number(1) }}</td>
+                <td>{{ row.get("profit_factor")|number(2) }}</td>
+                <td>{{ row.get("avg_holding_days")|number(1) }}</td>
+                <td>{{ row.get("avg_alignment_score")|number(2) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">Run the Strategy Lab to compare candidate strategies.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Selected Strategy Trades</h2>
+      <p>Showing trade samples for <strong>{{ selected_strategy or best_strategy_name or "-" }}</strong>.</p>
+    </div>
+
+    {% if trade_details %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Signal</th>
+              <th>Signal Date</th>
+              <th>Entry Date</th>
+              <th>Exit Date</th>
+              <th>Return %</th>
+              <th>Exit Reason</th>
+              <th>Hold Days</th>
+              <th>Entry RSI</th>
+              <th>Entry Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in trade_details %}
+              <tr>
+                <td>{{ row.get("symbol", "") }}</td>
+                <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("signal_date", "") }}</td>
+                <td>{{ row.get("entry_date", "") }}</td>
+                <td>{{ row.get("exit_date", "") }}</td>
+                <td>{{ row.get("return_pct")|number(2) }}</td>
+                <td>{{ row.get("exit_reason", "") }}</td>
+                <td>{{ row.get("holding_days", "") }}</td>
+                <td>{{ row.get("entry_rsi14")|number(1) }}</td>
+                <td>{{ row.get("entry_alignment_score", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No trades available for the selected strategy.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Signal Cohort Preview</h2>
+      <p>The experiment set is built from weekly BUY/SELL events saved by the screener since the chosen start date.</p>
+    </div>
+
+    {% if signal_universe_preview %}
+      <div class="table-wrap stock-list-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Signal</th>
+              <th>Symbol</th>
+              <th>Name</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in signal_universe_preview %}
+              <tr>
+                <td>{{ row.get("date", "") }}</td>
+                <td><span class="signal {{ row.get('signal', '')|lower }}">{{ row.get("signal", "") }}</span></td>
+                <td>{{ row.get("symbol", "") }}</td>
+                <td>{{ row.get("name", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No signal cohort data available yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

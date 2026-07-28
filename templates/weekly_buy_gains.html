@@ -1,0 +1,310 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">WEEKLY BUY GAINS</p>
+      <h1>Weekly BUY names and current gain</h1>
+      <p class="lede">Shows every stock that appeared in weekly BUY since the selected date, its latest local close, and current gain versus the latest weekly BUY price.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/weekly-buy-gains/run" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        Start date
+        <input type="date" name="start_date" value="{{ start_date }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Weekly Buy Gains</button>
+      </div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Weekly Buy Gains completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="buy-gains-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="buy-gains-progress-title">Weekly Buy Gains is running</strong>
+          <span id="buy-gains-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="buy-gains-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="buy-gains-progress-detail">Rebuilding weekly BUY history from daily candles...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if study_job %}
+    <script>
+      const buyGainsProgressBox = document.getElementById("buy-gains-progress");
+      const buyGainsProgressTitle = document.getElementById("buy-gains-progress-title");
+      const buyGainsProgressPercent = document.getElementById("buy-gains-progress-percent");
+      const buyGainsProgressFill = document.getElementById("buy-gains-progress-fill");
+      const buyGainsProgressDetail = document.getElementById("buy-gains-progress-detail");
+
+      async function pollBuyGainsProgress() {
+        if (!buyGainsProgressBox) return;
+        const jobId = buyGainsProgressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            buyGainsProgressTitle.textContent = "Weekly Buy Gains status unavailable";
+            buyGainsProgressDetail.textContent = status.error || "Could not find the job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          buyGainsProgressFill.style.width = `${percent}%`;
+          buyGainsProgressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          buyGainsProgressTitle.textContent = status.status === "queued" ? "Weekly Buy Gains queued" : "Weekly Buy Gains is running";
+          buyGainsProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} symbols${current}`;
+
+          if (status.status === "completed") {
+            buyGainsProgressTitle.textContent = "Weekly Buy Gains completed";
+            buyGainsProgressFill.style.width = "100%";
+            buyGainsProgressPercent.textContent = "100%";
+            buyGainsProgressDetail.textContent = "Loading results...";
+            window.location.href = status.redirect_url || "/weekly-buy-gains";
+            return;
+          }
+
+          if (status.status === "failed") {
+            buyGainsProgressTitle.textContent = "Weekly Buy Gains failed";
+            buyGainsProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          buyGainsProgressTitle.textContent = "Waiting for Weekly Buy Gains";
+          buyGainsProgressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollBuyGainsProgress, 1000);
+      }
+
+      pollBuyGainsProgress();
+    </script>
+  {% endif %}
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Stocks in Weekly BUY Since Date</span>
+      <strong>{{ stock_stats_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Stocks Currently in Gain</span>
+      <strong>{{ gainers_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>OBV MACD Cross Up</span>
+      <strong>{{ obv_macd_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Latest Volume 3x</span>
+      <strong>{{ latest_volume_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Profitable Share</span>
+      <strong>{% if profitable_share_pct is not none %}{{ profitable_share_pct|number }}%{% else %}-{% endif %}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Average Current Gain</span>
+      <strong>{% if avg_current_gain_pct is not none %}{{ avg_current_gain_pct|number }}%{% else %}-{% endif %}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/weekly-buy-gains" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <input type="hidden" name="minervini_only" value="0">
+      <input type="hidden" name="obv_macd_only" value="0">
+      <input type="hidden" name="latest_volume_only" value="0">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="minervini_only" value="1" {% if minervini_only %}checked{% endif %}>
+        Weekly BUY + Minervini only
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="obv_macd_only" value="1" {% if obv_macd_only %}checked{% endif %}>
+        OBV MACD cross-up only
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="latest_volume_only" value="1" {% if latest_volume_only %}checked{% endif %}>
+        Latest volume >= 3x prev 9D avg
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+    {% if minervini_notice %}
+      <p class="status">{{ minervini_notice }}</p>
+    {% endif %}
+    {% if obv_macd_notice %}
+      <p class="status">{{ obv_macd_notice }}</p>
+    {% endif %}
+    {% if latest_volume_notice %}
+      <p class="status">{{ latest_volume_notice }}</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Stocks Currently in Gain</h2>
+      <p>Subset where current price is above the latest weekly BUY price.</p>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Latest BUY Date</th>
+            <th>Latest BUY Price</th>
+            <th>Current Price</th>
+            <th>Current Price Date</th>
+            <th>Current Gain %</th>
+            <th>S2 Count</th>
+            <th>S3 Count</th>
+            <th>Minervini</th>
+            <th>OBV MACD</th>
+            <th>Latest Volume 3x</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in gainers %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("latest_buy_date", "") }}</td>
+              <td>{{ row.get("latest_buy_price", "")|number }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_close_date", "") }}</td>
+              <td>{{ row.get("gain_vs_latest_buy_pct", "")|number }}</td>
+              <td>{{ row.get("s2_buy_count", 0) }}</td>
+              <td>{{ row.get("s3_buy_count", 0) }}</td>
+              <td>{% if row.get("minervini_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("obv_macd_cross_up") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("latest_volume_3x_prev_9d") %}Yes{% else %}No{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="copy-symbols-panel">
+      <div class="copy-symbols-heading">
+        <div>
+          <h2>Filtered Symbols</h2>
+          <p>Comma-separated list of the visible weekly BUY names after the selected flags.</p>
+        </div>
+        <div class="copy-symbols-actions">
+          <button class="button secondary" type="button" data-copy-target="weekly-buy-symbols-csv">Copy Symbols</button>
+        </div>
+      </div>
+      <textarea id="weekly-buy-symbols-csv" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>All Weekly BUY Stocks</h2>
+      <p>Union of weekly BUY names since {{ start_date }} with latest local close and gain versus latest BUY.</p>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>First BUY Date</th>
+            <th>Latest BUY Date</th>
+            <th>Latest BUY Price</th>
+            <th>Current Price</th>
+            <th>Current Price Date</th>
+            <th>Current Gain %</th>
+            <th>S2 Count</th>
+            <th>S3 Count</th>
+            <th>Total BUY Count</th>
+            <th>Minervini</th>
+            <th>OBV MACD</th>
+            <th>Latest Volume 3x</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("first_buy_date", "") }}</td>
+              <td>{{ row.get("latest_buy_date", "") }}</td>
+              <td>{{ row.get("latest_buy_price", "")|number }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_close_date", "") }}</td>
+              <td>{{ row.get("gain_vs_latest_buy_pct", "")|number }}</td>
+              <td>{{ row.get("s2_buy_count", 0) }}</td>
+              <td>{{ row.get("s3_buy_count", 0) }}</td>
+              <td>{{ row.get("total_buy_count", 0) }}</td>
+              <td>{% if row.get("minervini_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("obv_macd_cross_up") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("latest_volume_3x_prev_9d") %}Yes{% else %}No{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const targetId = button.getAttribute("data-copy-target");
+        const target = targetId ? document.getElementById(targetId) : null;
+        if (!target) return;
+        const text = String(target.value || "").trim();
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1200);
+        } catch (error) {
+          target.focus();
+          target.select();
+          const original = button.textContent;
+          button.textContent = "Select and copy";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1600);
+        }
+      });
+    });
+  </script>
+{% endblock %}

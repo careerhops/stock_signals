@@ -4,6 +4,6 @@
   <section class="panel">
     <h2>{{ "Kite Token Saved" if success else "Kite Login Failed" }}</h2>
     <p>{{ message }}</p>
-    <p><a class="button" href="/">Back to dashboard</a></p>
+    <p><a class="button" href="{{ back_url if back_url is defined else '/' }}">{{ back_label if back_label is defined else 'Back to dashboard' }}</a></p>
   </section>
 {% endblock %}

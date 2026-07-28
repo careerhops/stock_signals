@@ -5,8 +5,10 @@ from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from uuid import uuid4
 
+from stock_screener.adx_di_study import calculate_adx_di
 from stock_screener.data.storage import Storage
 from stock_screener.resample import resample_daily_to_weekly
 
@@ -613,6 +615,224 @@ def build_rotation_group_chart(
     fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
     return f'<div class="opportunity-chart-frame">{chart_html}</div>'
+
+
+def build_adx_di_chart(
+    daily_frame: pd.DataFrame,
+    exchange: str,
+    symbol: str,
+    *,
+    length: int = 14,
+    threshold: float = 20.0,
+    bars: int = 140,
+    height: int = 760,
+) -> str:
+    frame = calculate_adx_di(daily_frame, length=length, threshold=threshold)
+    if frame.empty:
+        fig = go.Figure()
+        fig.update_layout(title=f"{exchange}:{symbol} - No daily candle data available")
+        return fig.to_html(full_html=False, include_plotlyjs="cdn")
+
+    frame = frame.tail(max(int(bars), 40)).copy()
+    di_plus_cross_rows = frame[frame["di_plus_crossed_above_di_minus"].fillna(False)].copy()
+    cross_rows = frame[frame["adx_bullish_cross_above_di_minus"].fillna(False)].copy()
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        specs=[[{"secondary_y": True}], [{}]],
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=frame["date"],
+            open=frame["open"],
+            high=frame["high"],
+            low=frame["low"],
+            close=frame["close"],
+            name="Price",
+            increasing_line_color="#20c997",
+            decreasing_line_color="#ff4d6d",
+            increasing_fillcolor="#20c997",
+            decreasing_fillcolor="#ff4d6d",
+        ),
+        row=1,
+        col=1,
+        secondary_y=False,
+    )
+
+    volume_colors = [
+        "rgba(32, 201, 151, 0.48)" if close_value >= open_value else "rgba(255, 77, 109, 0.48)"
+        for close_value, open_value in zip(frame["close"], frame["open"])
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=frame["date"],
+            y=frame["volume"],
+            name="Volume",
+            marker_color=volume_colors,
+            opacity=0.55,
+            hovertemplate="Date: %{x|%d %b %Y}<br>Volume: %{y:.0f}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+        secondary_y=True,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["di_plus"],
+            mode="lines",
+            name="DI+",
+            line={"color": "#39d353", "width": 2},
+            hovertemplate="Date: %{x|%d %b %Y}<br>DI+: %{y:.2f}<extra></extra>",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["di_minus"],
+            mode="lines",
+            name="DI-",
+            line={"color": "#ff4d4f", "width": 2},
+            hovertemplate="Date: %{x|%d %b %Y}<br>DI-: %{y:.2f}<extra></extra>",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["adx"],
+            mode="lines",
+            name="ADX",
+            line={"color": "#f8fafc", "width": 2.3},
+            hovertemplate="Date: %{x|%d %b %Y}<br>ADX: %{y:.2f}<extra></extra>",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["threshold"],
+            mode="lines",
+            name=f"Threshold {float(threshold):.0f}",
+            line={"color": "#facc15", "width": 1.4, "dash": "dot"},
+            hovertemplate="Date: %{x|%d %b %Y}<br>Threshold: %{y:.2f}<extra></extra>",
+        ),
+        row=2,
+        col=1,
+    )
+
+    if not di_plus_cross_rows.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=di_plus_cross_rows["date"],
+                y=di_plus_cross_rows["di_plus"],
+                mode="markers",
+                name="DI+ crossed above DI-",
+                marker={"size": 9, "color": "#39d353", "line": {"color": "#052e16", "width": 1.3}},
+                hovertemplate=(
+                    "Date: %{x|%d %b %Y}<br>"
+                    "DI+ crossed above DI-<br>"
+                    "DI+: %{y:.2f}<br>"
+                    "DI-: %{customdata[0]:.2f}<br>"
+                    "ADX: %{customdata[1]:.2f}<extra></extra>"
+                ),
+                customdata=di_plus_cross_rows[["di_minus", "adx"]].to_numpy(),
+            ),
+            row=2,
+            col=1,
+        )
+    fig.update_layout(
+        title=f"{exchange}:{symbol} ADX / DI Daily Chart",
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        margin={"l": 54, "r": 30, "t": 88, "b": 40},
+        height=height,
+        paper_bgcolor="#111827",
+        plot_bgcolor="#111827",
+        font={"color": "#e5e7eb"},
+        xaxis_rangeslider_visible=False,
+    )
+
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor="rgba(148, 163, 184, 0.14)",
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        title_text="Price",
+        showgrid=True,
+        gridcolor="rgba(148, 163, 184, 0.14)",
+        zeroline=False,
+        row=1,
+        col=1,
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="Volume",
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        row=1,
+        col=1,
+        secondary_y=True,
+    )
+    fig.update_yaxes(
+        title_text="ADX / DI",
+        showgrid=True,
+        gridcolor="rgba(148, 163, 184, 0.14)",
+        zeroline=False,
+        row=2,
+        col=1,
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
+
+
+def build_sector_mix_pie_chart(
+    sector_summary: pd.DataFrame,
+    *,
+    title: str = "Sector Mix",
+    height: int = 420,
+) -> str:
+    if sector_summary.empty or "sector_label" not in sector_summary.columns or "stock_count" not in sector_summary.columns:
+        return ""
+
+    labels = sector_summary["sector_label"].astype(str).tolist()
+    values = pd.to_numeric(sector_summary["stock_count"], errors="coerce").fillna(0).tolist()
+    if not any(value > 0 for value in values):
+        return ""
+
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.38,
+                sort=False,
+                textinfo="label+percent",
+                hovertemplate="%{label}<br>Stocks: %{value}<br>Share: %{percent}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title=title,
+        height=height,
+        margin={"l": 20, "r": 20, "t": 64, "b": 20},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        legend={"orientation": "h", "yanchor": "bottom", "y": -0.16, "xanchor": "left", "x": 0},
+    )
+    return fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
 
 
 def latest_signal_summary(strategy_output: pd.DataFrame) -> dict[str, Any]:

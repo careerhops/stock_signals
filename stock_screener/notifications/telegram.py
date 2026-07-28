@@ -4,6 +4,7 @@ from datetime import datetime
 from html import escape
 from io import StringIO
 import os
+import time
 from typing import Any
 
 import httpx
@@ -18,6 +19,9 @@ RATING_RANK = {
     "STRONG SELL": 1,
 }
 HTML_REPORT_LIMIT = 30
+TELEGRAM_REQUEST_TIMEOUT = httpx.Timeout(90.0, connect=15.0)
+TELEGRAM_RETRY_DELAY_SECONDS = 1.0
+TELEGRAM_MAX_ATTEMPTS = 2
 
 
 def build_telegram_message(filtered: pd.DataFrame, summary: dict[str, Any]) -> str:
@@ -77,13 +81,15 @@ def build_buy_signal_list_message(
         stock_name = row.get("company_name") or row.get("name") or ""
         signal_date = row.get("date") or ""
         close = row.get("close") or ""
+        best_buy_weekday = row.get("best_buy_weekday") or "NA"
+        best_sell_weekday = row.get("best_sell_weekday") or "NA"
         large_deal = "Yes" if bool(row.get("has_large_deal", False)) else "No"
         large_deal_summary = row.get("large_deal_summary") or ""
         large_deal_text = f"Large Deal: {large_deal}"
         if large_deal_summary:
             large_deal_text = f"{large_deal_text} ({large_deal_summary})"
         lines.append(
-            f"{index + 1}. {signal_date} | {exchange}:{symbol} | {stock_name} | Close: {close} | {large_deal_text}"
+            f"{index + 1}. {signal_date} | {exchange}:{symbol} | {stock_name} | Close: {close} | Buy day: {best_buy_weekday} | Sell day: {best_sell_weekday} | {large_deal_text}"
         )
 
     if inline_limit is not None and len(filtered) > inline_limit:
@@ -112,7 +118,7 @@ def send_telegram_message(config: dict[str, Any], message: str, required: bool =
         return
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    response = httpx.post(url, json={"chat_id": chat_id, "text": message}, timeout=30)
+    response = _telegram_post(url, json={"chat_id": chat_id, "text": message})
     _raise_for_telegram_error(response)
 
 
@@ -138,6 +144,10 @@ def buy_signals_to_csv_bytes(filtered: pd.DataFrame) -> bytes:
         export["large_deal_summary"] = filtered["large_deal_summary"]
     if "large_deal_latest_date" in filtered.columns:
         export["large_deal_latest_date"] = filtered["large_deal_latest_date"]
+    if "best_buy_weekday" in filtered.columns:
+        export["best_buy_weekday_5y"] = filtered["best_buy_weekday"]
+    if "best_sell_weekday" in filtered.columns:
+        export["best_sell_weekday_5y"] = filtered["best_sell_weekday"]
 
     buffer = StringIO()
     export = export.where(pd.notna(export), "NA")
@@ -165,6 +175,8 @@ def buy_signals_to_html_bytes(
         obv = _yes_no(row.get("daily_obv_confirmation", row.get("obv_confirmation")))
         last_return = _fmt(row.get("prior_pair_return_last_1_pct"), suffix="%")
         median_return = _fmt(row.get("median_pair_return_last_3_pct"), suffix="%")
+        best_buy_weekday = _fmt(row.get("best_buy_weekday"))
+        best_sell_weekday = _fmt(row.get("best_sell_weekday"))
         large_deal = "Large Deal" if bool(row.get("has_large_deal", False)) else "No Large Deal"
         large_deal_class = "badge hot" if bool(row.get("has_large_deal", False)) else "badge muted"
         cards.append(
@@ -189,6 +201,8 @@ def buy_signals_to_html_bytes(
                   <div><span>Market Cap</span><strong>{_html(market_cap)} Cr</strong></div>
                   <div><span>Last Pair</span><strong>{_html(last_return)}</strong></div>
                   <div><span>Median 3 Pairs</span><strong>{_html(median_return)}</strong></div>
+                  <div><span>Best Buy Day (5Y)</span><strong>{_html(best_buy_weekday)}</strong></div>
+                  <div><span>Best Sell Day (5Y)</span><strong>{_html(best_sell_weekday)}</strong></div>
                 </div>
               </div>
             </article>
@@ -344,13 +358,26 @@ def send_telegram_document(
         return
 
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    response = httpx.post(
+    response = _telegram_post(
         url,
         data={"chat_id": chat_id, "caption": caption},
         files={"document": (filename, file_bytes, media_type)},
-        timeout=30,
     )
     _raise_for_telegram_error(response)
+
+
+def _telegram_post(url: str, **kwargs: Any) -> httpx.Response:
+    last_error: Exception | None = None
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+        try:
+            return httpx.post(url, timeout=TELEGRAM_REQUEST_TIMEOUT, **kwargs)
+        except httpx.TimeoutException as exc:
+            last_error = exc
+            if attempt < TELEGRAM_MAX_ATTEMPTS:
+                time.sleep(TELEGRAM_RETRY_DELAY_SECONDS)
+                continue
+            raise RuntimeError("Telegram send timed out after retrying.") from exc
+    raise RuntimeError("Telegram send failed unexpectedly.") from last_error
 
 
 def _raise_for_telegram_error(response: httpx.Response) -> None:
@@ -378,18 +405,7 @@ def send_buy_signal_list_to_telegram(
     )
     send_telegram_message(config, message, required=True)
 
-    html_count = min(len(filtered), HTML_REPORT_LIMIT)
-    html_bytes = buy_signals_to_html_bytes(filtered, filters_text=filters_text, limit=HTML_REPORT_LIMIT)
-    send_telegram_document(
-        config,
-        html_bytes,
-        _dated_filename("weekly_buy_signal_report", "html"),
-        f"Readable Weekly BUY report: top {html_count} of {len(filtered)} stocks",
-        media_type="text/html",
-        required=True,
-    )
-
-    if len(filtered) > inline_limit:
+    if len(filtered) > 0:
         csv_bytes = buy_signals_to_csv_bytes(filtered)
         caption = f"Full Weekly BUY Signals list: {len(filtered)} stocks"
         if filters_text:
@@ -455,93 +471,98 @@ def _report_html(title: str, frame: pd.DataFrame, filters_text: str, cards: list
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f7f9fb;
+      --bg: #fafafa;
       --panel: #ffffff;
-      --ink: #172033;
-      --muted: #667085;
-      --line: #dfe5ec;
-      --green: #0f9f6e;
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --green: #047857;
       --blue: #2563eb;
-      --red: #d92d20;
+      --red: #b91c1c;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       background: var(--bg);
       color: var(--ink);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+      font-size: 14px;
       line-height: 1.45;
     }}
-    main {{ max-width: 1180px; margin: 0 auto; padding: 24px; }}
-    header {{ padding: 22px 0 18px; }}
-    h1 {{ margin: 0 0 8px; font-size: 28px; }}
-    .subtle {{ color: var(--muted); }}
+    main {{ max-width: 980px; margin: 0 auto; padding: 20px; }}
+    header {{ padding: 8px 0 16px; }}
+    h1 {{ margin: 0 0 4px; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }}
+    .subtle {{ color: var(--muted); font-size: 12px; }}
     .summary {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 12px;
-      margin: 18px 0;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px;
+      margin: 16px 0;
     }}
     .summary-card, .card, .table-panel {{
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+      box-shadow: none;
     }}
-    .summary-card {{ padding: 16px; }}
-    .summary-card span {{ color: var(--muted); font-size: 13px; }}
-    .summary-card strong {{ display: block; font-size: 24px; margin-top: 4px; }}
-    .toolbar {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0; }}
+    .summary-card {{ padding: 12px; }}
+    .summary-card span {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.02em; }}
+    .summary-card strong {{ display: block; font-size: 20px; font-weight: 600; margin-top: 4px; }}
+    .toolbar {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }}
     input, button {{
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px 12px;
+      border-radius: 6px;
+      padding: 7px 10px;
       font: inherit;
+      font-size: 13px;
       background: white;
     }}
-    button {{ cursor: pointer; color: white; background: var(--blue); border-color: var(--blue); }}
+    button {{ cursor: pointer; color: white; background: var(--blue); border-color: var(--blue); font-weight: 500; }}
+    button:hover {{ background: #1d4ed8; border-color: #1d4ed8; }}
     .symbols-box {{
       width: 100%;
-      min-height: 58px;
+      min-height: 44px;
       resize: vertical;
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px;
+      border-radius: 6px;
+      padding: 8px;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
     }}
-    .cards {{ display: grid; gap: 12px; margin: 16px 0 24px; }}
-    .card {{ display: grid; grid-template-columns: 54px 1fr; gap: 12px; padding: 14px; }}
-    .rank {{ color: var(--muted); font-weight: 700; padding-top: 4px; }}
-    .card-title {{ display: flex; flex-direction: column; gap: 2px; font-weight: 800; }}
-    .card-title small {{ color: var(--muted); font-weight: 500; }}
-    .badges {{ display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }}
+    .cards {{ display: grid; gap: 8px; margin: 12px 0 20px; }}
+    .card {{ display: grid; grid-template-columns: 32px 1fr; gap: 12px; padding: 12px 14px; }}
+    .rank {{ color: var(--muted); font-weight: 500; padding-top: 1px; font-size: 13px; }}
+    .card-title {{ display: flex; flex-direction: column; gap: 2px; font-weight: 600; font-size: 14px; }}
+    .card-title small {{ color: var(--muted); font-weight: 400; font-size: 12px; }}
+    .badges {{ display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }}
     .badge {{
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 4px 8px;
-      font-size: 12px;
-      color: #344054;
-      background: #f8fafc;
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-size: 11px;
+      color: #374151;
+      background: #fafafa;
     }}
-    .badge.buy {{ color: #027a48; background: #ecfdf3; border-color: #abefc6; }}
-    .badge.hot {{ color: #b42318; background: #fef3f2; border-color: #fecdca; }}
+    .badge.buy {{ color: var(--green); background: #ecfdf5; border-color: #d1fae5; }}
+    .badge.hot {{ color: var(--red); background: #fef2f2; border-color: #fee2e2; }}
     .badge.muted {{ color: var(--muted); }}
     .metrics {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+      gap: 0;
+      margin-top: 4px;
     }}
-    .metrics div {{ padding: 8px; border: 1px solid #eef2f6; border-radius: 8px; }}
-    .metrics span {{ display: block; color: var(--muted); font-size: 12px; }}
-    .metrics strong {{ font-size: 14px; }}
-    .table-panel {{ overflow: auto; margin-top: 18px; }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 880px; }}
-    th, td {{ padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }}
-    th {{ background: #f8fafc; font-size: 12px; color: #475467; }}
+    .metrics div {{ padding: 4px 12px 4px 0; border: none; background: transparent; }}
+    .metrics span {{ display: block; color: var(--muted); font-size: 11px; }}
+    .metrics strong {{ font-size: 13px; font-weight: 600; }}
+    .table-panel {{ overflow: auto; margin-top: 16px; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 760px; }}
+    th, td {{ padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; font-size: 12px; }}
+    th {{ background: #fafafa; font-size: 11px; color: var(--muted); font-weight: 600; }}
     @media (max-width: 640px) {{
-      main {{ padding: 14px; }}
+      main {{ padding: 12px; }}
       .card {{ grid-template-columns: 1fr; }}
-      h1 {{ font-size: 22px; }}
+      h1 {{ font-size: 18px; }}
     }}
   </style>
 </head>
@@ -596,6 +617,8 @@ def _buy_report_table(frame: pd.DataFrame) -> str:
         ("symbol", "Symbol"),
         ("company_name", "Name"),
         ("close", "Close"),
+        ("best_buy_weekday", "Best Buy Day 5Y"),
+        ("best_sell_weekday", "Best Sell Day 5Y"),
         ("market_cap_cr", "Market Cap Cr"),
         ("daily_ema_stack_confirmation", "EMA Stack"),
         ("daily_obv_confirmation", "OBV 20D"),

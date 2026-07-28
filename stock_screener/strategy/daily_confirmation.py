@@ -83,6 +83,14 @@ def add_latest_daily_confirmation_columns(frame: pd.DataFrame, daily: pd.DataFra
     latest = latest_daily_confirmation(daily)
     for column, value in latest.items():
         enriched[column] = value
+    if not daily.empty and {"date", "close"}.issubset(daily.columns):
+        latest_daily = daily.copy()
+        latest_daily["date"] = pd.to_datetime(latest_daily["date"], errors="coerce")
+        latest_daily = latest_daily.dropna(subset=["date"]).sort_values("date")
+        if not latest_daily.empty:
+            latest_row = latest_daily.iloc[-1]
+            enriched["latest_close"] = pd.to_numeric(pd.Series([latest_row.get("close")]), errors="coerce").iloc[0]
+            enriched["latest_close_date"] = latest_row.get("date", pd.NA)
     enriched["trend_confirmation"] = enriched["daily_ema_stack_confirmation"]
     enriched["obv_confirmation"] = enriched["daily_obv_confirmation"]
     return enriched

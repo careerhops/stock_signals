@@ -7,9 +7,10 @@ from pathlib import Path
 from threading import Lock
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -27,6 +28,11 @@ from stock_screener.data.nse_market_cap import (
     fetch_market_caps_from_nse_excel,
     load_nse_market_cap_excel,
 )
+from stock_screener.adx_di_study import (
+    load_adx_di_outputs,
+    run_adx_di_study,
+    save_adx_di_outputs,
+)
 from stock_screener.data.storage import Storage
 from stock_screener.data.supabase_store import SupabaseStore
 from stock_screener.gtt_gain_report import write_gtt_gain_workbook
@@ -38,6 +44,20 @@ from stock_screener.gtt_gain_study import (
     run_gtt_gain_study,
     save_gtt_gain_outputs,
 )
+from stock_screener.google_sheets import (
+    DEFAULT_WORKSHEET_TITLE,
+    batch_update_google_sheet_values,
+    build_google_oauth_login_url,
+    exchange_google_oauth_code,
+    export_weekly_buy_tracker_to_google_sheet,
+    google_oauth_status,
+    has_google_sheets_credentials,
+    load_google_sheets_settings,
+    load_google_oauth_client,
+    read_google_sheet_values,
+    save_google_oauth_client,
+    save_google_sheet_target,
+)
 from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
 from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram, send_gtt_stock_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
@@ -48,17 +68,80 @@ from stock_screener.signal_outcome_study import (
     run_signal_outcome_study,
     save_signal_outcome_outputs,
 )
+from stock_screener.swing_trade_study import (
+    load_swing_trade_outputs,
+    run_swing_trade_study,
+    save_swing_trade_outputs,
+)
 from stock_screener.signal_qa import build_signal_quality_report, strategy_rows_for_display
 from stock_screener.strategy.technical_ratings import latest_technical_rating
-from stock_screener.strategy.weekly_shortlist import enrich_weekly_signal_shortlist_frame
+from stock_screener.strategy.weekly_shortlist import (
+    DEFAULT_BENCHMARK_SYMBOL as SHORTLIST_DEFAULT_BENCHMARK_SYMBOL,
+    benchmark_symbol_for_industry,
+    enrich_weekly_signal_shortlist_frame,
+)
 from stock_screener.strategy.weekly_buy_sell import run_weekly_buy_sell
+from stock_screener.strategy_lab_study import (
+    DEFAULT_START_DATE as STRATEGY_LAB_DEFAULT_START_DATE,
+    load_strategy_lab_outputs,
+    run_strategy_lab_study,
+    save_strategy_lab_outputs,
+)
+from stock_screener.sensitivity_overlap_study import (
+    DEFAULT_START_DATE as SENSITIVITY_OVERLAP_DEFAULT_START_DATE,
+    build_next_week_conversion_markers,
+    load_sensitivity_overlap_outputs,
+    run_sensitivity_overlap_study,
+    save_sensitivity_overlap_outputs,
+)
+from stock_screener.qm_quality_study import (
+    DEFAULT_BUY_END_DATE as QM_QUALITY_DEFAULT_END_DATE,
+    DEFAULT_BUY_START_DATE as QM_QUALITY_DEFAULT_START_DATE,
+    load_qm_quality_outputs,
+    run_qm_quality_study,
+    save_qm_quality_outputs,
+)
+from stock_screener.resistance_breaks_study import (
+    load_resistance_breaks_outputs,
+    run_resistance_breaks_study,
+    save_resistance_breaks_outputs,
+)
 from stock_screener.symbols import normalize_nse_symbol
+from stock_screener.minervini_sheet_sync import (
+    DEFAULT_WORKSHEET_TITLE as MINERVINI_SHEET_DEFAULT_WORKSHEET_TITLE,
+    load_minervini_sheet_sync_outputs,
+    run_minervini_sheet_sync,
+    save_minervini_sheet_sync_outputs,
+)
 from stock_screener.universe import build_universe
+from stock_screener.weekday_pressure_study import (
+    WEEKDAY_ORDER,
+    WeekdayPressureStudyResult,
+    load_weekday_pressure_outputs,
+    run_weekday_pressure_study,
+    save_weekday_pressure_outputs,
+)
+from stock_screener.weekly_buy_tracker_study import (
+    DEFAULT_START_DATE as WEEKLY_BUY_TRACKER_DEFAULT_START_DATE,
+    load_weekly_buy_tracker_outputs,
+    run_weekly_buy_tracker_study,
+    save_weekly_buy_tracker_outputs,
+)
+from stock_screener.volume_burst_study import (
+    load_volume_burst_outputs,
+    run_volume_burst_study,
+    save_volume_burst_outputs,
+)
+
+
+WEEKLY_BUY_GAINS_DEFAULT_START_DATE = "2026-04-01"
 from stock_screener.jobs.large_deals import (
     default_last_7_days_range,
     fetch_and_store_current_large_deals,
 )
 from stock_screener.web.charts import (
+    build_adx_di_chart,
+    build_sector_mix_pie_chart,
     build_gtt_opportunity_chart,
     build_rotation_group_chart,
     build_signal_chart,
@@ -84,7 +167,44 @@ def _template_number(value: Any, digits: int = 2) -> str:
         return str(value)
 
 
+def _google_oauth_redirect_uri(request: Request) -> str:
+    env_redirect = str(os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")).strip()
+    if env_redirect:
+        return env_redirect
+    callback = str(request.url_for("google_sheets_callback"))
+    parts = urlsplit(callback)
+    hostname = parts.hostname or ""
+    if hostname == "0.0.0.0":
+        netloc = parts.netloc.replace("0.0.0.0", "127.0.0.1")
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return callback
+
+
+def _append_query_param(url: str, param: str) -> str:
+    separator = "&" if "?" in str(url) else "?"
+    return f"{url}{separator}{param}"
+
+
 templates.env.filters["number"] = _template_number
+
+
+def _template_ratio(value: Any, digits: int = 2) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+        numeric = float(value)
+        if numeric == float("inf"):
+            return "No losses"
+        if numeric == float("-inf"):
+            return "No wins"
+        return f"{numeric:.{int(digits)}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+templates.env.filters["ratio"] = _template_ratio
 
 SCAN_JOBS: dict[str, dict[str, Any]] = {}
 SCAN_JOBS_LOCK = Lock()
@@ -107,6 +227,32 @@ GTT_PEAK_SPEED_BUCKETS = [
     "NA",
 ]
 GTT_TECHNICAL_RATING_FILTERS = ["Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell"]
+GTT_TABLE_RENDER_LIMIT = 250
+
+
+def _normalize_gtt_technical_rating_statuses(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        raw_values = [values]
+    else:
+        try:
+            raw_values = list(values)
+        except TypeError:
+            raw_values = [str(values)]
+
+    allowed = {value.upper(): value for value in GTT_TECHNICAL_RATING_FILTERS}
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        canonical = allowed.get(text.upper())
+        if canonical and canonical not in seen:
+            normalized.append(canonical)
+            seen.add(canonical)
+    return normalized
 
 
 def _scan_job_path(job_id: str) -> Path:
@@ -213,6 +359,88 @@ def _enrich_with_symbol_metadata(frame: pd.DataFrame, metadata: pd.DataFrame, sy
     enriched["symbol_key"] = enriched[symbol_column].apply(normalize_nse_symbol)
     enriched = enriched.merge(metadata_for_merge, left_on="symbol_key", right_on="metadata_symbol_key", how="left")
     return enriched.drop(columns=["symbol_key", "metadata_symbol_key"], errors="ignore")
+
+
+def _sector_label_from_industry(industry: Any) -> str:
+    industry_text = str(industry or "").strip()
+    if not industry_text:
+        return "Unclassified"
+    benchmark_symbol = benchmark_symbol_for_industry(industry_text)
+    if benchmark_symbol and benchmark_symbol != SHORTLIST_DEFAULT_BENCHMARK_SYMBOL:
+        return benchmark_symbol.replace("NIFTY ", "").strip() or industry_text
+    return industry_text
+
+
+def _build_adx_di_sector_views(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if frame.empty:
+        return frame.copy(), pd.DataFrame(), pd.DataFrame()
+
+    working = frame.copy()
+    if "industry" not in working.columns:
+        working["industry"] = ""
+    working["industry"] = working["industry"].fillna("").astype(str).str.strip()
+    working["sector_label"] = working["industry"].apply(_sector_label_from_industry)
+
+    for column in ("quality_score", "relative_strength_spread_pct", "cross_volume_ratio", "market_cap_cr"):
+        if column in working.columns:
+            working[column] = pd.to_numeric(working[column], errors="coerce")
+    di_plus = pd.to_numeric(working.get("latest_di_plus"), errors="coerce")
+    di_minus = pd.to_numeric(working.get("latest_di_minus"), errors="coerce")
+    working["di_plus_minus_range"] = di_plus - di_minus
+    if "symbol_display" not in working.columns and "symbol" in working.columns:
+        working["symbol_display"] = working["symbol"].map(_display_symbol)
+
+    sorted_working = working.sort_values(
+        [
+            "sector_label",
+            "quality_score",
+            "relative_strength_spread_pct",
+            "cross_volume_ratio",
+            "di_plus_minus_range",
+            "market_cap_cr",
+            "symbol",
+        ],
+        ascending=[True, False, False, False, False, False, True],
+        na_position="last",
+    ).copy()
+    sorted_working["sector_rank"] = sorted_working.groupby("sector_label").cumcount() + 1
+
+    leaders = sorted_working[sorted_working["sector_rank"] <= 3].copy()
+    leaders["leader_label"] = leaders.apply(
+        lambda row: f"{row.get('symbol_display', row.get('symbol', ''))} ({int(row.get('quality_score', 0)) if pd.notna(row.get('quality_score')) else 0})",
+        axis=1,
+    )
+    leader_rollup = (
+        leaders.groupby("sector_label", dropna=False)["leader_label"]
+        .apply(lambda values: ", ".join([str(value) for value in values if str(value).strip()]))
+        .reset_index(name="leading_symbols_csv")
+    )
+
+    sector_summary = (
+        working.groupby("sector_label", dropna=False)
+        .agg(
+            stock_count=("symbol", "size"),
+            avg_quality_score=("quality_score", "mean"),
+            avg_rs_spread_pct=("relative_strength_spread_pct", "mean"),
+            avg_cross_volume_ratio=("cross_volume_ratio", "mean"),
+        )
+        .reset_index()
+    )
+    total_count = int(len(working))
+    sector_summary["share_pct"] = np.where(
+        total_count > 0,
+        sector_summary["stock_count"].astype(float) * 100.0 / float(total_count),
+        np.nan,
+    )
+    sector_summary = sector_summary.merge(leader_rollup, on="sector_label", how="left")
+    sector_summary = sector_summary.sort_values(
+        ["stock_count", "avg_quality_score", "avg_rs_spread_pct", "sector_label"],
+        ascending=[False, False, False, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    leaders = leaders.sort_values(["sector_label", "sector_rank"], ascending=[True, True], na_position="last").reset_index(drop=True)
+    return working, sector_summary, leaders
 
 
 def _request_float(request: Request, name: str) -> float | None:
@@ -323,8 +551,185 @@ def _apply_cmp_filters(
     return filtered
 
 
+def _enrich_with_latest_daily_close(
+    frame: pd.DataFrame,
+    scan_details: pd.DataFrame,
+    storage: Storage | None = None,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    symbol_column = _symbol_column(frame)
+    if not symbol_column or "exchange" not in frame.columns:
+        return frame
+
+    if "latest_close" in frame.columns and "latest_close_date" in frame.columns:
+        latest_close = pd.to_numeric(frame["latest_close"], errors="coerce")
+        latest_date = frame["latest_close_date"].astype(str).str.strip()
+        if latest_close.notna().all() and latest_date.ne("").all() and latest_date.ne("NaT").all():
+            return frame
+
+    merged = frame.copy()
+    if not scan_details.empty and "symbol" in scan_details.columns and "exchange" in scan_details.columns:
+        available = scan_details.copy()
+        merge_columns = ["exchange", "symbol"]
+        extra_columns = [column for column in ("latest_close", "latest_close_date") if column in available.columns]
+        if extra_columns:
+            available["exchange"] = available["exchange"].astype(str).str.upper()
+            available["symbol"] = available["symbol"].astype(str).str.upper()
+            available = available[merge_columns + extra_columns].drop_duplicates(subset=merge_columns, keep="last")
+
+            working = frame.copy()
+            working["exchange"] = working["exchange"].astype(str).str.upper()
+            working[symbol_column] = working[symbol_column].astype(str).str.upper()
+            merged = working.merge(
+                available.rename(columns={"symbol": symbol_column}),
+                on=["exchange", symbol_column],
+                how="left",
+                suffixes=("", "_scan"),
+            )
+
+            for column in extra_columns:
+                scan_column = f"{column}_scan"
+                if column not in merged.columns:
+                    merged[column] = pd.NA
+                if scan_column in merged.columns:
+                    merged[column] = merged[column].combine_first(merged[scan_column])
+                    merged = merged.drop(columns=[scan_column], errors="ignore")
+
+    if storage is None or merged.empty:
+        return merged
+
+    if "latest_close" not in merged.columns:
+        merged["latest_close"] = pd.NA
+    if "latest_close_date" not in merged.columns:
+        merged["latest_close_date"] = pd.NA
+
+    latest_close = pd.to_numeric(merged["latest_close"], errors="coerce")
+    latest_date = merged["latest_close_date"].astype(str).str.strip()
+    missing_mask = latest_close.isna() | latest_date.eq("") | latest_date.eq("NaT")
+    if not missing_mask.any():
+        return merged
+
+    symbol_column = _symbol_column(merged)
+    if not symbol_column or "exchange" not in merged.columns:
+        return merged
+
+    missing_rows = merged.loc[missing_mask, ["exchange", symbol_column]].copy()
+    missing_rows["exchange"] = missing_rows["exchange"].astype(str).str.strip().str.upper()
+    missing_rows[symbol_column] = missing_rows[symbol_column].astype(str).str.strip().str.upper()
+    unique_pairs = missing_rows.drop_duplicates(subset=["exchange", symbol_column])
+
+    latest_map: dict[tuple[str, str], tuple[object, object]] = {}
+    for _, row in unique_pairs.iterrows():
+        exchange = str(row.get("exchange", "")).strip().upper()
+        symbol = str(row.get(symbol_column, "")).strip().upper()
+        if not exchange or not symbol:
+            continue
+        daily = storage.load_candles(exchange, symbol, "1D")
+        if daily.empty or not {"date", "close"}.issubset(daily.columns):
+            continue
+        latest_daily = daily.copy()
+        latest_daily["date"] = pd.to_datetime(latest_daily["date"], errors="coerce")
+        latest_daily = latest_daily.dropna(subset=["date"]).sort_values("date")
+        if latest_daily.empty:
+            continue
+        latest_row = latest_daily.iloc[-1]
+        latest_close_value = pd.to_numeric(pd.Series([latest_row.get("close")]), errors="coerce").iloc[0]
+        latest_date_value = latest_row.get("date", pd.NA)
+        latest_map[(exchange, symbol)] = (latest_close_value, latest_date_value)
+
+    if not latest_map:
+        return merged
+
+    for index, row in merged.loc[missing_mask].iterrows():
+        key = (
+            str(row.get("exchange", "")).strip().upper(),
+            str(row.get(symbol_column, "")).strip().upper(),
+        )
+        if key not in latest_map:
+            continue
+        latest_close_value, latest_date_value = latest_map[key]
+        merged.at[index, "latest_close"] = latest_close_value
+        merged.at[index, "latest_close_date"] = latest_date_value
+
+    return merged
+
+
+def _refresh_live_cmp(
+    frame: pd.DataFrame,
+    data_root: Path,
+    max_symbols: int = 250,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    symbol_column = _symbol_column(frame)
+    if not symbol_column or "exchange" not in frame.columns:
+        return frame
+
+    working = frame.copy()
+    pairs = working[["exchange", symbol_column]].dropna(subset=["exchange", symbol_column]).copy()
+    if pairs.empty:
+        return working
+    pairs["exchange"] = pairs["exchange"].astype(str).str.strip().str.upper()
+    pairs[symbol_column] = pairs[symbol_column].astype(str).str.strip().str.upper()
+    pairs = pairs.drop_duplicates(subset=["exchange", symbol_column])
+    if len(pairs) > max_symbols:
+        return working
+
+    access_token = load_access_token(data_root)
+    if not access_token:
+        return working
+
+    instruments = [f"{row['exchange']}:{row[symbol_column]}" for _, row in pairs.iterrows()]
+    try:
+        provider = KiteDataProvider(access_token=access_token)
+        live_prices = provider.ltp(instruments)
+    except Exception:
+        return working
+    if not live_prices:
+        return working
+
+    quote_map = {(key.split(":", 1)[0].upper(), key.split(":", 1)[1].upper()): value for key, value in live_prices.items() if ":" in key}
+    if not quote_map:
+        return working
+
+    if "latest_close" not in working.columns:
+        working["latest_close"] = pd.NA
+    if "latest_close_date" not in working.columns:
+        working["latest_close_date"] = pd.NA
+    working["cmp_source"] = working.get("cmp_source", pd.Series(index=working.index, dtype="object"))
+
+    now = pd.Timestamp.now()
+    for index, row in working.iterrows():
+        key = (
+            str(row.get("exchange", "")).strip().upper(),
+            str(row.get(symbol_column, "")).strip().upper(),
+        )
+        if key not in quote_map:
+            continue
+        working.at[index, "latest_close"] = float(quote_map[key])
+        working.at[index, "latest_close_date"] = now
+        working.at[index, "cmp_source"] = "live"
+    return working
+
+
 def _truthy_series(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
+
+
+def _truthy_param(values: Any, default: bool = False) -> bool:
+    if values is None:
+        return default
+    if isinstance(values, str):
+        candidates = [values]
+    else:
+        try:
+            candidates = list(values)
+        except TypeError:
+            candidates = [values]
+    if not candidates:
+        return default
+    return any(str(value).strip().lower() in {"1", "true", "yes", "y", "on"} for value in candidates)
 
 
 def _apply_signal_quality_filters(
@@ -500,7 +905,7 @@ def _apply_gtt_stock_filters(
     fresh_daily_buy_symbols: set[str] | None = None,
     require_volume_confirmation: bool = False,
     require_obv_confirmation: bool = False,
-    technical_rating_status: str = "",
+    technical_rating_statuses: list[str] | None = None,
 ) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -534,12 +939,14 @@ def _apply_gtt_stock_filters(
         column = "daily_obv_confirmation" if "daily_obv_confirmation" in filtered.columns else "obv_confirmation"
         filtered = filtered[_truthy_series(filtered[column])]
 
-    if technical_rating_status:
+    normalized_statuses = _normalize_gtt_technical_rating_statuses(technical_rating_statuses or [])
+    if normalized_statuses:
         if "weekly_technical_rating_status" not in filtered.columns:
             return filtered.iloc[0:0].copy()
         filtered = filtered[
-            filtered["weekly_technical_rating_status"].astype(str).str.strip().str.upper()
-            == technical_rating_status.upper()
+            filtered["weekly_technical_rating_status"].astype(str).str.strip().str.upper().isin(
+                [status.upper() for status in normalized_statuses]
+            )
         ]
 
     if trend_only:
@@ -572,7 +979,7 @@ def _gtt_filter_warning(
     fresh_daily_buy_symbols: set[str] | None = None,
     require_volume_confirmation: bool = False,
     require_obv_confirmation: bool = False,
-    technical_rating_status: str = "",
+    technical_rating_statuses: list[str] | None = None,
 ) -> str:
     missing = []
     if open_buy_regime_only and "is_latest_signal_buy" not in frame.columns:
@@ -592,7 +999,7 @@ def _gtt_filter_warning(
         missing.append("dashboard BUY symbols")
     if fresh_daily_buy_only and not fresh_daily_buy_symbols:
         missing.append("daily BUY symbols")
-    if technical_rating_status and (
+    if _normalize_gtt_technical_rating_statuses(technical_rating_statuses or []) and (
         "weekly_technical_rating_status" not in frame.columns
         or not _has_meaningful_text(frame["weekly_technical_rating_status"]).any()
     ):
@@ -641,19 +1048,50 @@ def _daily_buy_symbols(data_root: Path) -> set[str]:
     return _symbols_from_frame(filtered)
 
 
-def _fresh_weekly_signal_symbols(data_root: Path) -> set[str]:
+def _latest_weekly_buy_sell_frame(data_root: Path) -> pd.DataFrame:
     raw = Storage(data_root).load_signals("latest_raw_signals.csv")
     if raw.empty or "date" not in raw.columns:
-        return set()
+        return pd.DataFrame()
     frame = raw.copy()
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     latest_date = frame["date"].max()
     if pd.isna(latest_date):
-        return set()
-    frame = frame[frame["date"] == latest_date]
+        return pd.DataFrame()
+    frame = frame[frame["date"] == latest_date].copy()
     if "signal" in frame.columns:
         frame = frame[frame["signal"].astype(str).str.upper().isin({"BUY", "SELL"})]
+    symbol_column = _symbol_column(frame)
+    if not symbol_column:
+        return pd.DataFrame()
+    frame[symbol_column] = frame[symbol_column].astype(str).str.upper().str.strip()
+    frame = frame[frame[symbol_column] != ""]
+    if "exchange" not in frame.columns:
+        frame["exchange"] = "NSE"
+    frame["exchange"] = frame["exchange"].astype(str).str.upper().str.strip()
+    if "name" not in frame.columns:
+        frame["name"] = frame[symbol_column]
+    frame["name"] = frame["name"].fillna("").astype(str).str.strip().mask(lambda s: s == "", frame[symbol_column])
+    frame = frame.drop_duplicates(subset=["exchange", symbol_column], keep="last").reset_index(drop=True)
+    return frame
+
+
+def _latest_weekly_buy_sell_symbols(data_root: Path) -> set[str]:
+    frame = _latest_weekly_buy_sell_frame(data_root)
     return _symbols_from_frame(frame)
+
+
+def _load_signal_universe_for_strategy_lab(storage: Storage, exchange: str, start_date: str) -> pd.DataFrame:
+    raw = storage.load_signals("latest_raw_signals.csv")
+    if raw.empty or "date" not in raw.columns or "signal" not in raw.columns:
+        return pd.DataFrame()
+    frame = raw.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame[frame["date"].notna()].copy()
+    frame = frame[frame["date"] >= pd.Timestamp(start_date)]
+    frame = frame[frame["signal"].astype(str).str.upper().isin({"BUY", "SELL"})]
+    if "exchange" in frame.columns:
+        frame = frame[frame["exchange"].astype(str).str.upper() == exchange.upper()]
+    return frame
 
 
 def _latest_kite_universe_symbols(data_root: Path, config: dict[str, Any]) -> set[str]:
@@ -901,17 +1339,56 @@ def _ensure_gtt_latest_signal_context(
             continue
         daily = storage.load_candles(exchange, symbol, "1D")
         if daily.empty:
-            context_rows.append(_latest_signal_context(pd.DataFrame(), pd.DataFrame(), exchange, symbol, name))
+            context_rows.append(
+                _latest_signal_context(
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    exchange,
+                    symbol,
+                    name,
+                    include_daily_quality_metrics=True,
+                    include_technical_rating=False,
+                )
+            )
             continue
         daily = _prepare_daily(daily)
         weekly = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
         strategy_output = run_weekly_buy_sell(weekly, config) if not weekly.empty else pd.DataFrame()
-        context_rows.append(_latest_signal_context(strategy_output, daily, exchange, symbol, name))
+        context_rows.append(
+            _latest_signal_context(
+                strategy_output,
+                daily,
+                exchange,
+                symbol,
+                name,
+                include_daily_quality_metrics=True,
+                include_technical_rating=False,
+            )
+        )
 
     if not context_rows:
         return stock_stats
 
     refreshed = _merge_latest_context(stock_stats, pd.DataFrame(context_rows))
+    preserve_columns = [
+        "weekly_technical_rating",
+        "weekly_technical_rating_status",
+        "weekly_ma_rating",
+        "weekly_oscillator_rating",
+    ]
+    existing = stock_stats[["exchange", "symbol"] + [column for column in preserve_columns if column in stock_stats.columns]].copy()
+    refreshed = refreshed.merge(existing, on=["exchange", "symbol"], how="left", suffixes=("", "_existing"))
+    for column in preserve_columns:
+        existing_column = f"{column}_existing"
+        if existing_column not in refreshed.columns:
+            continue
+        if column == "weekly_technical_rating_status":
+            current = refreshed[column].astype(str).str.strip()
+            placeholder_mask = current.str.upper().isin({"", "NA", "NAN", "NONE", "<NA>"})
+            refreshed.loc[placeholder_mask, column] = refreshed.loc[placeholder_mask, existing_column]
+        else:
+            refreshed[column] = refreshed[column].combine_first(refreshed[existing_column])
+        refreshed = refreshed.drop(columns=[existing_column], errors="ignore")
     stock_stats_path = _latest_gtt_gain_paths(data_root)["stock_stats"]
     if stock_stats_path.exists():
         refreshed.to_csv(stock_stats_path, index=False)
@@ -1047,7 +1524,7 @@ def _gtt_filter_query(
     return_metric: str = "",
     min_pair_return_pct: str = "",
     peak_speed_bucket: str = "",
-    technical_rating_status: str = "",
+    technical_rating_statuses: list[str] | None = None,
 ) -> str:
     params = []
     if token:
@@ -1088,7 +1565,7 @@ def _gtt_filter_query(
         params.append(f"min_pair_return_pct={quote(min_pair_return_pct)}")
     if peak_speed_bucket:
         params.append(f"peak_speed_bucket={quote(peak_speed_bucket)}")
-    if technical_rating_status:
+    for technical_rating_status in _normalize_gtt_technical_rating_statuses(technical_rating_statuses or []):
         params.append(f"technical_rating_status={quote(technical_rating_status)}")
     return "&".join(params)
 
@@ -1112,7 +1589,7 @@ def _gtt_filter_summary(
     return_metric: str = "",
     min_pair_return_text: str = "",
     peak_speed_bucket: str = "",
-    technical_rating_status: str = "",
+    technical_rating_statuses: list[str] | None = None,
 ) -> str:
     filters = []
     if stock_search:
@@ -1143,8 +1620,9 @@ def _gtt_filter_summary(
         filters.append("Volume confirmed")
     if require_obv_confirmation:
         filters.append("OBV rising over last 20 days")
-    if technical_rating_status:
-        filters.append(f"Weekly technical rating: {technical_rating_status}")
+    normalized_statuses = _normalize_gtt_technical_rating_statuses(technical_rating_statuses or [])
+    if normalized_statuses:
+        filters.append(f"Weekly technical rating: {', '.join(normalized_statuses)}")
     if require_screener_trend_confirmation:
         filters.append("Home screener daily EMA stack")
     if min_pair_return_text:
@@ -1168,6 +1646,37 @@ def _comma_separated_symbols(frame: pd.DataFrame) -> str:
     symbols = frame[symbol_column].dropna().astype(str).str.upper().str.strip()
     symbols = [symbol for symbol in symbols if symbol]
     return ",".join(dict.fromkeys(symbols))
+
+
+def _display_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    return normalize_nse_symbol(text) if text else ""
+
+
+def _comma_separated_display_symbols(frame: pd.DataFrame) -> str:
+    symbol_column = _symbol_column(frame)
+    if frame.empty or not symbol_column:
+        return ""
+    symbols = frame[symbol_column].dropna().astype(str).map(_display_symbol)
+    symbols = [symbol for symbol in symbols if symbol]
+    return ",".join(dict.fromkeys(symbols))
+
+
+def _adx_di_sorted_display_symbols(frame: pd.DataFrame) -> str:
+    symbol_column = _symbol_column(frame)
+    if frame.empty or not symbol_column:
+        return ""
+
+    working = frame.copy()
+    di_plus = pd.to_numeric(working.get("latest_di_plus"), errors="coerce")
+    di_minus = pd.to_numeric(working.get("latest_di_minus"), errors="coerce")
+    working["di_plus_minus_range"] = di_plus - di_minus
+    working = working.sort_values(
+        ["di_plus_minus_range", symbol_column],
+        ascending=[False, True],
+        na_position="last",
+    )
+    return _comma_separated_display_symbols(working)
 
 
 def _symbol_column(frame: pd.DataFrame) -> str | None:
@@ -1395,11 +1904,12 @@ def _common_filtered_symbols_from_request(
     latest["date_sort"] = pd.to_datetime(latest["date"], errors="coerce")
     latest = latest.sort_values("date_sort").groupby(["exchange", "symbol"], dropna=False).tail(1).copy()
     latest = latest.drop(columns=["date_sort"], errors="ignore")
+    latest = _enrich_with_latest_daily_close(latest, storage.load_signals("latest_scan_details.csv"), storage)
 
     metadata = _combined_symbol_metadata(config, storage)
     latest = _enrich_with_symbol_metadata(latest, metadata, "symbol")
     latest = _apply_market_cap_filters(latest, min_market_cap, max_market_cap, market_cap_bucket)
-    latest = _apply_cmp_filters(latest, min_cmp, max_cmp, "close")
+    latest = _apply_cmp_filters(latest, min_cmp, max_cmp, "latest_close")
     latest = _apply_stock_search(latest, stock_search)
     latest = _apply_signal_quality_filters(
         latest,
@@ -1548,9 +2058,11 @@ def _load_visible_buy_signals(
 ) -> pd.DataFrame:
     metadata = _combined_symbol_metadata(config, storage)
     filtered = storage.load_signals("latest_filtered.csv")
+    filtered = _enrich_with_latest_daily_close(filtered, storage.load_signals("latest_scan_details.csv"), storage)
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     filtered = _apply_market_cap_filters(filtered, min_market_cap, max_market_cap, market_cap_bucket)
-    filtered = _apply_cmp_filters(filtered, min_cmp, max_cmp, "close")
+    filtered = _refresh_live_cmp(filtered, storage.data_root)
+    filtered = _apply_cmp_filters(filtered, min_cmp, max_cmp, "latest_close")
     filtered = _apply_stock_search(filtered, stock_search)
     filtered = _apply_signal_quality_filters(
         filtered,
@@ -1612,12 +2124,13 @@ def _load_visible_gtt_stock_stats(
     peak_speed_bucket: str = "",
     require_volume_confirmation: bool = False,
     require_obv_confirmation: bool = False,
-    technical_rating_status: str = "",
+    technical_rating_statuses: list[str] | None = None,
 ) -> pd.DataFrame:
     latest = load_gtt_gain_outputs(_gtt_gain_dir(data_root))
     stock_stats = _align_gtt_stock_stats_to_latest_universe(data_root, latest.stock_stats, config)
     stock_stats = _ensure_gtt_weekly_technical_ratings(data_root, stock_stats, config)
     stock_stats = _enrich_with_symbol_metadata(stock_stats, _combined_symbol_metadata(config, storage), "symbol")
+    stock_stats = _ensure_gtt_s2_to_s3_markers(data_root, stock_stats, config)
     stock_stats = _apply_market_cap_filters(stock_stats, min_market_cap, max_market_cap, market_cap_bucket)
     stock_stats = _apply_cmp_filters(stock_stats, min_cmp, max_cmp, "latest_close")
     stock_stats = _apply_stock_search(stock_stats, stock_search)
@@ -1632,7 +2145,7 @@ def _load_visible_gtt_stock_stats(
         _daily_buy_symbols(data_root),
         require_volume_confirmation,
         require_obv_confirmation,
-        technical_rating_status,
+        technical_rating_statuses,
     )
     stock_stats = _apply_peak_speed_bucket_filter(stock_stats, peak_speed_bucket)
 
@@ -1656,6 +2169,86 @@ def _load_visible_gtt_stock_stats(
     if sort_columns:
         sorted_stats = sorted_stats.sort_values(sort_columns, ascending=sort_ascending, na_position="last")
     return sorted_stats.reset_index(drop=True)
+
+
+def _latest_signal_week_date(data_root: Path) -> str:
+    raw = Storage(data_root).load_signals("latest_raw_signals.csv")
+    if raw.empty or "date" not in raw.columns:
+        return ""
+    dates = pd.to_datetime(raw["date"], errors="coerce").dropna()
+    if dates.empty:
+        return ""
+    return dates.max().strftime("%Y-%m-%d")
+
+
+def _ensure_gtt_s2_to_s3_markers(
+    data_root: Path,
+    frame: pd.DataFrame,
+    config: dict[str, Any],
+) -> pd.DataFrame:
+    if frame.empty or "symbol" not in frame.columns:
+        return frame
+
+    enriched = frame.copy()
+    symbols = {str(symbol).upper().strip() for symbol in enriched["symbol"] if str(symbol).strip()}
+    if not symbols:
+        enriched["s2_to_s3_next_week_seen"] = False
+        enriched["s2_to_s3_next_week_count"] = 0
+        return enriched
+
+    expected_start = SENSITIVITY_OVERLAP_DEFAULT_START_DATE
+    latest_week_date = _latest_signal_week_date(data_root)
+    cached = load_sensitivity_overlap_outputs(_sensitivity_overlap_dir(data_root))
+    use_cached = (
+        bool(cached.summary)
+        and str(cached.summary.get("start_date", "")) == expected_start
+        and str(cached.summary.get("latest_week_date", "")) == latest_week_date
+        and not cached.conversion_details.empty
+    )
+
+    if use_cached:
+        details = cached.conversion_details.copy()
+        details["symbol"] = details["symbol"].astype(str).str.upper().str.strip()
+        details = details[details["symbol"].isin(symbols)]
+        details = details[details["next_week_match"] == True]
+        grouped = (
+            details.groupby("symbol", dropna=False)
+            .agg(
+                s2_to_s3_next_week_count=("next_week_match", "sum"),
+                s2_to_s3_first_s2_date=("s2_date", "min"),
+                s2_to_s3_latest_s2_date=("s2_date", "max"),
+            )
+            .reset_index()
+        )
+        markers = pd.DataFrame({"symbol": sorted(symbols)}).merge(grouped, on="symbol", how="left")
+    else:
+        markers = pd.DataFrame({"symbol": sorted(symbols)})
+        markers["s2_to_s3_next_week_count"] = 0
+        markers["s2_to_s3_first_s2_date"] = pd.NA
+        markers["s2_to_s3_latest_s2_date"] = pd.NA
+
+    if "symbol" not in markers.columns:
+        markers["symbol"] = pd.Series(dtype="object")
+    markers["symbol"] = markers["symbol"].astype(str).str.upper().str.strip()
+    markers["s2_to_s3_next_week_seen"] = pd.to_numeric(
+        pd.Series(markers.get("s2_to_s3_next_week_count", 0)),
+        errors="coerce",
+    ).fillna(0).astype(int) > 0
+    markers["s2_to_s3_next_week_count"] = pd.to_numeric(markers.get("s2_to_s3_next_week_count", 0), errors="coerce").fillna(0).astype(int)
+    merged = enriched.merge(
+        markers[[
+            "symbol",
+            "s2_to_s3_next_week_seen",
+            "s2_to_s3_next_week_count",
+            "s2_to_s3_first_s2_date",
+            "s2_to_s3_latest_s2_date",
+        ]],
+        on="symbol",
+        how="left",
+    )
+    merged["s2_to_s3_next_week_seen"] = merged["s2_to_s3_next_week_seen"].fillna(False).astype(bool)
+    merged["s2_to_s3_next_week_count"] = pd.to_numeric(merged["s2_to_s3_next_week_count"], errors="coerce").fillna(0).astype(int)
+    return merged
 
 
 def _signal_qa_candidates(
@@ -1745,6 +2338,85 @@ def _gtt_gain_error_url(error: Exception, query_suffix: str) -> str:
     return f"/gtt-gain-study?study_error={quote(str(error)[:500])}{query_suffix}"
 
 
+def _weekday_study_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/weekday-study?"
+        f"study_ran=1&symbols_processed={summary.get('symbols_processed', 0)}"
+        f"&stocks_with_weekday_profile={summary.get('stocks_with_weekday_profile', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _weekday_study_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/weekday-study?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
+def _strategy_lab_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/strategy-lab?"
+        f"study_ran=1&signal_events={summary.get('signal_events', 0)}"
+        f"&best_strategy={quote(str(summary.get('best_strategy_name', '')))}"
+        f"{query_suffix}"
+    )
+
+
+def _strategy_lab_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/strategy-lab?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
+def _sensitivity_overlap_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/sensitivity-study?"
+        f"study_ran=1&s2_events={summary.get('s2_buy_events', 0)}"
+        f"&same_week_overlap={summary.get('same_week_overlap_events', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _sensitivity_overlap_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/sensitivity-study?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
+def _weekly_buy_gains_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/weekly-buy-gains?"
+        f"study_ran=1&stocks={summary.get('stocks_with_buy_history', 0)}"
+        f"&s2_events={summary.get('s2_buy_events', 0)}"
+        f"&s3_events={summary.get('s3_buy_events', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _weekly_buy_gains_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/weekly-buy-gains?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
+def _qm_quality_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/qm-quality?"
+        f"study_ran=1&symbols={summary.get('april_buy_symbols', 0)}"
+        f"&events={summary.get('april_buy_events', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _qm_quality_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/qm-quality?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
+def _volume_burst_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/volume-burst?"
+        f"study_ran=1&symbols={summary.get('symbols_processed', 0)}"
+        f"&matches={summary.get('volume_burst_matches', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _volume_burst_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/volume-burst?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
 def _rotation_study_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
     return (
         "/rotation-study?"
@@ -1771,7 +2443,22 @@ def _signal_outcome_error_url(error: Exception, query_suffix: str) -> str:
     return f"/signal-outcome-study?study_error={quote(str(error)[:500])}{query_suffix}"
 
 
+def _swing_trade_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
+    return (
+        "/swing-trade-study?"
+        f"study_ran=1&candidates={summary.get('candidates_found', 0)}"
+        f"&ready_now={summary.get('ready_now_count', 0)}"
+        f"{query_suffix}"
+    )
+
+
+def _swing_trade_error_url(error: Exception, query_suffix: str) -> str:
+    return f"/swing-trade-study?study_error={quote(str(error)[:500])}{query_suffix}"
+
+
 def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: str) -> None:
+    data_root = get_data_root(scan_config)
+    storage = Storage(data_root)
     _set_scan_job(
         job_id,
         status="running",
@@ -1800,6 +2487,34 @@ def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: st
 
     try:
         summary = run_daily_scan(scan_config, progress_callback=progress_callback)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase="Preparing weekday profiles",
+            completed=int(summary.get("symbols_scanned", 0)),
+            total=int(summary.get("symbols_scanned", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+        )
+        _build_latest_weekday_pressure_cache(scan_config, storage, data_root)
+        try:
+            _set_scan_job(
+                job_id,
+                status="running",
+                phase="Updating Minervini Google Sheet",
+                completed=int(summary.get("symbols_scanned", 0)),
+                total=int(summary.get("symbols_scanned", 0)),
+                percent=100,
+                current_symbol="",
+                current_exchange="",
+            )
+            summary["minervini_sheet_sync"] = _maybe_run_minervini_sheet_sync_after_screener(storage, data_root)
+        except Exception as minervini_exc:
+            summary["minervini_sheet_sync"] = {
+                "status": "failed",
+                "error": str(minervini_exc),
+            }
         _set_scan_job(
             job_id,
             status="completed",
@@ -1855,17 +2570,6 @@ def _run_gtt_gain_job(job_id: str, config: dict[str, Any], data_root: Path, quer
         save_gtt_gain_outputs(result, _gtt_gain_dir(data_root))
         _set_scan_job(
             job_id,
-            status="running",
-            phase="Writing Excel report",
-            completed=int(result.summary.get("symbols_processed", 0)),
-            total=int(result.summary.get("symbols_processed", 0)),
-            percent=99,
-            current_symbol="",
-            current_exchange="NSE",
-        )
-        write_gtt_gain_workbook(result, _latest_gtt_gain_paths(data_root)["workbook"])
-        _set_scan_job(
-            job_id,
             status="completed",
             phase="Complete",
             completed=int(result.summary.get("symbols_processed", 0)),
@@ -1884,6 +2588,615 @@ def _run_gtt_gain_job(job_id: str, config: dict[str, Any], data_root: Path, quer
             error=str(exc),
             redirect_url=_gtt_gain_error_url(exc, query_suffix),
         )
+
+
+def _run_weekday_study_job(job_id: str, config: dict[str, Any], data_root: Path, query_suffix: str) -> None:
+    storage = Storage(data_root)
+    signal_rows = _latest_weekly_buy_sell_frame(data_root)
+    signal_symbols = _symbols_from_frame(signal_rows)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Weekday Study",
+        completed=0,
+        total=len(signal_symbols),
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = _build_latest_weekday_pressure_cache(
+            config,
+            storage,
+            data_root,
+            progress_callback=progress_callback,
+        )
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_weekday_study_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_weekday_study_error_url(exc, query_suffix),
+        )
+
+
+def _run_strategy_lab_job(
+    job_id: str,
+    config: dict[str, Any],
+    data_root: Path,
+    query_suffix: str,
+    start_date: str,
+) -> None:
+    storage = Storage(data_root)
+    signal_rows = _load_signal_universe_for_strategy_lab(storage, "NSE", start_date)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Strategy Lab",
+        completed=0,
+        total=len(signal_rows),
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_strategy_lab_study(
+            config,
+            storage,
+            exchange="NSE",
+            start_date=start_date,
+            progress_callback=progress_callback,
+        )
+        save_strategy_lab_outputs(result, _strategy_lab_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("signal_events", 0)),
+            total=int(result.summary.get("signal_events", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_strategy_lab_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_strategy_lab_error_url(exc, query_suffix),
+        )
+
+
+def _run_sensitivity_overlap_job(
+    job_id: str,
+    config: dict[str, Any],
+    data_root: Path,
+    query_suffix: str,
+    start_date: str,
+) -> None:
+    storage = Storage(data_root)
+    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Sensitivity Study",
+        completed=0,
+        total=symbol_total,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_sensitivity_overlap_study(
+            config,
+            storage,
+            exchange="NSE",
+            start_date=start_date,
+            progress_callback=progress_callback,
+        )
+        save_sensitivity_overlap_outputs(result, _sensitivity_overlap_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_sensitivity_overlap_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_sensitivity_overlap_error_url(exc, query_suffix),
+        )
+
+
+def _run_weekly_buy_tracker_job(
+    job_id: str,
+    config: dict[str, Any],
+    data_root: Path,
+    query_suffix: str,
+    start_date: str,
+) -> None:
+    storage = Storage(data_root)
+    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Weekly Buy Tracker",
+        completed=0,
+        total=symbol_total,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_weekly_buy_tracker_study(
+            config,
+            storage,
+            exchange="NSE",
+            start_date=start_date,
+            progress_callback=progress_callback,
+        )
+        save_weekly_buy_tracker_outputs(result, _weekly_buy_tracker_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_weekly_buy_gains_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_weekly_buy_gains_error_url(exc, query_suffix),
+        )
+
+
+def _run_qm_quality_job(
+    job_id: str,
+    config: dict[str, Any],
+    data_root: Path,
+    query_suffix: str,
+    buy_start_date: str,
+    buy_end_date: str,
+    run_mode: str,
+    price_as_of_date: str,
+) -> None:
+    storage = Storage(data_root)
+    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
+    signal_frame = _latest_weekly_buy_sell_frame(data_root) if run_mode == "latest" else None
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Quantitative Momentum Quality",
+        completed=0,
+        total=symbol_total,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_qm_quality_study(
+            config,
+            storage,
+            exchange="NSE",
+            buy_start_date=buy_start_date,
+            buy_end_date=buy_end_date,
+            price_as_of_date=price_as_of_date,
+            signal_frame=signal_frame,
+            progress_callback=progress_callback,
+        )
+        save_qm_quality_outputs(result, _qm_quality_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_qm_quality_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_qm_quality_error_url(exc, query_suffix),
+        )
+
+
+def _run_volume_burst_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+) -> None:
+    storage = Storage(data_root)
+    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Volume Burst Study",
+        completed=0,
+        total=symbol_total,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_volume_burst_study(storage, exchange="NSE", progress_callback=progress_callback)
+        save_volume_burst_outputs(result, _volume_burst_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_volume_burst_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_volume_burst_error_url(exc, query_suffix),
+        )
+
+
+def _run_resistance_breaks_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    left_bars: int,
+    right_bars: int,
+    volume_avg_window: int,
+    volume_multiplier: float,
+    min_break_count: int,
+    recent_window_days: int,
+) -> None:
+    storage = Storage(data_root)
+    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting resistance break scan",
+        completed=0,
+        total=symbol_total,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_resistance_breaks_study(
+            storage,
+            exchange="NSE",
+            left_bars=left_bars,
+            right_bars=right_bars,
+            volume_avg_window=volume_avg_window,
+            volume_multiplier=volume_multiplier,
+            min_break_count=min_break_count,
+            recent_window_days=recent_window_days,
+            progress_callback=progress_callback,
+        )
+        save_resistance_breaks_outputs(result, _resistance_breaks_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/resistance-breaks?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/resistance-breaks?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _run_adx_di_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    length: int,
+    threshold: float,
+    cross_lookback_bars: int,
+    trend_fast_ma_length: int,
+    trend_slow_ma_length: int,
+    volume_avg_lookback: int,
+    min_volume_ratio: float,
+    breakout_lookback_days: int,
+    rs_lookback_days: int,
+    min_rs_spread_pct: float,
+) -> None:
+    storage = Storage(data_root)
+    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting ADX / DI scan",
+        completed=0,
+        total=symbol_total,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_adx_di_study(
+            storage,
+            exchange="NSE",
+            length=length,
+            threshold=threshold,
+            cross_lookback_bars=cross_lookback_bars,
+            trend_fast_ma_length=trend_fast_ma_length,
+            trend_slow_ma_length=trend_slow_ma_length,
+            volume_avg_lookback=volume_avg_lookback,
+            min_volume_ratio=min_volume_ratio,
+            breakout_lookback_days=breakout_lookback_days,
+            rs_lookback_days=rs_lookback_days,
+            min_rs_spread_pct=min_rs_spread_pct,
+            progress_callback=progress_callback,
+        )
+        save_adx_di_outputs(result, _adx_di_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/adx-di?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/adx-di?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _run_minervini_sheet_job(job_id: str, data_root: Path, query_suffix: str) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Reading Google Sheet",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_minervini_sheet_sync(storage, data_root, progress_callback=progress_callback)
+        save_minervini_sheet_sync_outputs(result, _minervini_sheet_sync_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("sheet_row_count", 0)),
+            total=int(result.summary.get("sheet_row_count", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/minervini-sheet?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/minervini-sheet?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _maybe_run_minervini_sheet_sync_after_screener(storage: Storage, data_root: Path) -> dict[str, Any]:
+    settings = load_google_sheets_settings(data_root)
+    oauth = google_oauth_status(data_root)
+    if not settings.spreadsheet_id:
+        return {"status": "skipped", "reason": "sheet_not_configured"}
+    if not oauth.get("logged_in"):
+        return {"status": "skipped", "reason": "google_login_required"}
+    result = run_minervini_sheet_sync(storage, data_root)
+    save_minervini_sheet_sync_outputs(result, _minervini_sheet_sync_dir(data_root))
+    return {"status": "completed", **result.summary}
 
 
 def _run_rotation_study_job(job_id: str, config: dict[str, Any], data_root: Path, query_suffix: str) -> None:
@@ -2003,6 +3316,59 @@ def _run_signal_outcome_job(
             phase="Failed",
             error=str(exc),
             redirect_url=_signal_outcome_error_url(exc, query_suffix),
+        )
+
+
+def _run_swing_trade_job(job_id: str, config: dict[str, Any], data_root: Path, query_suffix: str) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Starting Swing Trade Study",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def swing_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        raw_percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(raw_percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        result = run_swing_trade_study(config, storage, exchange="NSE", progress_callback=swing_progress_callback)
+        save_swing_trade_outputs(result, _swing_trade_study_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_scored", 0)),
+            total=int(result.summary.get("symbols_scored", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=_swing_trade_redirect_url(result.summary, query_suffix),
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=_swing_trade_error_url(exc, query_suffix),
         )
 
 
@@ -2207,6 +3573,214 @@ def _latest_gtt_gain_paths(data_root: Path) -> dict[str, Path]:
     }
 
 
+def _weekday_pressure_dir(data_root: Path) -> Path:
+    path = data_root / "weekday_pressure_study"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _latest_weekday_pressure_paths(data_root: Path) -> dict[str, Path]:
+    directory = _weekday_pressure_dir(data_root)
+    return {
+        "summary": directory / "latest_summary.csv",
+        "stock_stats": directory / "latest_stock_stats.csv",
+        "weekday_details": directory / "latest_weekday_details.csv",
+    }
+
+
+def _weekday_pressure_cache_is_fresh(
+    cached: WeekdayPressureStudyResult,
+    latest_week_date: str,
+    signal_symbols: set[str],
+) -> bool:
+    if not cached.summary:
+        return False
+    if str(cached.summary.get("latest_week_date", "")) != latest_week_date:
+        return False
+    source_symbol_count = int(pd.to_numeric(cached.summary.get("source_symbol_count", 0), errors="coerce") or 0)
+    return source_symbol_count == len(signal_symbols)
+
+
+def _build_latest_weekday_pressure_cache(
+    config: dict[str, Any],
+    storage: Storage,
+    data_root: Path,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> WeekdayPressureStudyResult:
+    signal_rows = _latest_weekly_buy_sell_frame(data_root)
+    signal_symbols = _symbols_from_frame(signal_rows)
+    latest_week_date = ""
+    if not signal_rows.empty and "date" in signal_rows.columns:
+        latest_dates = pd.to_datetime(signal_rows["date"], errors="coerce").dropna()
+        if not latest_dates.empty:
+            latest_week_date = latest_dates.max().strftime("%Y-%m-%d")
+    result = run_weekday_pressure_study(
+        config,
+        storage,
+        exchange="NSE",
+        symbols=signal_symbols,
+        progress_callback=progress_callback,
+    )
+    summary = dict(result.summary)
+    summary["latest_week_date"] = latest_week_date
+    summary["source_signal_count"] = int(len(signal_rows))
+    summary["source_symbol_count"] = int(len(signal_symbols))
+    enriched_result = WeekdayPressureStudyResult(
+        summary=summary,
+        stock_stats=result.stock_stats,
+        weekday_details=result.weekday_details,
+    )
+    save_weekday_pressure_outputs(enriched_result, _weekday_pressure_dir(data_root))
+    return enriched_result
+
+
+def _ensure_latest_weekday_pressure_cache(
+    config: dict[str, Any],
+    storage: Storage,
+    data_root: Path,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> WeekdayPressureStudyResult:
+    signal_rows = _latest_weekly_buy_sell_frame(data_root)
+    signal_symbols = _symbols_from_frame(signal_rows)
+    latest_week_date = ""
+    if not signal_rows.empty and "date" in signal_rows.columns:
+        latest_dates = pd.to_datetime(signal_rows["date"], errors="coerce").dropna()
+        if not latest_dates.empty:
+            latest_week_date = latest_dates.max().strftime("%Y-%m-%d")
+    cached = load_weekday_pressure_outputs(_weekday_pressure_dir(data_root))
+    if _weekday_pressure_cache_is_fresh(cached, latest_week_date, signal_symbols):
+        return cached
+    return _build_latest_weekday_pressure_cache(
+        config,
+        storage,
+        data_root,
+        progress_callback=progress_callback,
+    )
+
+
+def _merge_cached_weekday_profiles(
+    config: dict[str, Any],
+    storage: Storage,
+    data_root: Path,
+    frame: pd.DataFrame,
+    exchange_column: str = "exchange",
+    symbol_column: str = "symbol",
+) -> pd.DataFrame:
+    if frame.empty or symbol_column not in frame.columns:
+        return frame.copy()
+
+    signal_rows = _latest_weekly_buy_sell_frame(data_root)
+    signal_symbols = _symbols_from_frame(signal_rows)
+    latest_week_date = ""
+    if not signal_rows.empty and "date" in signal_rows.columns:
+        latest_dates = pd.to_datetime(signal_rows["date"], errors="coerce").dropna()
+        if not latest_dates.empty:
+            latest_week_date = latest_dates.max().strftime("%Y-%m-%d")
+    cached = load_weekday_pressure_outputs(_weekday_pressure_dir(data_root))
+    if not _weekday_pressure_cache_is_fresh(cached, latest_week_date, signal_symbols):
+        merged = frame.copy()
+        if "best_buy_weekday" not in merged.columns:
+            merged["best_buy_weekday"] = pd.NA
+        if "best_sell_weekday" not in merged.columns:
+            merged["best_sell_weekday"] = pd.NA
+        return merged
+    if cached.stock_stats.empty or "symbol" not in cached.stock_stats.columns:
+        merged = frame.copy()
+        if "best_buy_weekday" not in merged.columns:
+            merged["best_buy_weekday"] = pd.NA
+        if "best_sell_weekday" not in merged.columns:
+            merged["best_sell_weekday"] = pd.NA
+        return merged
+
+    profiles = cached.stock_stats.copy()
+    profiles["symbol"] = profiles["symbol"].astype(str).str.upper().str.strip()
+    if "exchange" not in profiles.columns:
+        profiles["exchange"] = "NSE"
+    profiles["exchange"] = profiles["exchange"].astype(str).str.upper().str.strip()
+
+    merged = frame.copy()
+    if exchange_column not in merged.columns:
+        merged[exchange_column] = "NSE"
+    merged[exchange_column] = merged[exchange_column].astype(str).str.upper().str.strip()
+    merged[symbol_column] = merged[symbol_column].astype(str).str.upper().str.strip()
+    merged = merged.merge(
+        profiles[["exchange", "symbol", "best_buy_weekday", "best_sell_weekday"]],
+        left_on=[exchange_column, symbol_column],
+        right_on=["exchange", "symbol"],
+        how="left",
+        suffixes=("", "_weekday"),
+    )
+    return merged.drop(columns=["exchange_weekday", "symbol_weekday"], errors="ignore")
+
+
+def _strategy_lab_dir(data_root: Path) -> Path:
+    path = data_root / "strategy_lab"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sensitivity_overlap_dir(data_root: Path) -> Path:
+    path = data_root / "sensitivity_overlap_study"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _weekly_buy_tracker_dir(data_root: Path) -> Path:
+    path = data_root / "weekly_buy_tracker"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _qm_quality_dir(data_root: Path) -> Path:
+    path = data_root / "qm_quality"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _volume_burst_dir(data_root: Path) -> Path:
+    path = data_root / "volume_burst"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _resistance_breaks_dir(data_root: Path) -> Path:
+    path = data_root / "resistance_breaks"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _adx_di_dir(data_root: Path) -> Path:
+    path = data_root / "adx_di"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _minervini_sheet_sync_dir(data_root: Path) -> Path:
+    path = data_root / "minervini_sheet_sync"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _latest_strategy_lab_paths(data_root: Path) -> dict[str, Path]:
+    directory = _strategy_lab_dir(data_root)
+    return {
+        "summary": directory / "latest_summary.csv",
+        "strategy_stats": directory / "latest_strategy_stats.csv",
+        "trade_details": directory / "latest_trade_details.csv",
+        "signal_universe": directory / "latest_signal_universe.csv",
+    }
+
+
+def _latest_sensitivity_overlap_paths(data_root: Path) -> dict[str, Path]:
+    directory = _sensitivity_overlap_dir(data_root)
+    return {
+        "summary": directory / "latest_summary.csv",
+        "weekly_breakdown": directory / "latest_weekly_breakdown.csv",
+        "latest_cohort": directory / "latest_latest_cohort.csv",
+        "conversion_details": directory / "latest_conversion_details.csv",
+    }
+
+
 def _rotation_study_dir(data_root: Path) -> Path:
     path = data_root / "rotation_study"
     path.mkdir(parents=True, exist_ok=True)
@@ -2238,6 +3812,12 @@ def _latest_signal_outcome_paths(data_root: Path) -> dict[str, Path]:
         "pair_details": directory / "latest_pair_details.csv",
         "workbook": directory / "signal_outcome_study_report.xlsx",
     }
+
+
+def _swing_trade_study_dir(data_root: Path) -> Path:
+    path = data_root / "swing_trade_study"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _rotation_group_chart_rows(
@@ -2350,8 +3930,7 @@ def health() -> str:
     return "ok"
 
 
-@app.get("/backtest", response_class=HTMLResponse)
-def backtest_page(request: Request) -> HTMLResponse:
+def _temporarily_removed_response(request: Request, page_name: str) -> HTMLResponse:
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -2360,93 +3939,40 @@ def backtest_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
-    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
-    common_symbol_scope = _common_filtered_symbols_from_request(data_root, config, request)
-    latest = _load_latest_backtest(data_root)
-    stock_stats = _filter_frame_by_symbol_scope(latest["stock_stats"], common_symbol_scope).head(100)
-    trades = _filter_frame_by_symbol_scope(latest["trades"], common_symbol_scope).head(100)
-    fresh_weekly_signal_only = _request_bool(request, "fresh_weekly_signal_only")
-
     return templates.TemplateResponse(
-        "backtest.html",
+        "page_unavailable.html",
         {
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "dashboard_token": request.query_params.get("token", ""),
             "selected_sensitivity": selected_sensitivity,
             "default_sensitivity": base_sensitivity,
-            "summary": latest["summary"],
-            "stock_stats": _records(stock_stats),
-            "trades": _records(trades),
-            "workbook_exists": latest["workbook_exists"],
-            "backtest_ran": request.query_params.get("backtest_ran", ""),
-            "backtest_error": request.query_params.get("backtest_error", ""),
-            "fresh_weekly_signal_only": fresh_weekly_signal_only,
+            "page_name": page_name,
+            "message": f"{page_name} is temporarily removed from the workspace for now.",
             **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
         },
+        status_code=404,
     )
+
+
+@app.get("/backtest", response_class=HTMLResponse)
+def backtest_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Backtest")
 
 
 @app.post("/backtest/run")
 async def run_backtest_from_dashboard(request: Request) -> RedirectResponse:
-    config = load_config()
-    form = await request.form()
-    selected_sensitivity = _parse_sensitivity_text(
-        str(form.get("sensitivity", "")),
-        int(config.get("strategy", {}).get("sensitivity", 3)),
-    ) or int(config.get("strategy", {}).get("sensitivity", 3))
-    if selected_sensitivity != int(config.get("strategy", {}).get("sensitivity", 3)):
-        config = deepcopy(config)
-        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
-    data_root = get_data_root(config)
-    storage = Storage(data_root)
-    dashboard_token = request.query_params.get("token", "").strip()
-    fresh_weekly_signal_only = str(form.get("fresh_weekly_signal_only", "")).strip().lower() in {"1", "true", "on", "yes"}
-
-    try:
-        symbols = _fresh_weekly_signal_symbols(data_root) if fresh_weekly_signal_only else None
-        if fresh_weekly_signal_only and not symbols:
-            raise RuntimeError("No fresh weekly BUY/SELL signals are available in latest_raw_signals.csv.")
-        result = (
-            run_buy_sell_backtest_for_symbols(config, storage, exchange="NSE", symbols=symbols)
-            if symbols is not None
-            else run_buy_sell_backtest(config, storage, exchange="NSE")
-        )
-        save_backtest_outputs(result, _backtest_dir(data_root), run_id="latest")
-        write_backtest_workbook(result, _latest_backtest_paths(data_root)["workbook"])
-        redirect_url = (
-            "/backtest?"
-            f"backtest_ran=1&closed_trades={result.summary.get('closed_trades', 0)}"
-            f"&symbols_processed={result.summary.get('symbols_processed', 0)}"
-            f"&sensitivity={selected_sensitivity}"
-        )
-        if fresh_weekly_signal_only:
-            redirect_url += "&fresh_weekly_signal_only=1"
-        if dashboard_token:
-            redirect_url += f"&token={quote(dashboard_token)}"
-        return RedirectResponse(redirect_url, status_code=303)
-    except Exception as exc:
-        redirect_url = f"/backtest?backtest_error={quote(str(exc)[:500])}&sensitivity={selected_sensitivity}"
-        if fresh_weekly_signal_only:
-            redirect_url += "&fresh_weekly_signal_only=1"
-        if dashboard_token:
-            redirect_url += f"&token={quote(dashboard_token)}"
-        return RedirectResponse(redirect_url, status_code=303)
+    raise HTTPException(status_code=404, detail="Backtest is temporarily removed from the workspace for now.")
 
 
 @app.get("/backtest/report")
 def download_backtest_report() -> FileResponse:
-    config = load_config()
-    workbook_path = _latest_backtest_paths(get_data_root(config))["workbook"]
-    if not workbook_path.exists():
-        raise HTTPException(status_code=404, detail="Backtest report has not been generated yet.")
-    return FileResponse(
-        workbook_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="buy_sell_backtest_report.xlsx",
-    )
+    raise HTTPException(status_code=404, detail="Backtest is temporarily removed from the workspace for now.")
 
 
 @app.get("/gtt-gain-study", response_class=HTMLResponse)
@@ -2464,7 +3990,6 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_gtt_gain_outputs(_gtt_gain_dir(data_root))
     latest_stock_stats = _align_gtt_stock_stats_to_latest_universe(data_root, latest.stock_stats, config)
-    latest_stock_stats = _ensure_gtt_weekly_technical_ratings(data_root, latest_stock_stats, config)
     latest_universe_symbols = _latest_kite_universe_symbols(data_root, config)
     metadata = _combined_symbol_metadata(config, Storage(data_root))
     latest_stock_stats = _enrich_with_symbol_metadata(latest_stock_stats, metadata, "symbol")
@@ -2489,9 +4014,9 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     selected_peak_speed_bucket = request.query_params.get("peak_speed_bucket", "").strip()
     if selected_peak_speed_bucket not in GTT_PEAK_SPEED_BUCKETS:
         selected_peak_speed_bucket = ""
-    selected_technical_rating_status = request.query_params.get("technical_rating_status", "").strip()
-    if selected_technical_rating_status not in GTT_TECHNICAL_RATING_FILTERS:
-        selected_technical_rating_status = ""
+    selected_technical_rating_statuses = _normalize_gtt_technical_rating_statuses(
+        request.query_params.getlist("technical_rating_status")
+    )
     open_buy_regime_only = _request_bool(request, "open_buy_regime_only") or _request_bool(request, "latest_buy_only")
     dashboard_buy_only = _request_bool(request, "dashboard_buy_only")
     fresh_weekly_buy_only = _request_bool(request, "fresh_weekly_buy_only")
@@ -2519,6 +4044,23 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
     )
     stock_stats = _apply_cmp_filters(stock_stats, min_cmp, max_cmp, "latest_close")
     stock_stats = _apply_stock_search(stock_stats, stock_search)
+    stock_stats = _apply_gtt_stock_filters(
+        stock_stats,
+        open_buy_regime_only,
+        False,
+        dashboard_buy_only,
+        dashboard_buy_symbols,
+        fresh_weekly_buy_only,
+        fresh_daily_buy_only,
+        fresh_daily_buy_symbols,
+        False,
+        False,
+        [],
+    )
+    if selected_technical_rating_statuses:
+        stock_stats = _ensure_gtt_weekly_technical_ratings(data_root, stock_stats, config)
+    if trend_only or require_volume_confirmation or require_obv_confirmation:
+        stock_stats = _ensure_gtt_latest_signal_context(data_root, stock_stats, config)
     stock_stats_after_screener_filter_count = len(stock_stats)
     stock_stats_before_filter_count = len(stock_stats)
     gtt_filter_warning = _gtt_filter_warning(
@@ -2532,7 +4074,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         fresh_daily_buy_symbols,
         require_volume_confirmation,
         require_obv_confirmation,
-        selected_technical_rating_status,
+        selected_technical_rating_statuses,
     )
     pair_details = universe_pair_details
     open_positions = universe_open_positions
@@ -2549,11 +4091,12 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         fresh_daily_buy_symbols,
         require_volume_confirmation,
         require_obv_confirmation,
-        selected_technical_rating_status,
+        selected_technical_rating_statuses,
     )
     bucket_chart_stock_stats = stock_stats.copy()
     stock_stats_before_bucket_count = len(bucket_chart_stock_stats)
     stock_stats = _apply_peak_speed_bucket_filter(stock_stats, selected_peak_speed_bucket)
+    stock_stats = _ensure_gtt_s2_to_s3_markers(data_root, stock_stats, config)
     if (
         open_buy_regime_only
         or dashboard_buy_only
@@ -2563,7 +4106,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         or require_volume_confirmation
         or require_obv_confirmation
         or selected_peak_speed_bucket
-        or selected_technical_rating_status
+        or selected_technical_rating_statuses
         or min_cmp is not None
         or max_cmp is not None
     ):
@@ -2603,7 +4146,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         return_metric=selected_return_metric if min_pair_return_text else "",
         min_pair_return_pct=min_pair_return_text,
         peak_speed_bucket=selected_peak_speed_bucket,
-        technical_rating_status=selected_technical_rating_status,
+        technical_rating_statuses=selected_technical_rating_statuses,
     )
     active_gtt_filter_summary = _gtt_filter_summary(
         stock_search,
@@ -2624,8 +4167,10 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
         selected_return_metric,
         min_pair_return_text,
         selected_peak_speed_bucket,
-        selected_technical_rating_status,
+        selected_technical_rating_statuses,
     )
+    rendered_stock_stats = stock_stats.head(GTT_TABLE_RENDER_LIMIT).copy()
+    stock_stats_truncated = len(rendered_stock_stats) < len(stock_stats)
 
     return templates.TemplateResponse(
         "gtt_gain_study.html",
@@ -2636,11 +4181,11 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "selected_sensitivity": selected_sensitivity,
             "default_sensitivity": base_sensitivity,
             "summary": display_summary,
-            "stock_stats": _records(stock_stats),
+            "stock_stats": _records(rendered_stock_stats),
             "stock_symbols_csv": _comma_separated_symbols(stock_stats),
             "gtt_peak_speed_buckets": GTT_PEAK_SPEED_BUCKETS,
             "selected_peak_speed_bucket": selected_peak_speed_bucket,
-            "selected_technical_rating_status": selected_technical_rating_status,
+            "selected_technical_rating_statuses": selected_technical_rating_statuses,
             "gtt_technical_rating_filters": GTT_TECHNICAL_RATING_FILTERS,
             "stock_stats_before_bucket_count": stock_stats_before_bucket_count,
             "gtt_opportunity_chart_html": gtt_opportunity_chart_html,
@@ -2654,6 +4199,9 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "fresh_daily_buy_only": fresh_daily_buy_only,
             "trend_only": trend_only,
             "stock_stats_count": len(stock_stats),
+            "rendered_stock_stats_count": len(rendered_stock_stats),
+            "stock_stats_truncated": stock_stats_truncated,
+            "stock_stats_render_limit": GTT_TABLE_RENDER_LIMIT,
             "stock_stats_before_filter_count": stock_stats_before_filter_count,
             "stock_stats_after_screener_filter_count": stock_stats_after_screener_filter_count,
             "selected_market_cap_bucket": selected_market_cap_bucket,
@@ -2675,8 +4223,11 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
             "study_ran": request.query_params.get("study_ran", ""),
             "study_error": request.query_params.get("study_error", ""),
             "telegram_sent": request.query_params.get("telegram_sent", ""),
+            "telegram_sent_count": request.query_params.get("telegram_sent_count", ""),
             "telegram_error": request.query_params.get("telegram_error", ""),
             **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
         },
     )
 
@@ -2728,8 +4279,8 @@ def download_gtt_gain_study_report() -> FileResponse:
     )
 
 
-@app.get("/rotation-study", response_class=HTMLResponse)
-def rotation_study_page(request: Request) -> HTMLResponse:
+@app.get("/weekday-study", response_class=HTMLResponse)
+def weekday_study_page(request: Request) -> HTMLResponse:
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -2738,52 +4289,103 @@ def rotation_study_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
-    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
-    common_symbol_scope = _common_filtered_symbols_from_request(data_root, config, request)
-    latest = load_rotation_study_outputs(_rotation_study_dir(data_root))
+    latest = load_weekday_pressure_outputs(_weekday_pressure_dir(data_root))
+    signal_frame = _latest_weekly_buy_sell_frame(data_root)
 
-    selected_group_id = request.query_params.get("group_id", "").strip().upper()
-    selected_movement_status = request.query_params.get("movement_status", "").strip()
+    signal_symbol_column = _symbol_column(signal_frame)
+    if signal_frame.empty or not signal_symbol_column:
+        merged = latest.stock_stats.copy()
+        if not merged.empty and "signal" not in merged.columns:
+            merged["signal"] = ""
+        if not merged.empty and "signal_date" not in merged.columns:
+            merged["signal_date"] = ""
+    else:
+        base = signal_frame.copy()
+        base["symbol"] = base[signal_symbol_column].astype(str).str.upper().str.strip()
+        base["signal"] = base["signal"].astype(str).str.upper().str.strip()
+        base["signal_date"] = pd.to_datetime(base["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        keep_columns = ["exchange", "symbol", "name", "signal", "signal_date"]
+        if "close" in base.columns:
+            keep_columns.append("close")
+            base = base.rename(columns={"close": "signal_close"})
+            keep_columns[-1] = "signal_close"
+        base = base[keep_columns].drop_duplicates(subset=["exchange", "symbol"], keep="last")
+        merged = base
+        if not latest.stock_stats.empty:
+            merged = merged.merge(
+                latest.stock_stats,
+                on=["exchange", "symbol"],
+                how="left",
+                suffixes=("", "_study"),
+            )
+            if "name_study" in merged.columns:
+                merged["name"] = merged["name"].fillna("").astype(str).str.strip().mask(
+                    lambda s: s == "",
+                    merged["name_study"].fillna("").astype(str).str.strip(),
+                )
+                merged = merged.drop(columns=["name_study"])
+
     stock_search = request.query_params.get("stock_search", "").strip()
+    selected_signal = request.query_params.get("signal", "").strip().upper()
+    if selected_signal not in {"", "BUY", "SELL"}:
+        selected_signal = ""
+    selected_buy_weekday = request.query_params.get("best_buy_weekday", "").strip()
+    if selected_buy_weekday not in WEEKDAY_ORDER:
+        selected_buy_weekday = ""
+    selected_sell_weekday = request.query_params.get("best_sell_weekday", "").strip()
+    if selected_sell_weekday not in WEEKDAY_ORDER:
+        selected_sell_weekday = ""
 
-    groups = latest.groups.copy()
-    all_members = latest.members.copy()
-    members = all_members.copy()
-    candidates = latest.candidates.copy()
-    all_members = _filter_frame_by_symbol_scope(all_members, common_symbol_scope)
-    members = _filter_frame_by_symbol_scope(members, common_symbol_scope)
-    candidates = _filter_frame_by_symbol_scope(candidates, common_symbol_scope)
-    if not groups.empty and not all_members.empty and "group_id" in groups.columns and "group_id" in all_members.columns:
-        valid_group_ids = set(all_members["group_id"].astype(str))
-        groups = groups[groups["group_id"].astype(str).isin(valid_group_ids)].reset_index(drop=True)
+    if not merged.empty:
+        merged = _apply_stock_search(merged, stock_search)
+        if selected_signal:
+            merged = merged[merged["signal"].astype(str).str.upper() == selected_signal]
+        if selected_buy_weekday and "best_buy_weekday" in merged.columns:
+            merged = merged[merged["best_buy_weekday"].astype(str) == selected_buy_weekday]
+        if selected_sell_weekday and "best_sell_weekday" in merged.columns:
+            merged = merged[merged["best_sell_weekday"].astype(str) == selected_sell_weekday]
+        sort_columns = []
+        ascending = []
+        if "best_buy_pressure_score" in merged.columns:
+            merged["best_buy_pressure_score"] = pd.to_numeric(merged["best_buy_pressure_score"], errors="coerce")
+            sort_columns.append("best_buy_pressure_score")
+            ascending.append(False)
+        if "symbol" in merged.columns:
+            sort_columns.append("symbol")
+            ascending.append(True)
+        if sort_columns:
+            merged = merged.sort_values(sort_columns, ascending=ascending, na_position="last")
 
-    if selected_group_id and not members.empty:
-        members = members[members["group_id"].astype(str).str.upper() == selected_group_id]
-        candidates = candidates[candidates["group_id"].astype(str).str.upper() == selected_group_id]
-    if selected_movement_status and not members.empty:
-        members = members[members["movement_status"].astype(str) == selected_movement_status]
-    if stock_search:
-        members = _apply_stock_search(members, stock_search)
-        candidates = _apply_stock_search(candidates, stock_search)
+    selected_symbol = request.query_params.get("symbol", "").strip().upper()
+    if not selected_symbol and not merged.empty and "symbol" in merged.columns:
+        selected_symbol = str(merged.iloc[0].get("symbol") or "").upper()
 
-    if not groups.empty:
-        groups = groups.head(40)
-    if not members.empty:
-        members = members.head(200)
-    if not candidates.empty:
-        candidates = candidates.head(100)
-    group_chart_rows = _rotation_group_chart_rows(
-        data_root=data_root,
-        config=config,
-        groups=groups,
-        members=all_members,
-        selected_group_id=selected_group_id,
+    detail_rows = latest.weekday_details.copy()
+    if not detail_rows.empty:
+        detail_rows["symbol"] = detail_rows["symbol"].astype(str).str.upper().str.strip()
+        if selected_symbol:
+            detail_rows = detail_rows[detail_rows["symbol"] == selected_symbol]
+        if not detail_rows.empty:
+            detail_rows["weekday"] = pd.Categorical(detail_rows["weekday"], categories=WEEKDAY_ORDER, ordered=True)
+            detail_rows = detail_rows.sort_values("weekday")
+
+    selected_row = {}
+    if selected_symbol and not merged.empty and "symbol" in merged.columns:
+        selected_match = merged[merged["symbol"].astype(str).str.upper() == selected_symbol]
+        if not selected_match.empty:
+            selected_row = selected_match.iloc[0].to_dict()
+
+    signal_counts = (
+        signal_frame["signal"].astype(str).str.upper().value_counts().to_dict()
+        if not signal_frame.empty and "signal" in signal_frame.columns
+        else {}
     )
 
     return templates.TemplateResponse(
-        "rotation_study.html",
+        "weekday_study.html",
         {
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
@@ -2791,55 +4393,75 @@ def rotation_study_page(request: Request) -> HTMLResponse:
             "selected_sensitivity": selected_sensitivity,
             "default_sensitivity": base_sensitivity,
             "summary": latest.summary,
-            "groups": _records(groups),
-            "members": _records(members),
-            "candidates": _records(candidates),
+            "stock_stats": _records(merged),
+            "stock_stats_count": len(merged),
+            "signal_universe_count": len(signal_frame),
+            "buy_signal_count": signal_counts.get("BUY", 0),
+            "sell_signal_count": signal_counts.get("SELL", 0),
+            "stock_search": stock_search,
+            "selected_signal": selected_signal,
+            "selected_buy_weekday": selected_buy_weekday,
+            "selected_sell_weekday": selected_sell_weekday,
+            "weekday_options": WEEKDAY_ORDER,
+            "selected_symbol": selected_symbol,
+            "selected_row": selected_row,
+            "weekday_details": _records(detail_rows),
+            "weekday_job": request.query_params.get("weekday_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
             "study_error": request.query_params.get("study_error", ""),
-            "rotation_job": request.query_params.get("rotation_job", ""),
-            "selected_group_id": selected_group_id,
-            "selected_movement_status": selected_movement_status,
-            "stock_search": stock_search,
-            "movement_status_options": ["Leader", "Catch-up Candidate", "In Sync", "Lagging"],
-            "groups_found": request.query_params.get("groups_found", ""),
-            "candidates_found": request.query_params.get("candidates", ""),
-            "group_chart_rows": group_chart_rows,
             **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
         },
     )
 
 
-@app.post("/rotation-study/run")
-async def run_rotation_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+@app.post("/weekday-study/run")
+async def run_weekday_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
     config = load_config()
-    form = await request.form()
-    selected_sensitivity = _parse_sensitivity_text(
-        str(form.get("sensitivity", "")),
-        int(config.get("strategy", {}).get("sensitivity", 3)),
-    ) or int(config.get("strategy", {}).get("sensitivity", 3))
-    if selected_sensitivity != int(config.get("strategy", {}).get("sensitivity", 3)):
-        config = deepcopy(config)
-        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
     data_root = get_data_root(config)
-    dashboard_token = request.query_params.get("token", "").strip()
-    params = []
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    query_suffix = ""
     if dashboard_token:
-        params.append(f"token={quote(dashboard_token)}")
-    params.append(f"sensitivity={selected_sensitivity}")
-    query_suffix = ("&" + "&".join(params)) if params else ""
+        query_suffix += f"&token={quote(dashboard_token)}"
+    if sensitivity_text:
+        query_suffix += f"&sensitivity={quote(sensitivity_text)}"
 
     try:
         job_id = uuid4().hex
         _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
-        background_tasks.add_task(_run_rotation_study_job, job_id, config, data_root, query_suffix)
-        redirect_url = f"/rotation-study?rotation_job={job_id}{query_suffix}"
+        background_tasks.add_task(_run_weekday_study_job, job_id, config, data_root, query_suffix)
+        redirect_url = f"/weekday-study?weekday_job={job_id}{query_suffix}"
     except Exception as exc:
-        redirect_url = _rotation_study_error_url(exc, query_suffix)
+        redirect_url = _weekday_study_error_url(exc, query_suffix)
     return RedirectResponse(redirect_url, status_code=303)
 
 
-@app.get("/signal-outcome-study", response_class=HTMLResponse)
-def signal_outcome_study_page(request: Request) -> HTMLResponse:
+@app.get("/strategy-lab", response_class=HTMLResponse)
+def strategy_lab_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Strategy Lab")
+
+
+@app.get("/sensitivity-study", response_class=HTMLResponse)
+def sensitivity_overlap_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Sensitivity Study")
+
+
+@app.post("/sensitivity-study/run")
+async def run_sensitivity_overlap_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Sensitivity Study is temporarily removed from the workspace for now.")
+
+
+@app.post("/strategy-lab/run")
+async def run_strategy_lab_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Strategy Lab is temporarily removed from the workspace for now.")
+
+
+@app.get("/weekly-buy-gains", response_class=HTMLResponse)
+def weekly_buy_gains_page(request: Request) -> HTMLResponse:
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -2848,128 +4470,903 @@ def signal_outcome_study_page(request: Request) -> HTMLResponse:
         )
 
     config = load_config()
-    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
-    study_error = request.query_params.get("study_error", "")
-    try:
-        common_symbol_scope = _common_filtered_symbols_from_request(data_root, config, request)
-        latest = load_signal_outcome_outputs(_signal_outcome_study_dir(data_root))
-        latest_signal_universe = _filter_frame_by_symbol_scope(latest.signal_universe, common_symbol_scope)
-        latest_stock_stats = _filter_frame_by_symbol_scope(latest.stock_stats, common_symbol_scope)
-        latest_pair_details = _filter_frame_by_symbol_scope(latest.pair_details, common_symbol_scope)
-    except Exception as exc:
-        latest_summary: dict[str, Any] = {}
-        latest_signal_universe = pd.DataFrame()
-        latest_stock_stats = pd.DataFrame()
-        latest_pair_details = pd.DataFrame()
-        study_error = study_error or f"Could not load Signal Outcome Study: {exc}"
-    else:
-        latest_summary = latest.summary
+    latest = load_weekly_buy_tracker_outputs(_weekly_buy_tracker_dir(data_root))
+    start_date = request.query_params.get("start_date", WEEKLY_BUY_GAINS_DEFAULT_START_DATE).strip() or WEEKLY_BUY_GAINS_DEFAULT_START_DATE
+    stock_search = request.query_params.get("stock_search", "").strip()
+    minervini_only = _truthy_param(request.query_params.getlist("minervini_only"), default=False)
+    obv_macd_only = _truthy_param(request.query_params.getlist("obv_macd_only"), default=False)
+    latest_volume_only = _truthy_param(request.query_params.getlist("latest_volume_only"), default=False)
 
-    signal_scope = request.query_params.get("signal_scope", "").strip().lower() or str(latest_summary.get("signal_scope", "buy") or "buy")
-    if signal_scope not in {"buy", "sell", "both"}:
-        signal_scope = "buy"
-    target_gain_text = request.query_params.get("target_gain_pct", "").strip()
-    if not target_gain_text:
-        target_gain_text = str(latest_summary.get("target_gain_pct", config.get("signal_outcome_study", {}).get("target_gain_pct", 10.0)))
-    stock_stats_count = len(latest_stock_stats)
-    stock_symbols_csv = ""
-    if not latest_stock_stats.empty and "symbol" in latest_stock_stats.columns:
-        stock_symbols_csv = ",".join(
-            latest_stock_stats["symbol"]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.upper()
-            .loc[lambda series: series != ""]
-            .drop_duplicates()
-            .tolist()
-        )
+    stock_stats = latest.stock_stats.copy()
+    if not stock_stats.empty:
+        for column in (
+            "first_buy_date",
+            "latest_buy_date",
+            "first_s2_buy_date",
+            "latest_s2_buy_date",
+            "first_s3_buy_date",
+            "latest_s3_buy_date",
+            "latest_close_date",
+        ):
+            if column in stock_stats.columns:
+                stock_stats[column] = pd.to_datetime(stock_stats[column], errors="coerce").dt.strftime("%Y-%m-%d")
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        if minervini_only:
+            if "minervini_pass" in stock_stats.columns:
+                stock_stats = stock_stats[_truthy_series(stock_stats["minervini_pass"])].copy()
+            else:
+                stock_stats = stock_stats.iloc[0:0].copy()
+        if obv_macd_only:
+            if "obv_macd_cross_up" in stock_stats.columns:
+                stock_stats = stock_stats[_truthy_series(stock_stats["obv_macd_cross_up"])].copy()
+            else:
+                stock_stats = stock_stats.iloc[0:0].copy()
+        if latest_volume_only:
+            if "latest_volume_3x_prev_9d" in stock_stats.columns:
+                stock_stats = stock_stats[_truthy_series(stock_stats["latest_volume_3x_prev_9d"])].copy()
+            else:
+                stock_stats = stock_stats.iloc[0:0].copy()
+    gainers = stock_stats.copy()
+    if not gainers.empty and "gain_vs_latest_buy_pct" in gainers.columns:
+        gainers["gain_vs_latest_buy_pct"] = pd.to_numeric(gainers["gain_vs_latest_buy_pct"], errors="coerce")
+        gainers = gainers[gainers["gain_vs_latest_buy_pct"] > 0].copy()
+        gainers = gainers.sort_values(["gain_vs_latest_buy_pct", "symbol"], ascending=[False, True], na_position="last")
+
+    profitable_count = int(len(gainers))
+    total_count = int(len(stock_stats))
+    avg_gain = (
+        pd.to_numeric(stock_stats["gain_vs_latest_buy_pct"], errors="coerce").dropna()
+        if "gain_vs_latest_buy_pct" in stock_stats.columns
+        else pd.Series(dtype=float)
+    )
+    avg_gain_value = round(float(avg_gain.mean()), 2) if not avg_gain.empty else None
+    stock_symbols_csv = _comma_separated_symbols(stock_stats)
+    obv_macd_count = int(_truthy_series(stock_stats["obv_macd_cross_up"]).sum()) if not stock_stats.empty and "obv_macd_cross_up" in stock_stats.columns else 0
+    latest_volume_count = int(_truthy_series(stock_stats["latest_volume_3x_prev_9d"]).sum()) if not stock_stats.empty and "latest_volume_3x_prev_9d" in stock_stats.columns else 0
+    minervini_notice = ""
+    if minervini_only and latest.stock_stats is not None and not latest.stock_stats.empty and "minervini_pass" not in latest.stock_stats.columns:
+        minervini_notice = "Minervini results are not available yet. Run Weekly Buy Gains once more to populate them."
+    obv_macd_notice = ""
+    if obv_macd_only and latest.stock_stats is not None and not latest.stock_stats.empty and "obv_macd_cross_up" not in latest.stock_stats.columns:
+        obv_macd_notice = "OBV MACD results are not available yet. Run Weekly Buy Gains once more to populate them."
+    latest_volume_notice = ""
+    if latest_volume_only and latest.stock_stats is not None and not latest.stock_stats.empty and "latest_volume_3x_prev_9d" not in latest.stock_stats.columns:
+        latest_volume_notice = "Latest-volume burst results are not available yet. Run Weekly Buy Gains once more to populate them."
 
     return templates.TemplateResponse(
-        "signal_outcome_study.html",
+        "weekly_buy_gains.html",
         {
             "request": request,
             "app_name": config.get("app", {}).get("name", "Investment Screener"),
             "dashboard_token": request.query_params.get("token", ""),
             "selected_sensitivity": selected_sensitivity,
             "default_sensitivity": base_sensitivity,
-            "summary": latest_summary,
-            "signal_universe": _records(latest_signal_universe.head(150)),
-            "stock_stats": _records(latest_stock_stats.head(150)),
-            "stock_stats_count": stock_stats_count,
-            "pair_details": _records(latest_pair_details.head(400)),
-            "signal_scope": signal_scope,
-            "target_gain_pct": target_gain_text,
+            "summary": latest.summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "gainers": _records(gainers),
+            "gainers_count": profitable_count,
+            "avg_current_gain_pct": avg_gain_value,
+            "profitable_share_pct": round((profitable_count / total_count) * 100.0, 2) if total_count else None,
             "stock_symbols_csv": stock_symbols_csv,
-            "signal_outcome_job": request.query_params.get("signal_outcome_job", ""),
+            "obv_macd_count": obv_macd_count,
+            "latest_volume_count": latest_volume_count,
+            "minervini_only": minervini_only,
+            "minervini_notice": minervini_notice,
+            "obv_macd_only": obv_macd_only,
+            "obv_macd_notice": obv_macd_notice,
+            "latest_volume_only": latest_volume_only,
+            "latest_volume_notice": latest_volume_notice,
+            "start_date": start_date,
+            "stock_search": stock_search,
+            "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
-            "study_error": study_error,
+            "study_error": request.query_params.get("study_error", ""),
             **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
         },
     )
 
 
-@app.post("/signal-outcome-study/run")
-async def run_signal_outcome_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+@app.post("/weekly-buy-gains/run")
+async def run_weekly_buy_gains_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
     config = load_config()
-    form = await request.form()
-    selected_sensitivity = _parse_sensitivity_text(
-        str(form.get("sensitivity", "")),
-        int(config.get("strategy", {}).get("sensitivity", 3)),
-    ) or int(config.get("strategy", {}).get("sensitivity", 3))
-    if selected_sensitivity != int(config.get("strategy", {}).get("sensitivity", 3)):
-        config = deepcopy(config)
-        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
     data_root = get_data_root(config)
-    dashboard_token = request.query_params.get("token", "").strip()
-    signal_scope = str(form.get("signal_scope", "buy")).strip().lower() or "buy"
-    if signal_scope not in {"buy", "sell", "both"}:
-        signal_scope = "buy"
-    target_gain_pct = _optional_float(str(form.get("target_gain_pct", "")).strip()) or 10.0
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    start_date = str(form.get("start_date", WEEKLY_BUY_GAINS_DEFAULT_START_DATE)).strip() or WEEKLY_BUY_GAINS_DEFAULT_START_DATE
+    minervini_only = _truthy_param(form.getlist("minervini_only"), default=False)
+    obv_macd_only = _truthy_param(form.getlist("obv_macd_only"), default=False)
+    latest_volume_only = _truthy_param(form.getlist("latest_volume_only"), default=False)
+    params = [f"start_date={quote(start_date)}"]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    params.append(f"minervini_only={'1' if minervini_only else '0'}")
+    params.append(f"obv_macd_only={'1' if obv_macd_only else '0'}")
+    params.append(f"latest_volume_only={'1' if latest_volume_only else '0'}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(_run_weekly_buy_tracker_job, job_id, config, data_root, query_suffix, start_date)
+        redirect_url = f"/weekly-buy-gains?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = _weekly_buy_gains_error_url(exc, query_suffix)
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/volume-burst", response_class=HTMLResponse)
+def volume_burst_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = load_volume_burst_outputs(_volume_burst_dir(data_root))
+    stock_search = request.query_params.get("stock_search", "").strip()
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+
+    stock_stats = latest.stock_stats.copy()
+    if not stock_stats.empty:
+        if "latest_close_date" in stock_stats.columns:
+            stock_stats["latest_close_date"] = pd.to_datetime(stock_stats["latest_close_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        if matches_only:
+            if "latest_volume_3x_prev_9d" in stock_stats.columns:
+                stock_stats = stock_stats[_truthy_series(stock_stats["latest_volume_3x_prev_9d"])].copy()
+            else:
+                stock_stats = stock_stats.iloc[0:0].copy()
+
+    ratio_series = (
+        pd.to_numeric(stock_stats["latest_volume_ratio_prev_9d"], errors="coerce").dropna()
+        if "latest_volume_ratio_prev_9d" in stock_stats.columns
+        else pd.Series(dtype=float)
+    )
+    return templates.TemplateResponse(
+        "volume_burst.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": latest.summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "stock_symbols_csv": _comma_separated_symbols(stock_stats),
+            "stock_search": stock_search,
+            "matches_only": matches_only,
+            "avg_ratio": round(float(ratio_series.mean()), 2) if not ratio_series.empty else None,
+            "max_ratio": round(float(ratio_series.max()), 2) if not ratio_series.empty else None,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/volume-burst/run")
+async def run_volume_burst_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
     params = []
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
-    params.append(f"sensitivity={selected_sensitivity}")
-    params.append(f"signal_scope={quote(signal_scope)}")
-    params.append(f"target_gain_pct={quote(str(target_gain_pct))}")
-    query_suffix = ("&" + "&".join(params)) if params else ""
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params) if params else ""
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(_run_volume_burst_job, job_id, data_root, query_suffix)
+        redirect_url = f"/volume-burst?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = _volume_burst_error_url(exc, query_suffix)
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/resistance-breaks", response_class=HTMLResponse)
+def resistance_breaks_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = load_resistance_breaks_outputs(_resistance_breaks_dir(data_root))
+    stock_search = request.query_params.get("stock_search", "").strip()
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+    left_bars = int(request.query_params.get("left_bars", latest.summary.get("left_bars", 15)) or 15)
+    right_bars = int(request.query_params.get("right_bars", latest.summary.get("right_bars", 15)) or 15)
+    volume_avg_window = int(request.query_params.get("volume_avg_window", latest.summary.get("volume_avg_window", 20)) or 20)
+    volume_multiplier = float(request.query_params.get("volume_multiplier", latest.summary.get("volume_multiplier", 2.0)) or 2.0)
+    min_break_count = int(request.query_params.get("min_break_count", latest.summary.get("min_break_count", 2)) or 2)
+    recent_window_days = int(request.query_params.get("recent_window_days", latest.summary.get("recent_breakout_window_days", 7)) or 7)
+
+    stock_stats = latest.stock_stats.copy()
+    if not stock_stats.empty:
+        if "latest_close_date" in stock_stats.columns:
+            stock_stats["latest_close_date"] = pd.to_datetime(stock_stats["latest_close_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        if matches_only:
+            if "passes_volume_confirmed_resistance_breaks" in stock_stats.columns:
+                stock_stats = stock_stats[_truthy_series(stock_stats["passes_volume_confirmed_resistance_breaks"])].copy()
+            else:
+                stock_stats = stock_stats.iloc[0:0].copy()
+
+    breakout_events = latest.breakout_events.copy()
+    if not breakout_events.empty:
+        if "date" in breakout_events.columns:
+            breakout_events["date"] = pd.to_datetime(breakout_events["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        if stock_search:
+            breakout_events = _apply_stock_search(breakout_events, stock_search)
+
+    break_counts = (
+        pd.to_numeric(stock_stats["volume_confirmed_resistance_break_count"], errors="coerce").dropna()
+        if "volume_confirmed_resistance_break_count" in stock_stats.columns
+        else pd.Series(dtype=float)
+    )
+    return templates.TemplateResponse(
+        "resistance_breaks.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": latest.summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "breakout_events": _records(breakout_events.head(300)),
+            "breakout_events_count": len(breakout_events),
+            "stock_symbols_csv": _comma_separated_symbols(stock_stats),
+            "stock_search": stock_search,
+            "matches_only": matches_only,
+            "left_bars": left_bars,
+            "right_bars": right_bars,
+            "volume_avg_window": volume_avg_window,
+            "volume_multiplier": volume_multiplier,
+            "min_break_count": min_break_count,
+            "recent_window_days": recent_window_days,
+            "avg_break_count": round(float(break_counts.mean()), 2) if not break_counts.empty else None,
+            "max_break_count": int(break_counts.max()) if not break_counts.empty else None,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/resistance-breaks/run")
+async def run_resistance_breaks_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    left_bars = max(int(str(form.get("left_bars", "15")).strip() or "15"), 1)
+    right_bars = max(int(str(form.get("right_bars", "15")).strip() or "15"), 1)
+    volume_avg_window = max(int(str(form.get("volume_avg_window", "20")).strip() or "20"), 2)
+    volume_multiplier = max(float(str(form.get("volume_multiplier", "2")).strip() or "2"), 0.1)
+    min_break_count = max(int(str(form.get("min_break_count", "2")).strip() or "2"), 1)
+    recent_window_days = max(int(str(form.get("recent_window_days", "7")).strip() or "7"), 1)
+    params = [
+        f"left_bars={left_bars}",
+        f"right_bars={right_bars}",
+        f"volume_avg_window={volume_avg_window}",
+        f"volume_multiplier={quote(str(volume_multiplier))}",
+        f"min_break_count={min_break_count}",
+        f"recent_window_days={recent_window_days}",
+    ]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
 
     try:
         job_id = uuid4().hex
         _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
         background_tasks.add_task(
-            _run_signal_outcome_job,
+            _run_resistance_breaks_job,
             job_id,
-            config,
             data_root,
             query_suffix,
-            signal_scope,
-            float(target_gain_pct),
+            left_bars,
+            right_bars,
+            volume_avg_window,
+            volume_multiplier,
+            min_break_count,
+            recent_window_days,
         )
-        redirect_url = f"/signal-outcome-study?signal_outcome_job={job_id}{query_suffix}"
+        redirect_url = f"/resistance-breaks?study_job={job_id}{query_suffix}"
     except Exception as exc:
-        redirect_url = _signal_outcome_error_url(exc, query_suffix)
+        redirect_url = f"/resistance-breaks?study_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/adx-di", response_class=HTMLResponse)
+def adx_di_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = load_adx_di_outputs(_adx_di_dir(data_root))
+    stock_search = request.query_params.get("stock_search", "").strip()
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+    length = max(int(request.query_params.get("length", latest.summary.get("length", 14)) or 14), 2)
+    threshold = float(request.query_params.get("threshold", latest.summary.get("threshold", 20.0)) or 20.0)
+    cross_lookback_bars = max(int(request.query_params.get("cross_lookback_bars", latest.summary.get("cross_lookback_bars", 3)) or 3), 1)
+    trend_fast_ma_length = max(int(request.query_params.get("trend_fast_ma_length", latest.summary.get("trend_fast_ma_length", 50)) or 50), 2)
+    trend_slow_ma_length = max(int(request.query_params.get("trend_slow_ma_length", latest.summary.get("trend_slow_ma_length", 200)) or 200), trend_fast_ma_length + 1)
+    volume_avg_lookback = max(int(request.query_params.get("volume_avg_lookback", latest.summary.get("volume_avg_lookback", 20)) or 20), 2)
+    min_volume_ratio = max(float(request.query_params.get("min_volume_ratio", latest.summary.get("min_volume_ratio", 1.5)) or 1.5), 0.0)
+    breakout_lookback_days = max(int(request.query_params.get("breakout_lookback_days", latest.summary.get("breakout_lookback_days", 20)) or 20), 2)
+    rs_lookback_days = max(int(request.query_params.get("rs_lookback_days", latest.summary.get("rs_lookback_days", 20)) or 20), 1)
+    min_rs_spread_pct = float(request.query_params.get("min_rs_spread_pct", latest.summary.get("min_rs_spread_pct", 0.0)) or 0.0)
+    require_trend_filter = _truthy_param(request.query_params.getlist("require_trend_filter"), default=False)
+    require_volume_filter = _truthy_param(request.query_params.getlist("require_volume_filter"), default=False)
+    require_breakout_filter = _truthy_param(request.query_params.getlist("require_breakout_filter"), default=False)
+    require_rs_filter = _truthy_param(request.query_params.getlist("require_rs_filter"), default=False)
+    chart_symbol = str(request.query_params.get("chart_symbol", "")).strip().upper()
+    storage = Storage(data_root)
+
+    all_stock_stats = latest.stock_stats.copy()
+    stock_stats = all_stock_stats.copy()
+    if not stock_stats.empty:
+        default_columns: dict[str, Any] = {
+            "di_plus_crosses_in_lookback_bars": 0,
+            "recent_di_plus_cross_dates_csv": "",
+            "latest_di_plus_cross_date": "",
+            "di_plus_cross_above_di_minus_recent": False,
+            "di_plus_cross_above_di_minus_latest": False,
+            "di_plus_lead_pending": False,
+            "trend_fast_ma": pd.NA,
+            "trend_slow_ma": pd.NA,
+            "trend_fast_ma_slope": pd.NA,
+            "trend_slow_ma_slope": pd.NA,
+            "trend_filter_pass": False,
+            "cross_date": "",
+            "cross_close": pd.NA,
+            "cross_volume_ratio": pd.NA,
+            "volume_filter_pass": False,
+            "breakout_level": pd.NA,
+            "breakout_extension_pct": pd.NA,
+            "breakout_filter_pass": False,
+            "rs_stock_return_pct": pd.NA,
+            "rs_benchmark_return_pct": pd.NA,
+            "relative_strength_spread_pct": pd.NA,
+            "rs_filter_pass": False,
+            "quality_score": 0,
+        }
+        for column, default_value in default_columns.items():
+            if column not in stock_stats.columns:
+                stock_stats[column] = default_value
+        metadata = _combined_symbol_metadata(config, storage)
+        stock_stats = _enrich_with_symbol_metadata(stock_stats, metadata, "symbol")
+        if "latest_close_date" in stock_stats.columns:
+            stock_stats["latest_close_date"] = pd.to_datetime(stock_stats["latest_close_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        if matches_only:
+            di_plus_matches = _truthy_series(stock_stats["di_plus_cross_above_di_minus_recent"]) if "di_plus_cross_above_di_minus_recent" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            if len(di_plus_matches) == len(stock_stats):
+                stock_stats = stock_stats[di_plus_matches].copy()
+            else:
+                stock_stats = stock_stats.iloc[0:0].copy()
+        if require_trend_filter and "trend_filter_pass" in stock_stats.columns:
+            stock_stats = stock_stats[_truthy_series(stock_stats["trend_filter_pass"])].copy()
+        if require_volume_filter and "volume_filter_pass" in stock_stats.columns:
+            stock_stats = stock_stats[_truthy_series(stock_stats["volume_filter_pass"])].copy()
+        if require_breakout_filter and "breakout_filter_pass" in stock_stats.columns:
+            stock_stats = stock_stats[_truthy_series(stock_stats["breakout_filter_pass"])].copy()
+        if require_rs_filter and "rs_filter_pass" in stock_stats.columns:
+            stock_stats = stock_stats[_truthy_series(stock_stats["rs_filter_pass"])].copy()
+        if "symbol" in stock_stats.columns:
+            stock_stats["symbol_display"] = stock_stats["symbol"].map(_display_symbol)
+
+    stock_stats, sector_summary, sector_leaders = _build_adx_di_sector_views(stock_stats)
+    adx_di_sorted_stats = stock_stats.copy()
+    if not adx_di_sorted_stats.empty:
+        di_plus = pd.to_numeric(adx_di_sorted_stats.get("latest_di_plus"), errors="coerce")
+        di_minus = pd.to_numeric(adx_di_sorted_stats.get("latest_di_minus"), errors="coerce")
+        adx_di_sorted_stats["di_plus_minus_range"] = di_plus - di_minus
+        adx_di_sorted_stats = adx_di_sorted_stats.sort_values(
+            ["di_plus_cross_above_di_minus_recent", "latest_di_plus_cross_date", "di_plus_minus_range", "symbol"],
+            ascending=[False, False, False, True],
+            na_position="last",
+        )
+
+    visible_symbols = adx_di_sorted_stats.get("symbol", pd.Series(dtype=str)).astype(str).tolist() if not adx_di_sorted_stats.empty else []
+    selected_chart_symbol = chart_symbol if chart_symbol and chart_symbol in visible_symbols else (visible_symbols[0] if visible_symbols else "")
+    chart_symbol_option_rows = [{"value": symbol, "label": _display_symbol(symbol)} for symbol in visible_symbols]
+
+    chart_html = ""
+    chart_message = "Run the ADX / DI scan and choose a visible stock to inspect the chart."
+    selected_chart_name = ""
+    selected_chart_symbol_display = _display_symbol(selected_chart_symbol)
+    if selected_chart_symbol:
+        daily = storage.load_candles("NSE", selected_chart_symbol, "1D")
+        if daily.empty:
+            chart_message = f"No local daily candles found for NSE:{selected_chart_symbol}."
+        else:
+            chart_html = build_adx_di_chart(daily, "NSE", selected_chart_symbol, length=length, threshold=threshold)
+            selected_rows = all_stock_stats[all_stock_stats["symbol"].astype(str).str.upper() == selected_chart_symbol.upper()]
+            if not selected_rows.empty:
+                selected_chart_name = str(selected_rows.iloc[0].get("name", ""))
+            chart_message = ""
+
+    sector_chart_html = build_sector_mix_pie_chart(sector_summary, title="Sector / Industry Mix")
+    adx_series = (
+        pd.to_numeric(stock_stats["latest_adx"], errors="coerce").dropna()
+        if "latest_adx" in stock_stats.columns
+        else pd.Series(dtype=float)
+    )
+    return templates.TemplateResponse(
+        "adx_di.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": latest.summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "stock_symbols_csv": _adx_di_sorted_display_symbols(stock_stats),
+            "sector_summary": _records(sector_summary),
+            "sector_summary_count": len(sector_summary),
+            "sector_leaders": _records(sector_leaders),
+            "sector_chart_html": sector_chart_html,
+            "stock_search": stock_search,
+            "matches_only": matches_only,
+            "length": length,
+            "threshold": threshold,
+            "cross_lookback_bars": cross_lookback_bars,
+            "trend_fast_ma_length": trend_fast_ma_length,
+            "trend_slow_ma_length": trend_slow_ma_length,
+            "volume_avg_lookback": volume_avg_lookback,
+            "min_volume_ratio": min_volume_ratio,
+            "breakout_lookback_days": breakout_lookback_days,
+            "rs_lookback_days": rs_lookback_days,
+            "min_rs_spread_pct": min_rs_spread_pct,
+            "require_trend_filter": require_trend_filter,
+            "require_volume_filter": require_volume_filter,
+            "require_breakout_filter": require_breakout_filter,
+            "require_rs_filter": require_rs_filter,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "chart_html": chart_html,
+            "chart_message": chart_message,
+            "chart_symbol": selected_chart_symbol,
+            "chart_symbol_display": selected_chart_symbol_display,
+            "chart_name": selected_chart_name,
+            "chart_symbol_options": chart_symbol_option_rows,
+            "avg_latest_adx": round(float(adx_series.mean()), 2) if not adx_series.empty else None,
+            "max_latest_adx": round(float(adx_series.max()), 2) if not adx_series.empty else None,
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/adx-di/run")
+async def run_adx_di_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    length = max(int(str(form.get("length", "14")).strip() or "14"), 2)
+    threshold = max(float(str(form.get("threshold", "20")).strip() or "20"), 0.0)
+    cross_lookback_bars = max(int(str(form.get("cross_lookback_bars", "3")).strip() or "3"), 1)
+    trend_fast_ma_length = max(int(str(form.get("trend_fast_ma_length", "50")).strip() or "50"), 2)
+    trend_slow_ma_length = max(int(str(form.get("trend_slow_ma_length", "200")).strip() or "200"), trend_fast_ma_length + 1)
+    volume_avg_lookback = max(int(str(form.get("volume_avg_lookback", "20")).strip() or "20"), 2)
+    min_volume_ratio = max(float(str(form.get("min_volume_ratio", "1.5")).strip() or "1.5"), 0.0)
+    breakout_lookback_days = max(int(str(form.get("breakout_lookback_days", "20")).strip() or "20"), 2)
+    rs_lookback_days = max(int(str(form.get("rs_lookback_days", "20")).strip() or "20"), 1)
+    min_rs_spread_pct = float(str(form.get("min_rs_spread_pct", "0")).strip() or "0")
+    require_trend_filter = _truthy_param(form.getlist("require_trend_filter"), default=False)
+    require_volume_filter = _truthy_param(form.getlist("require_volume_filter"), default=False)
+    require_breakout_filter = _truthy_param(form.getlist("require_breakout_filter"), default=False)
+    require_rs_filter = _truthy_param(form.getlist("require_rs_filter"), default=False)
+    params = [
+        f"length={length}",
+        f"threshold={quote(str(threshold))}",
+        f"cross_lookback_bars={cross_lookback_bars}",
+        f"trend_fast_ma_length={trend_fast_ma_length}",
+        f"trend_slow_ma_length={trend_slow_ma_length}",
+        f"volume_avg_lookback={volume_avg_lookback}",
+        f"min_volume_ratio={quote(str(min_volume_ratio))}",
+        f"breakout_lookback_days={breakout_lookback_days}",
+        f"rs_lookback_days={rs_lookback_days}",
+        f"min_rs_spread_pct={quote(str(min_rs_spread_pct))}",
+    ]
+    if require_trend_filter:
+        params.append("require_trend_filter=1")
+    if require_volume_filter:
+        params.append("require_volume_filter=1")
+    if require_breakout_filter:
+        params.append("require_breakout_filter=1")
+    if require_rs_filter:
+        params.append("require_rs_filter=1")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(
+            _run_adx_di_job,
+            job_id,
+            data_root,
+            query_suffix,
+            length,
+            threshold,
+            cross_lookback_bars,
+            trend_fast_ma_length,
+            trend_slow_ma_length,
+            volume_avg_lookback,
+            min_volume_ratio,
+            breakout_lookback_days,
+            rs_lookback_days,
+            min_rs_spread_pct,
+        )
+        redirect_url = f"/adx-di?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/adx-di?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/qm-quality", response_class=HTMLResponse)
+def qm_quality_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = load_qm_quality_outputs(_qm_quality_dir(data_root))
+    buy_start_date = request.query_params.get("buy_start_date", QM_QUALITY_DEFAULT_START_DATE).strip() or QM_QUALITY_DEFAULT_START_DATE
+    buy_end_date = request.query_params.get("buy_end_date", QM_QUALITY_DEFAULT_END_DATE).strip() or QM_QUALITY_DEFAULT_END_DATE
+    run_mode = request.query_params.get("run_mode", "date_range").strip() or "date_range"
+    price_as_of_date = request.query_params.get("price_as_of_date", "").strip() or str(latest.summary.get("price_as_of_date", "") or "")
+    stock_search = request.query_params.get("stock_search", "").strip()
+
+    stock_stats = latest.stock_stats.copy()
+    if not stock_stats.empty:
+        for column in ("first_april_buy_date", "latest_april_buy_date", "latest_close_date", "as_of_date"):
+            if column in stock_stats.columns:
+                stock_stats[column] = pd.to_datetime(stock_stats[column], errors="coerce").dt.strftime("%Y-%m-%d")
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+    elite = stock_stats.copy()
+    if not elite.empty and "qm_quality_bucket" in elite.columns:
+        elite = elite[elite["qm_quality_bucket"].astype(str).isin(["Elite", "High"])].copy()
+        if "qm_composite_score" in elite.columns:
+            elite["qm_composite_score"] = pd.to_numeric(elite["qm_composite_score"], errors="coerce")
+            elite = elite.sort_values(["qm_composite_score", "current_gain_pct", "symbol"], ascending=[False, False, True], na_position="last")
+
+    return templates.TemplateResponse(
+        "qm_quality.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": latest.summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "elite_stats": _records(elite),
+            "elite_stats_count": len(elite),
+            "buy_start_date": buy_start_date,
+            "buy_end_date": buy_end_date,
+            "run_mode": run_mode,
+            "price_as_of_date": price_as_of_date,
+            "stock_search": stock_search,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/qm-quality/run")
+async def run_qm_quality_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    buy_start_date = str(form.get("buy_start_date", QM_QUALITY_DEFAULT_START_DATE)).strip() or QM_QUALITY_DEFAULT_START_DATE
+    buy_end_date = str(form.get("buy_end_date", QM_QUALITY_DEFAULT_END_DATE)).strip() or QM_QUALITY_DEFAULT_END_DATE
+    price_as_of_date = str(form.get("price_as_of_date", "")).strip()
+    run_mode = str(form.get("run_mode", "date_range")).strip() or "date_range"
+    params = [f"buy_start_date={quote(buy_start_date)}", f"buy_end_date={quote(buy_end_date)}", f"run_mode={quote(run_mode)}"]
+    if price_as_of_date:
+        params.append(f"price_as_of_date={quote(price_as_of_date)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(_run_qm_quality_job, job_id, config, data_root, query_suffix, buy_start_date, buy_end_date, run_mode, price_as_of_date)
+        redirect_url = f"/qm-quality?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = _qm_quality_error_url(exc, query_suffix)
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/minervini-sheet", response_class=HTMLResponse)
+def minervini_sheet_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    google_settings = load_google_sheets_settings(data_root)
+    oauth_status = google_oauth_status(data_root)
+    oauth_client = load_google_oauth_client(data_root)
+    latest = load_minervini_sheet_sync_outputs(_minervini_sheet_sync_dir(data_root))
+    dashboard_token = request.query_params.get("token", "")
+    stock_search = request.query_params.get("stock_search", "").strip()
+    row_updates = latest.row_updates.copy()
+    if not row_updates.empty and stock_search:
+        search = stock_search.upper()
+        mask = (
+            row_updates.get("input_symbol", pd.Series("", index=row_updates.index)).astype(str).str.upper().str.contains(search, na=False)
+            | row_updates.get("resolved_symbol", pd.Series("", index=row_updates.index)).astype(str).str.upper().str.contains(search, na=False)
+        )
+        row_updates = row_updates[mask].copy()
+
+    redirect_uri = _google_oauth_redirect_uri(request)
+    return_to = "/minervini-sheet"
+    token_suffix = ""
+    if dashboard_token:
+        return_to = f"{return_to}?token={quote(str(dashboard_token))}"
+        token_suffix = f"&token={quote(str(dashboard_token))}"
+    if selected_sensitivity:
+        separator = "&" if "?" in return_to else "?"
+        return_to = f"{return_to}{separator}sensitivity={quote(str(selected_sensitivity))}"
+        token_suffix += f"&sensitivity={quote(str(selected_sensitivity))}"
+    login_url = f"/auth/google-sheets/login?return_to={quote(return_to, safe='')}{token_suffix}"
+    login_error = ""
+    if not oauth_client.configured:
+        login_error = "Google OAuth client is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env."
+
+    return templates.TemplateResponse(
+        "minervini_sheet.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": dashboard_token,
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "google_sheets_settings": google_settings,
+            "google_oauth_status": oauth_status,
+            "google_oauth_client_configured": oauth_client.configured,
+            "google_redirect_uri": redirect_uri,
+            "google_login_url": login_url,
+            "google_error": request.query_params.get("google_error", "").strip() or login_error,
+            "google_saved": request.query_params.get("google_saved", "").strip(),
+            "google_login_done": request.query_params.get("google_login_done", "").strip(),
+            "stock_search": stock_search,
+            "summary": latest.summary,
+            "row_updates": _records(row_updates.head(250)),
+            "row_updates_count": len(row_updates),
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/minervini-sheet/google/save")
+async def save_minervini_sheet_settings(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    spreadsheet_id = str(form.get("spreadsheet_id", "")).strip()
+    worksheet_title = str(form.get("worksheet_title", MINERVINI_SHEET_DEFAULT_WORKSHEET_TITLE)).strip() or MINERVINI_SHEET_DEFAULT_WORKSHEET_TITLE
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+
+    params = ["google_saved=1"]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "?" + "&".join(params)
+
+    try:
+        save_google_sheet_target(data_root, spreadsheet_id, worksheet_title)
+        redirect_url = f"/minervini-sheet{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/minervini-sheet?google_error={quote(str(exc)[:500])}"
+        if dashboard_token:
+            redirect_url += f"&token={quote(dashboard_token)}"
+        if sensitivity_text:
+            redirect_url += f"&sensitivity={quote(sensitivity_text)}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.post("/minervini-sheet/run")
+async def run_minervini_sheet_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    params = []
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params) if params else ""
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(_run_minervini_sheet_job, job_id, data_root, query_suffix)
+        redirect_url = f"/minervini-sheet?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/minervini-sheet?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/weekly-buy-tracker", response_class=HTMLResponse)
+def weekly_buy_tracker_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Buy Tracker")
+
+
+@app.post("/weekly-buy-tracker/run")
+async def run_weekly_buy_tracker_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Buy Tracker is temporarily removed from the workspace for now.")
+
+
+@app.post("/weekly-buy-tracker/google/save")
+async def save_weekly_buy_tracker_google_settings(request: Request) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Buy Tracker is temporarily removed from the workspace for now.")
+
+
+@app.post("/weekly-buy-tracker/google/oauth-client/save")
+async def save_weekly_buy_tracker_google_oauth_client(request: Request) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Buy Tracker is temporarily removed from the workspace for now.")
+
+
+@app.get("/auth/google-sheets/login")
+def google_sheets_login(request: Request) -> RedirectResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Dashboard access is required.")
+    config = load_config()
+    data_root = get_data_root(config)
+    redirect_uri = _google_oauth_redirect_uri(request)
+    return_to = str(request.query_params.get("return_to", "/minervini-sheet")).strip() or "/minervini-sheet"
+    try:
+        login_url = build_google_oauth_login_url(data_root, redirect_uri, return_to)
+        return RedirectResponse(login_url, status_code=303)
+    except Exception as exc:
+        return RedirectResponse(_append_query_param(return_to, f"google_error={quote(str(exc)[:500])}"), status_code=303)
+
+
+@app.get("/auth/google-sheets/callback", response_class=HTMLResponse, name="google_sheets_callback")
+def google_sheets_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    config = load_config()
+    data_root = get_data_root(config)
+    redirect_uri = _google_oauth_redirect_uri(request)
+    return_to = "/minervini-sheet"
+    if error:
+        return RedirectResponse(_append_query_param(return_to, f"google_error={quote(str(error)[:500])}"), status_code=303)
+    if not code or not state:
+        return RedirectResponse(_append_query_param(return_to, "google_error=Missing+Google+OAuth+response"), status_code=303)
+    try:
+        outcome = exchange_google_oauth_code(data_root, code=code, state=state, redirect_uri=redirect_uri)
+        return_to = str(outcome.get("return_to", return_to)).strip() or return_to
+        return RedirectResponse(_append_query_param(return_to, "google_login_done=1"), status_code=303)
+    except Exception as exc:
+        return RedirectResponse(_append_query_param(return_to, f"google_error={quote(str(exc)[:500])}"), status_code=303)
+
+
+@app.post("/weekly-buy-tracker/google/export")
+async def export_weekly_buy_tracker_google_sheet(request: Request) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Buy Tracker is temporarily removed from the workspace for now.")
+
+
+@app.get("/rotation-study", response_class=HTMLResponse)
+def rotation_study_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Rotation Study")
+
+
+@app.post("/rotation-study/run")
+async def run_rotation_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Rotation Study is temporarily removed from the workspace for now.")
+
+
+@app.get("/signal-outcome-study", response_class=HTMLResponse)
+def signal_outcome_study_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Signal Outcome")
+
+
+@app.post("/signal-outcome-study/run")
+async def run_signal_outcome_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Signal Outcome is temporarily removed from the workspace for now.")
 
 
 @app.get("/signal-outcome-study/report")
 def download_signal_outcome_study_report() -> FileResponse:
-    config = load_config()
-    data_root = get_data_root(config)
-    study_dir = _signal_outcome_study_dir(data_root)
-    workbook_path = _latest_signal_outcome_paths(data_root)["workbook"]
-    result = load_signal_outcome_outputs(study_dir)
-    if result.stock_stats.empty and not workbook_path.exists():
-        raise HTTPException(status_code=404, detail="Signal outcome study report has not been generated yet.")
-    if not result.stock_stats.empty:
-        write_signal_outcome_workbook(result, workbook_path)
-    return FileResponse(
-        workbook_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="signal_outcome_study_report.xlsx",
-    )
+    raise HTTPException(status_code=404, detail="Signal Outcome is temporarily removed from the workspace for now.")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2989,8 +5386,6 @@ def dashboard(request: Request) -> HTMLResponse:
     _ensure_market_cap_metadata(config, storage)
     filtered = storage.load_signals("latest_filtered.csv")
     raw = storage.load_signals("latest_raw_signals.csv")
-    daily_filtered = storage.load_signals("latest_daily_filtered.csv")
-    daily_raw = storage.load_signals("latest_daily_raw_signals.csv")
     scan_details = storage.load_signals("latest_scan_details.csv")
     metadata = _combined_symbol_metadata(config, storage)
     stock_search = request.query_params.get("stock_search", "").strip()
@@ -3055,25 +5450,18 @@ def dashboard(request: Request) -> HTMLResponse:
 
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     raw = _enrich_with_symbol_metadata(raw, metadata, "symbol")
-    daily_filtered = _enrich_with_symbol_metadata(daily_filtered, metadata, "symbol")
-    daily_raw = _enrich_with_symbol_metadata(daily_raw, metadata, "symbol")
     scan_details = _enrich_with_symbol_metadata(scan_details, metadata, "symbol")
+    filtered = _enrich_with_latest_daily_close(filtered, scan_details, storage)
 
     filtered = _apply_market_cap_filters(filtered, min_market_cap, max_market_cap, selected_market_cap_bucket)
     raw = _apply_market_cap_filters(raw, min_market_cap, max_market_cap, selected_market_cap_bucket)
-    daily_filtered = _apply_market_cap_filters(daily_filtered, min_market_cap, max_market_cap, selected_market_cap_bucket)
-    daily_raw = _apply_market_cap_filters(daily_raw, min_market_cap, max_market_cap, selected_market_cap_bucket)
     scan_details = _apply_market_cap_filters(scan_details, min_market_cap, max_market_cap, selected_market_cap_bucket)
 
-    filtered = _apply_cmp_filters(filtered, min_cmp, max_cmp, "close")
-    raw = _apply_cmp_filters(raw, min_cmp, max_cmp, "close")
-    daily_filtered = _apply_cmp_filters(daily_filtered, min_cmp, max_cmp, "close")
-    daily_raw = _apply_cmp_filters(daily_raw, min_cmp, max_cmp, "close")
+    filtered = _refresh_live_cmp(filtered, data_root)
+    filtered = _apply_cmp_filters(filtered, min_cmp, max_cmp, "latest_close")
 
     filtered = _apply_stock_search(filtered, stock_search)
     raw = _apply_stock_search(raw, stock_search)
-    daily_filtered = _apply_stock_search(daily_filtered, stock_search)
-    daily_raw = _apply_stock_search(daily_raw, stock_search)
     scan_details = _apply_stock_search(scan_details, stock_search)
 
     filtered = enrich_weekly_signal_shortlist_frame(filtered, storage, config)
@@ -3113,7 +5501,25 @@ def dashboard(request: Request) -> HTMLResponse:
     )
     large_deals = _load_big_bull_deals(data_root)
     filtered = _apply_large_deal_markers(filtered, large_deals)
-    daily_filtered = _apply_large_deal_markers(daily_filtered, large_deals)
+
+    raw_symbol_column = _symbol_column(raw)
+    filtered_symbol_column = _symbol_column(filtered)
+    if not raw.empty and raw_symbol_column and filtered_symbol_column:
+        filtered_symbol_pairs = filtered[["exchange", filtered_symbol_column]].copy()
+        filtered_symbol_pairs = filtered_symbol_pairs.dropna(subset=["exchange", filtered_symbol_column])
+        if filtered_symbol_pairs.empty:
+            raw = raw.iloc[0:0].copy()
+        else:
+            filtered_symbol_pairs["exchange"] = filtered_symbol_pairs["exchange"].astype(str).str.upper()
+            filtered_symbol_pairs[filtered_symbol_column] = filtered_symbol_pairs[filtered_symbol_column].astype(str).str.upper()
+            raw = raw.copy()
+            raw["exchange"] = raw["exchange"].astype(str).str.upper()
+            raw[raw_symbol_column] = raw[raw_symbol_column].astype(str).str.upper()
+            raw = raw.merge(
+                filtered_symbol_pairs.rename(columns={filtered_symbol_column: raw_symbol_column}).drop_duplicates(),
+                on=["exchange", raw_symbol_column],
+                how="inner",
+            )
 
     market_cap_bounds = {"min": "", "max": ""}
     if not metadata.empty and "market_cap_cr" in metadata.columns and metadata["market_cap_cr"].notna().any():
@@ -3192,16 +5598,7 @@ def dashboard(request: Request) -> HTMLResponse:
     if not raw_table.empty:
         raw_table["date"] = raw_table["date"].astype(str)
         raw_table = raw_table.sort_values("date", ascending=False)
-
-    daily_filtered_table = daily_filtered.copy()
-    if not daily_filtered_table.empty:
-        daily_filtered_table["date"] = daily_filtered_table["date"].astype(str)
-        daily_filtered_table = daily_filtered_table.sort_values("date", ascending=False)
-
-    daily_raw_table = daily_raw.copy()
-    if not daily_raw_table.empty:
-        daily_raw_table["date"] = daily_raw_table["date"].astype(str)
-        daily_raw_table = daily_raw_table.sort_values("date", ascending=False)
+        raw_table = raw_table.head(500)
 
     return templates.TemplateResponse(
         "dashboard.html",
@@ -3211,9 +5608,9 @@ def dashboard(request: Request) -> HTMLResponse:
             "filtered": _records(filtered),
             "raw_count": len(raw),
             "filtered_count": len(filtered),
-            "daily_filtered": _records(daily_filtered_table),
-            "daily_raw_count": len(daily_raw),
-            "daily_filtered_count": len(daily_filtered),
+            "daily_filtered": [],
+            "daily_raw_count": 0,
+            "daily_filtered_count": 0,
             "token_status": token_status(data_root),
             "scan_details": _records(scan_details),
             "scan_details_count": len(scan_details),
@@ -3230,7 +5627,8 @@ def dashboard(request: Request) -> HTMLResponse:
             "chart_html": chart_html,
             "chart_message": chart_message,
             "all_signals": _records(raw_table),
-            "all_daily_signals": _records(daily_raw_table),
+            "all_signals_preview_count": len(raw_table),
+            "all_daily_signals": [],
             "selected_market_cap_bucket": selected_market_cap_bucket,
             "selected_min_market_cap": request.query_params.get("min_market_cap_cr", ""),
             "selected_max_market_cap": request.query_params.get("max_market_cap_cr", ""),
@@ -3286,6 +5684,7 @@ def dashboard(request: Request) -> HTMLResponse:
             "scan_error": request.query_params.get("scan_error", ""),
             "scan_job": request.query_params.get("scan_job", ""),
             "telegram_sent": request.query_params.get("telegram_sent", ""),
+            "telegram_sent_count": request.query_params.get("telegram_sent_count", ""),
             "telegram_error": request.query_params.get("telegram_error", ""),
             "symbols_scanned": request.query_params.get("symbols_scanned", ""),
             "refresh_mode": request.query_params.get("refresh_mode", ""),
@@ -3380,8 +5779,8 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
     try:
         if market_cap_filter_requested and not _has_market_cap_metadata(storage):
             raise RuntimeError(
-                "Market-cap metadata is missing. Open /stocks and click Fetch NSE Market Caps, "
-                "or run python scripts/import_nse_market_caps.py."
+                "Market-cap metadata is missing. The Stocks page is hidden for now, "
+                "so load it with python scripts/import_nse_market_caps.py."
             )
 
         scan_config = _manual_screener_config(
@@ -3491,6 +5890,14 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             visible_buy_signals,
             _load_big_bull_deals(data_root),
         )
+        visible_buy_signals = _merge_cached_weekday_profiles(
+            config,
+            storage,
+            data_root,
+            visible_buy_signals,
+            exchange_column="exchange",
+            symbol_column="symbol" if "symbol" in visible_buy_signals.columns else "tradingsymbol",
+        )
         filters_text = _buy_signal_filter_summary(
             stock_search,
             market_cap_bucket,
@@ -3511,7 +5918,7 @@ async def send_buy_signals_to_telegram(request: Request) -> RedirectResponse:
             min_risk_reward_ratio_text,
         )
         send_buy_signal_list_to_telegram(config, visible_buy_signals, filters_text=filters_text)
-        status_query = "telegram_sent=1"
+        status_query = f"telegram_sent=1&telegram_sent_count={len(visible_buy_signals)}"
     except Exception as exc:
         status_query = f"telegram_error={quote(str(exc)[:500])}"
 
@@ -3546,11 +5953,9 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
     require_volume_confirmation = str(form.get("require_volume_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
     require_obv_confirmation = str(form.get("require_obv_confirmation", "")).strip().lower() in {"1", "true", "on", "yes"}
     peak_speed_bucket = str(form.get("peak_speed_bucket", "")).strip()
-    technical_rating_status = str(form.get("technical_rating_status", "")).strip()
+    technical_rating_statuses = _normalize_gtt_technical_rating_statuses(form.getlist("technical_rating_status"))
     if peak_speed_bucket not in GTT_PEAK_SPEED_BUCKETS:
         peak_speed_bucket = ""
-    if technical_rating_status not in GTT_TECHNICAL_RATING_FILTERS:
-        technical_rating_status = ""
 
     filter_query = _gtt_filter_query(
         token=dashboard_token,
@@ -3568,7 +5973,7 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
         require_volume_confirmation=require_volume_confirmation,
         require_obv_confirmation=require_obv_confirmation,
         peak_speed_bucket=peak_speed_bucket,
-        technical_rating_status=technical_rating_status,
+        technical_rating_statuses=technical_rating_statuses,
     )
 
     try:
@@ -3590,30 +5995,31 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
             peak_speed_bucket,
             require_volume_confirmation,
             require_obv_confirmation,
-            technical_rating_status,
+            technical_rating_statuses,
         )
         if visible_gtt_stocks.empty:
             raise RuntimeError("No GTT stocks are available to send with the selected filters.")
 
         filters_text = _gtt_filter_summary(
-            stock_search,
-            market_cap_bucket,
-            min_market_cap_text,
-            max_market_cap_text,
-            min_cmp_text,
-            max_cmp_text,
-            open_buy_regime_only,
-            dashboard_buy_only,
-            fresh_weekly_buy_only,
-            fresh_daily_buy_only,
-            trend_only,
+            stock_search=stock_search,
+            sensitivity_text="",
+            market_cap_bucket=market_cap_bucket,
+            min_market_cap_text=min_market_cap_text,
+            max_market_cap_text=max_market_cap_text,
+            min_cmp_text=min_cmp_text,
+            max_cmp_text=max_cmp_text,
+            open_buy_regime_only=open_buy_regime_only,
+            dashboard_buy_only=dashboard_buy_only,
+            fresh_weekly_buy_only=fresh_weekly_buy_only,
+            fresh_daily_buy_only=fresh_daily_buy_only,
+            trend_only=trend_only,
             require_volume_confirmation=require_volume_confirmation,
             require_obv_confirmation=require_obv_confirmation,
             peak_speed_bucket=peak_speed_bucket,
-            technical_rating_status=technical_rating_status,
+            technical_rating_statuses=technical_rating_statuses,
         )
         send_gtt_stock_list_to_telegram(config, visible_gtt_stocks, filters_text=filters_text)
-        status_query = "telegram_sent=1"
+        status_query = f"telegram_sent=1&telegram_sent_count={len(visible_gtt_stocks)}"
     except Exception as exc:
         status_query = f"telegram_error={quote(str(exc)[:500])}"
 
@@ -3623,191 +6029,27 @@ async def send_gtt_list_to_telegram(request: Request) -> RedirectResponse:
 
 @app.get("/signal-qa", response_class=HTMLResponse)
 def signal_qa_page(request: Request) -> HTMLResponse:
-    if not _is_allowed(request):
-        return templates.TemplateResponse(
-            "locked.html",
-            {"request": request, "app_name": "Investment Screener"},
-            status_code=401,
-        )
-
-    config = load_config()
-    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
-    data_root = get_data_root(config)
-    storage = Storage(data_root)
-    _ensure_market_cap_metadata(config, storage)
-
-    filtered = storage.load_signals("latest_filtered.csv")
-    raw = storage.load_signals("latest_raw_signals.csv")
-    scan_details = storage.load_signals("latest_scan_details.csv")
-    instruments = storage.load_instruments()
-    metadata = _combined_symbol_metadata(config, storage)
-
-    filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
-    raw = _enrich_with_symbol_metadata(raw, metadata, "symbol")
-    scan_details = _enrich_with_symbol_metadata(scan_details, metadata, "symbol")
-
-    report = build_signal_quality_report(raw, filtered, scan_details)
-    symbol_search = request.query_params.get("symbol_search", "").strip()
-    candidates = _signal_qa_candidates(filtered, scan_details, instruments, symbol_search)
-    selected_exchange, selected_symbol = _selected_signal_qa_symbol(request, filtered, candidates, symbol_search)
-
-    chart_html = ""
-    latest_summary = {"signal": "NONE", "date": "", "close": ""}
-    strategy_rows = pd.DataFrame()
-    signal_rows = pd.DataFrame()
-    qa_message = "Choose a stock to inspect signal generation."
-
-    if selected_exchange and selected_symbol:
-        daily = storage.load_candles(selected_exchange, selected_symbol, "1D")
-        if daily.empty:
-            qa_message = f"No local OHLC candles found for {selected_exchange}:{selected_symbol}."
-        else:
-            scan_timeframe = config.get("data", {}).get("scan_timeframe", "1W")
-            strategy_cfg = config.get("strategy", {})
-            weekly_anchor = strategy_cfg.get("weekly_anchor", "W-FRI")
-            use_completed_weeks_only = bool(strategy_cfg.get("use_completed_weeks_only", True))
-            strategy_input = daily
-            if scan_timeframe == "1W":
-                strategy_input = resample_daily_to_weekly(daily, weekly_anchor, use_completed_weeks_only)
-
-            strategy_output = run_weekly_buy_sell(strategy_input, config)
-            chart_html = build_signal_chart(strategy_output, selected_exchange, selected_symbol, height=480)
-            latest_summary = latest_signal_summary(strategy_output)
-            strategy_rows = strategy_rows_for_display(strategy_output, limit=120)
-            signal_rows = strategy_rows[strategy_rows["signal"].isin(["BUY", "SELL"])].copy()
-            qa_message = ""
-
-    return templates.TemplateResponse(
-        "signal_qa.html",
-        {
-            "request": request,
-            "app_name": config.get("app", {}).get("name", "Investment Screener"),
-            "dashboard_token": request.query_params.get("token", ""),
-            "selected_sensitivity": selected_sensitivity,
-            "default_sensitivity": base_sensitivity,
-            "report": report,
-            "checks": report["checks"],
-            "issues": report["issues"][:200],
-            "symbol_search": symbol_search,
-            "candidates": _records(candidates.head(200)),
-            "candidate_count": len(candidates),
-            "selected_exchange": selected_exchange,
-            "selected_symbol": selected_symbol,
-            "latest_summary": latest_summary,
-            "chart_html": chart_html,
-            "qa_message": qa_message,
-            "strategy_rows": _records(strategy_rows),
-            "signal_rows": _records(signal_rows),
-            "raw_count": len(raw),
-            "filtered_count": len(filtered),
-            "scan_details_count": len(scan_details),
-        },
-    )
+    return _temporarily_removed_response(request, "Signal QA")
 
 
 @app.post("/watchlist/add/{exchange}/{symbol}")
 async def add_watchlist(request: Request, exchange: str, symbol: str) -> RedirectResponse:
-    config = load_config()
-    storage = Storage(get_data_root(config))
-    storage.add_to_watchlist(exchange, symbol)
-    form = await request.form()
-    dashboard_token = str(form.get("token", "")).strip() or request.query_params.get("token", "").strip()
-    sensitivity = str(form.get("sensitivity", "")).strip() or request.query_params.get("sensitivity", "").strip()
-    params = ["watchlist_added=1"]
-    if dashboard_token:
-        params.append(f"token={quote(dashboard_token)}")
-    if sensitivity:
-        params.append(f"sensitivity={quote(sensitivity)}")
-    return RedirectResponse(f"/stocks?{'&'.join(params)}", status_code=303)
+    raise HTTPException(status_code=404, detail="Stocks is temporarily removed from the workspace for now.")
 
 
 @app.post("/watchlist/remove/{exchange}/{symbol}")
 async def remove_watchlist(request: Request, exchange: str, symbol: str) -> RedirectResponse:
-    config = load_config()
-    storage = Storage(get_data_root(config))
-    storage.remove_from_watchlist(exchange, symbol)
-    form = await request.form()
-    dashboard_token = str(form.get("token", "")).strip() or request.query_params.get("token", "").strip()
-    sensitivity = str(form.get("sensitivity", "")).strip() or request.query_params.get("sensitivity", "").strip()
-    params = ["watchlist_removed=1"]
-    if dashboard_token:
-        params.append(f"token={quote(dashboard_token)}")
-    if sensitivity:
-        params.append(f"sensitivity={quote(sensitivity)}")
-    return RedirectResponse(f"/stocks?{'&'.join(params)}", status_code=303)
+    raise HTTPException(status_code=404, detail="Stocks is temporarily removed from the workspace for now.")
 
 
 @app.post("/stocks/fetch")
 async def fetch_stocks(request: Request) -> RedirectResponse:
-    config = load_config()
-    data_root = get_data_root(config)
-    access_token = load_access_token(data_root)
-    form = await request.form()
-    dashboard_token = str(form.get("token", "")).strip()
-    sensitivity = str(form.get("sensitivity", "")).strip()
-    if not access_token:
-        params = ["message=kite_token_missing"]
-        if dashboard_token:
-            params.append(f"token={quote(dashboard_token)}")
-        if sensitivity:
-            params.append(f"sensitivity={quote(sensitivity)}")
-        return RedirectResponse(f"/login?{'&'.join(params)}", status_code=303)
-
-    provider = KiteDataProvider(access_token=access_token)
-    provider.validate_session()
-    instruments = provider.instruments()
-    storage = Storage(data_root)
-    storage.save_instruments(instruments)
-
-    params = ["refreshed=1"]
-    if dashboard_token:
-        params.append(f"token={quote(dashboard_token)}")
-    if sensitivity:
-        params.append(f"sensitivity={quote(sensitivity)}")
-    return RedirectResponse(f"/stocks?{'&'.join(params)}", status_code=303)
+    raise HTTPException(status_code=404, detail="Stocks is temporarily removed from the workspace for now.")
 
 
 @app.post("/stocks/fetch-market-caps")
 async def fetch_market_caps(request: Request) -> RedirectResponse:
-    config = load_config()
-    data_root = get_data_root(config)
-    storage = Storage(data_root)
-    universe_cfg = config.get("universe", {})
-    form = await request.form()
-    dashboard_token = str(form.get("token", "")).strip()
-    sensitivity = str(form.get("sensitivity", "")).strip()
-    market_cap_cfg = universe_cfg.get("market_cap_source", {})
-    local_path = _resolve_project_path(str(market_cap_cfg.get("local_path", "")))
-    source_url = market_cap_cfg.get("url", DEFAULT_NSE_MARKET_CAP_URL)
-    local_file = market_cap_cfg.get("local_file", "Average_MCAP_July2025ToDecember2025_20260102201101.xlsx")
-    workbook_path = data_root / "instruments" / local_file
-
-    try:
-        bucket_cfg = universe_cfg.get("market_cap_buckets", {})
-        small_max_cr = float(bucket_cfg.get("small_max_cr", 5000))
-        mid_max_cr = float(bucket_cfg.get("mid_max_cr", 20000))
-        market_cap_divisor = market_cap_cfg.get("market_cap_divisor")
-        market_cap_divisor = float(market_cap_divisor) if market_cap_divisor else None
-        if local_path.exists():
-            metadata = load_nse_market_cap_excel(local_path, small_max_cr, mid_max_cr, market_cap_divisor)
-        else:
-            metadata = fetch_market_caps_from_nse_excel(
-                source_url,
-                workbook_path,
-                small_max_cr,
-                mid_max_cr,
-                market_cap_divisor,
-            )
-        storage.save_symbol_metadata(metadata)
-        redirect_url = f"/stocks?market_caps_refreshed=1&market_cap_rows={len(metadata)}"
-    except Exception as exc:
-        redirect_url = f"/stocks?market_cap_error={quote(str(exc)[:500])}"
-
-    if dashboard_token:
-        redirect_url += f"&token={quote(dashboard_token)}"
-    if sensitivity:
-        redirect_url += f"&sensitivity={quote(sensitivity)}"
-    return RedirectResponse(redirect_url, status_code=303)
+    raise HTTPException(status_code=404, detail="Stocks is temporarily removed from the workspace for now.")
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -3834,125 +6076,15 @@ def login_page(request: Request) -> HTMLResponse:
             "selected_sensitivity": selected_sensitivity,
             "default_sensitivity": base_sensitivity,
             **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
         },
     )
 
 
 @app.get("/stocks", response_class=HTMLResponse)
 def stocks_page(request: Request) -> HTMLResponse:
-    if not _is_allowed(request):
-        return templates.TemplateResponse(
-            "locked.html",
-            {"request": request, "app_name": "Investment Screener"},
-            status_code=401,
-        )
-
-    config = load_config()
-    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
-    data_root = get_data_root(config)
-    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
-    storage = Storage(data_root)
-    _ensure_market_cap_metadata(config, storage)
-    instruments = storage.load_instruments()
-
-    stocks = build_universe(instruments, config)
-    watchlist = storage.load_watchlist()
-    watchlist_keys = set(zip(watchlist["exchange"], watchlist["symbol"]))
-    active_stock_filters = False
-    market_cap_filter_requested = bool(
-        request.query_params.get("market_cap_bucket", "").strip()
-        or request.query_params.get("min_market_cap_cr", "").strip()
-        or request.query_params.get("max_market_cap_cr", "").strip()
-    )
-    metadata = _combined_symbol_metadata(config, storage)
-    if not stocks.empty:
-        universe_cfg = config.get("universe", {})
-        restrict_to_metadata_symbols = bool(universe_cfg.get("restrict_to_metadata_symbols", False))
-
-        if not metadata.empty:
-            stocks = stocks.copy()
-            metadata_for_merge = metadata.copy()
-            metadata_for_merge["metadata_symbol_key"] = metadata_for_merge["symbol"].apply(normalize_nse_symbol)
-            stocks["symbol_key"] = stocks["tradingsymbol"].apply(normalize_nse_symbol)
-            merge_type = "inner" if restrict_to_metadata_symbols else "left"
-            stocks = stocks.merge(metadata_for_merge, left_on="symbol_key", right_on="metadata_symbol_key", how=merge_type)
-            stocks = stocks.drop(columns=["symbol_key", "metadata_symbol_key", "symbol"], errors="ignore")
-        elif restrict_to_metadata_symbols:
-            stocks = stocks.iloc[0:0].copy()
-
-        search = request.query_params.get("search", "").strip().upper()
-        selected_industries = request.query_params.getlist("industry")
-        selected_market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
-        min_market_cap = request.query_params.get("min_market_cap_cr", "").strip()
-        max_market_cap = request.query_params.get("max_market_cap_cr", "").strip()
-        active_stock_filters = bool(search or selected_industries or selected_market_cap_bucket or min_market_cap or max_market_cap)
-
-        if search:
-            symbol_match = stocks["tradingsymbol"].astype(str).str.upper().str.contains(search, na=False)
-            name_match = stocks["name"].astype(str).str.upper().str.contains(search, na=False)
-            stocks = stocks[symbol_match | name_match]
-
-        if selected_industries and "industry" in stocks.columns:
-            stocks = stocks[stocks["industry"].isin(selected_industries)]
-
-        if selected_market_cap_bucket and "market_cap_bucket" in stocks.columns:
-            stocks = stocks[stocks["market_cap_bucket"] == selected_market_cap_bucket]
-
-        if min_market_cap and "market_cap_cr" in stocks.columns:
-            stocks = stocks[pd.to_numeric(stocks["market_cap_cr"], errors="coerce") >= float(min_market_cap)]
-
-        if max_market_cap and "market_cap_cr" in stocks.columns:
-            stocks = stocks[pd.to_numeric(stocks["market_cap_cr"], errors="coerce") <= float(max_market_cap)]
-
-        stocks["is_watchlisted"] = [
-            (str(row.exchange).upper(), str(row.tradingsymbol).upper()) in watchlist_keys
-            for row in stocks.itertuples()
-        ]
-        stocks = stocks.sort_values(["exchange", "tradingsymbol"])
-
-    industry_options = []
-    market_cap_bucket_options = []
-    market_cap_bounds = {"min": "", "max": ""}
-    has_market_cap_metadata = False
-    if not metadata.empty:
-        if "industry" in metadata.columns:
-            industry_options = sorted([industry for industry in metadata["industry"].dropna().unique() if str(industry).strip()])
-        if "market_cap_bucket" in metadata.columns:
-            market_cap_bucket_options = sorted(
-                [bucket for bucket in metadata["market_cap_bucket"].dropna().unique() if str(bucket).strip()]
-            )
-        if "market_cap_cr" in metadata.columns and metadata["market_cap_cr"].notna().any():
-            has_market_cap_metadata = True
-            market_cap_bounds = {
-                "min": int(metadata["market_cap_cr"].min()),
-                "max": int(metadata["market_cap_cr"].max()),
-            }
-
-    return templates.TemplateResponse(
-        "stocks.html",
-        {
-            "request": request,
-            "app_name": config.get("app", {}).get("name", "Investment Screener"),
-            "stocks": _records(stocks),
-            "stock_count": len(stocks),
-            "dashboard_token": request.query_params.get("token", ""),
-            "selected_sensitivity": selected_sensitivity,
-            "default_sensitivity": base_sensitivity,
-            "industry_options": industry_options,
-            "selected_industries": request.query_params.getlist("industry"),
-            "market_cap_bucket_options": market_cap_bucket_options,
-            "selected_market_cap_bucket": request.query_params.get("market_cap_bucket", ""),
-            "market_cap_bounds": market_cap_bounds,
-            "selected_min_market_cap": request.query_params.get("min_market_cap_cr", ""),
-            "selected_max_market_cap": request.query_params.get("max_market_cap_cr", ""),
-            "search": request.query_params.get("search", ""),
-            "has_metadata": not metadata.empty,
-            "has_market_cap_metadata": has_market_cap_metadata,
-            "active_stock_filters": active_stock_filters,
-            "market_cap_filter_requested": market_cap_filter_requested,
-            **common_filter_context,
-        },
-    )
+    return _temporarily_removed_response(request, "Stocks")
 
 
 @app.get("/big-bull-deals", response_class=HTMLResponse)

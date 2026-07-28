@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">GOOGLE SHEET MINERVINI SYNC</p>
+      <h1>Update Sheet1 with Minervini pass or fail</h1>
+      <p class="lede">Reads the symbols already present in your Google Sheet, evaluates the existing 8-rule Minervini template on local daily candles, and updates only the Minervini Filter column with 1 or 0.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Google target</h2>
+    {% if google_saved %}
+      <p class="status success">Google Sheet target saved.</p>
+    {% endif %}
+    {% if google_login_done %}
+      <p class="status success">Google login completed. The stored refresh token is ready for future runs.</p>
+    {% endif %}
+    {% if google_error %}
+      <p class="status error">{{ google_error }}</p>
+    {% endif %}
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Minervini sheet sync completed.</p>
+    {% endif %}
+
+    <form action="/minervini-sheet/google/save" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        Spreadsheet ID
+        <input type="text" name="spreadsheet_id" value="{{ google_sheets_settings.spreadsheet_id }}" placeholder="Google Sheet ID">
+      </label>
+      <label>
+        Worksheet title
+        <input type="text" name="worksheet_title" value="{{ google_sheets_settings.worksheet_title or 'Sheet1' }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Save Sheet Target</button>
+      </div>
+    </form>
+
+    <div class="filter-panel compact-form">
+      <div>
+        <strong>OAuth client</strong>
+        <div class="muted">
+          {% if google_oauth_client_configured %}
+            Loaded from `.env`
+          {% else %}
+            Missing `GOOGLE_CLIENT_ID` or `GOOGLE_CLIENT_SECRET`
+          {% endif %}
+        </div>
+      </div>
+      <div>
+        <strong>Redirect URI</strong>
+        <div class="muted"><code>{{ google_redirect_uri }}</code></div>
+      </div>
+      <div>
+        <strong>Google login status</strong>
+        <div class="muted">
+          {% if google_oauth_status.logged_in %}
+            Logged in as {{ google_oauth_status.user_email }}
+          {% elif google_oauth_client_configured %}
+            Client ready. Login still required.
+          {% else %}
+            OAuth client not configured.
+          {% endif %}
+        </div>
+      </div>
+      <div class="filter-actions">
+        <a class="button {% if not google_oauth_client_configured %}disabled{% endif %}" href="{{ google_login_url }}">Login with Google</a>
+      </div>
+    </div>
+
+    <form action="/minervini-sheet/run" method="post" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <div class="filter-actions">
+        <button class="button" type="submit" {% if not google_oauth_status.logged_in or not google_sheets_settings.spreadsheet_id %}disabled{% endif %}>Run Minervini Sheet Update</button>
+      </div>
+    </form>
+
+    {% if study_job %}
+      <div class="scan-progress" id="minervini-sheet-progress" data-job-id="{{ study_job }}">
+        <div class="progress-header">
+          <strong id="minervini-sheet-progress-title">Minervini sheet sync is running</strong>
+          <span id="minervini-sheet-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="minervini-sheet-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="minervini-sheet-progress-detail">Reading the sheet and evaluating local daily candles...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("minervini-sheet-progress");
+          if (!box) return;
+          const jobId = box.dataset.jobId;
+          const title = document.getElementById("minervini-sheet-progress-title");
+          const percent = document.getElementById("minervini-sheet-progress-percent");
+          const fill = document.getElementById("minervini-sheet-progress-fill");
+          const detail = document.getElementById("minervini-sheet-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${jobId}`);
+              if (!response.ok) return;
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "Minervini sheet sync queued" : (status.phase || "Minervini sheet sync is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              detail.textContent = status.current_symbol ? `${status.phase || "Running"}: ${status.current_symbol}` : (status.phase || "Running");
+              if (status.status === "completed") {
+                window.location.href = status.redirect_url || "/minervini-sheet";
+                return;
+              }
+              if (status.status === "failed") {
+                window.location.href = status.redirect_url || "/minervini-sheet?study_error=Sync+failed";
+                return;
+              }
+              window.setTimeout(poll, 1500);
+            } catch (error) {
+              title.textContent = "Minervini sheet sync status unavailable";
+              detail.textContent = "Refresh the page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 800);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Sheet Rows Evaluated</span>
+      <strong>{{ summary.get("sheet_row_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Rows Updated</span>
+      <strong>{{ summary.get("rows_updated", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Minervini Pass</span>
+      <strong>{{ summary.get("minervini_pass_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Missing/Short History</span>
+      <strong>{{ (summary.get("missing_history_count", 0) or 0) + (summary.get("short_history_count", 0) or 0) }}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/minervini-sheet" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <label>
+        Search symbol
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+        {% if summary.get("spreadsheet_url") %}
+          <a class="table-link" href="{{ summary.get('spreadsheet_url') }}" target="_blank" rel="noopener">Open sheet</a>
+        {% endif %}
+      </div>
+    </form>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Sheet Row</th>
+            <th>Input Symbol</th>
+            <th>Resolved Symbol</th>
+            <th>Exchange</th>
+            <th>History Rows</th>
+            <th>Rule Count</th>
+            <th>Minervini Filter</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in row_updates %}
+            <tr>
+              <td>{{ row.get("sheet_row", "") }}</td>
+              <td>{{ row.get("input_symbol", "") }}</td>
+              <td>{{ row.get("resolved_symbol", "") }}</td>
+              <td>{{ row.get("exchange", "") }}</td>
+              <td>{{ row.get("history_rows", "") }}</td>
+              <td>{{ row.get("minervini_rule_count", "") }}</td>
+              <td>{{ row.get("minervini_filter", "") }}</td>
+              <td>{{ row.get("status", "") }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

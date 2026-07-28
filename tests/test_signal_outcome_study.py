@@ -154,29 +154,23 @@ class SignalOutcomeStudyTests(unittest.TestCase):
         self.assertEqual(set(result.signal_universe["symbol"]), {"AAA"})
         self.assertEqual(set(result.stock_stats["symbol"]), {"AAA"})
 
-    def test_signal_outcome_page_gracefully_handles_broken_saved_outputs(self) -> None:
+    def test_signal_outcome_page_is_temporarily_removed(self) -> None:
         from stock_screener.web.main import app
 
         client = TestClient(app)
-        with patch(
-            "stock_screener.web.main.load_signal_outcome_outputs",
-            side_effect=RuntimeError("broken csv"),
-        ):
-            response = client.get("/signal-outcome-study")
+        response = client.get("/signal-outcome-study")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Could not load Signal Outcome Study", response.text)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("Signal Outcome", response.text)
+        self.assertIn("temporarily removed from the workspace", response.text)
 
-    def test_signal_outcome_page_handles_shared_filters_without_type_error(self) -> None:
+    def test_signal_outcome_report_is_temporarily_removed(self) -> None:
         from stock_screener.web.main import app
 
         client = TestClient(app)
-        response = client.get(
-            "/signal-outcome-study?market_cap_bucket=Large%20Cap&min_market_cap_cr=1000&min_cmp=100&stock_search=A"
-        )
+        response = client.get("/signal-outcome-study/report")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("Invalid comparison between dtype=float64 and str", response.text)
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

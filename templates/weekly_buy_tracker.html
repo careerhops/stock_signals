@@ -1,0 +1,210 @@
+{% extends "base.html" %}
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">WEEKLY BUY TRACKER</p>
+      <h1>Weekly BUY history with live sheet export</h1>
+      <p class="lede">Tracks all weekly BUY stocks since the selected date, counts how many times they appeared in sensitivity 2 and 3, and exports a live Google Sheet with GOOGLEFINANCE formulas.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/weekly-buy-tracker/run" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        Start date
+        <input type="date" name="start_date" value="{{ start_date }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Weekly Buy Tracker</button>
+      </div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Weekly Buy Tracker completed.</p>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Stocks With BUY History</span>
+      <strong>{{ summary.get("stocks_with_buy_history", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>S2 BUY Events</span>
+      <strong>{{ summary.get("s2_buy_events", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>S3 BUY Events</span>
+      <strong>{{ summary.get("s3_buy_events", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Latest Local Close Date</span>
+      <strong>{{ summary.get("latest_close_date", "") or "-" }}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <h2>Google Sheets</h2>
+    <p class="muted">Save the target sheet, save a Google OAuth client, then sign in with your Google account. The app will use that stored refresh token for later exports.</p>
+    {% if google_saved %}
+      <p class="status success">Google Sheets settings saved.</p>
+    {% endif %}
+    {% if google_login_done %}
+      <p class="status success">Google login completed. Exports can now use {{ google_oauth_status.user_email or "your saved Google account" }}.</p>
+    {% endif %}
+    {% if google_error %}
+      <p class="status error">{{ google_error }}</p>
+    {% endif %}
+    {% if export_done %}
+      <p class="status success">Exported {{ export_rows }} rows to Google Sheet. {% if export_url %}<a href="{{ export_url }}" target="_blank" rel="noopener">Open sheet</a>{% endif %}</p>
+    {% endif %}
+    <form action="/weekly-buy-tracker/google/save" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <input type="hidden" name="stock_search" value="{{ stock_search }}">
+      <label>
+        Spreadsheet ID
+        <input type="text" name="spreadsheet_id" value="{{ google_sheets_settings.spreadsheet_id }}" placeholder="Google Sheet ID">
+      </label>
+      <label>
+        Worksheet title
+        <input type="text" name="worksheet_title" value="{{ google_sheets_settings.worksheet_title or 'Weekly Buy Tracker' }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Save Sheet Target</button>
+      </div>
+    </form>
+
+    <form action="/weekly-buy-tracker/google/oauth-client/save" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <input type="hidden" name="stock_search" value="{{ stock_search }}">
+      <label class="full-width">
+        Google OAuth Client ID
+        <input type="text" name="google_client_id" value="" placeholder="Google OAuth desktop/web client ID">
+      </label>
+      <label class="full-width">
+        Google OAuth Client Secret
+        <input type="password" name="google_client_secret" value="" placeholder="Google OAuth client secret">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Save Google OAuth Client</button>
+      </div>
+    </form>
+
+    <div class="filter-panel compact-form">
+      <div>
+        <strong>Redirect URI</strong>
+        <div class="muted"><code>{{ google_redirect_uri }}</code></div>
+      </div>
+      <div>
+        <strong>Google Login Status</strong>
+        <div class="muted">
+          {% if google_oauth_status.logged_in %}
+            Logged in as {{ google_oauth_status.user_email }}
+          {% elif google_oauth_status.client_configured %}
+            Client saved. Login still required.
+          {% else %}
+            OAuth client not saved yet.
+          {% endif %}
+        </div>
+      </div>
+      <div class="filter-actions">
+        <a class="button" href="{{ google_login_url }}">Login with Google</a>
+      </div>
+    </div>
+
+    <form action="/weekly-buy-tracker/google/export" method="post" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <input type="hidden" name="stock_search" value="{{ stock_search }}">
+      <div class="filter-actions">
+        <button class="button" type="submit" {% if not stock_stats_count or not google_oauth_status.logged_in %}disabled{% endif %}>Export Current Table To Google Sheet</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/weekly-buy-tracker" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Latest Close</th>
+            <th>Latest Close Date</th>
+            <th>S2 Count</th>
+            <th>S3 Count</th>
+            <th>Total</th>
+            <th>First BUY Date</th>
+            <th>First BUY Price</th>
+            <th>Latest BUY Date</th>
+            <th>Latest BUY Price</th>
+            <th>Gain vs First BUY %</th>
+            <th>Gain vs Latest BUY %</th>
+            <th>Latest S2 BUY Date</th>
+            <th>Latest S2 BUY Price</th>
+            <th>Gain vs Latest S2 %</th>
+            <th>Latest S3 BUY Date</th>
+            <th>Latest S3 BUY Price</th>
+            <th>Gain vs Latest S3 %</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_close_date", "") }}</td>
+              <td>{{ row.get("s2_buy_count", 0) }}</td>
+              <td>{{ row.get("s3_buy_count", 0) }}</td>
+              <td>{{ row.get("total_buy_count", 0) }}</td>
+              <td>{{ row.get("first_buy_date", "") }}</td>
+              <td>{{ row.get("first_buy_price", "")|number }}</td>
+              <td>{{ row.get("latest_buy_date", "") }}</td>
+              <td>{{ row.get("latest_buy_price", "")|number }}</td>
+              <td>{{ row.get("gain_vs_first_buy_pct", "")|number }}</td>
+              <td>{{ row.get("gain_vs_latest_buy_pct", "")|number }}</td>
+              <td>{{ row.get("latest_s2_buy_date", "") }}</td>
+              <td>{{ row.get("latest_s2_buy_price", "")|number }}</td>
+              <td>{{ row.get("gain_vs_latest_s2_buy_pct", "")|number }}</td>
+              <td>{{ row.get("latest_s3_buy_date", "") }}</td>
+              <td>{{ row.get("latest_s3_buy_price", "")|number }}</td>
+              <td>{{ row.get("gain_vs_latest_s3_buy_pct", "")|number }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

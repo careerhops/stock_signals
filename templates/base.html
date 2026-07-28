@@ -5,78 +5,64 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name or "Investment Screener" }}</title>
   <link rel="stylesheet" href="/static/css/styles.css">
+  <link rel="stylesheet" href="/static/css/simpler.css">
 </head>
-<body>
+<body class="simple-ui">
+  {% set _qs = '' %}
+  {% if common_filter_query %}
+    {% set _qs = '?' ~ common_filter_query %}
+  {% elif dashboard_token or selected_sensitivity %}
+    {% set _qs = '?' ~ ('token=' ~ dashboard_token if dashboard_token else '') ~ ('&' if dashboard_token and selected_sensitivity else '') ~ ('sensitivity=' ~ selected_sensitivity if selected_sensitivity else '') %}
+  {% endif %}
+
   <header class="topbar">
-    <div class="topbar-main">
-      <div class="topbar-brand">
-        <p class="eyebrow">End-of-day investment screener</p>
-        <h1>{{ app_name or "Investment Screener" }}</h1>
-        <p class="brand-copy">Signals, studies, and shortlist workflows in one place.</p>
-      </div>
-      {% if common_filter_summary and common_filter_summary != "None" %}
-        <div class="page-status">
-          <span class="status-label">Active shared filters</span>
-          <span class="status-value">{{ common_filter_summary }}</span>
-        </div>
-      {% endif %}
+    <div class="topbar-row">
+      <a class="brand" href="/{{ _qs }}">{{ app_name or "Investment Screener" }}</a>
+      <nav class="topnav" aria-label="Primary">
+        <a class="{% if request.url.path == '/' %}active{% endif %}" href="/{{ _qs }}">Dashboard</a>
+        <a class="{% if request.url.path == '/gtt-gain-study' %}active{% endif %}" href="/gtt-gain-study{{ _qs }}">GTT</a>
+        <a class="{% if request.url.path == '/weekday-study' %}active{% endif %}" href="/weekday-study{{ _qs }}">Weekday Study</a>
+        <a class="{% if request.url.path == '/weekly-buy-gains' %}active{% endif %}" href="/weekly-buy-gains{{ _qs }}">Buy Gains</a>
+        <a class="{% if request.url.path == '/volume-burst' %}active{% endif %}" href="/volume-burst{{ _qs }}">Volume Burst</a>
+        <a class="{% if request.url.path == '/resistance-breaks' %}active{% endif %}" href="/resistance-breaks{{ _qs }}">Resistance Breaks</a>
+        <a class="{% if request.url.path == '/adx-di' %}active{% endif %}" href="/adx-di{{ _qs }}">ADX / DI</a>
+        <a class="{% if request.url.path == '/minervini-sheet' %}active{% endif %}" href="/minervini-sheet{{ _qs }}">Minervini Sheet</a>
+        <a class="{% if request.url.path == '/qm-quality' %}active{% endif %}" href="/qm-quality{{ _qs }}">QM Quality</a>
+        <a class="{% if request.url.path == '/big-bull-deals' %}active{% endif %}" href="/big-bull-deals{{ _qs }}">Deals</a>
+        <a class="{% if request.url.path == '/login' %}active{% endif %}" href="/login{{ _qs }}">Kite</a>
+      </nav>
     </div>
-    <nav class="topnav" aria-label="Primary">
-      <a class="{% if request.url.path == '/' %}active{% endif %}" href="/{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Dashboard</a>
-      <a class="{% if request.url.path == '/stocks' %}active{% endif %}" href="/stocks{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Stocks</a>
-      <a class="{% if request.url.path == '/signal-qa' %}active{% endif %}" href="/signal-qa{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Signal QA</a>
-      <a class="{% if request.url.path == '/backtest' %}active{% endif %}" href="/backtest{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Backtest</a>
-      <a class="{% if request.url.path == '/signal-outcome-study' %}active{% endif %}" href="/signal-outcome-study{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Signal Outcome</a>
-      <a class="{% if request.url.path == '/gtt-gain-study' %}active{% endif %}" href="/gtt-gain-study{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">GTT Study</a>
-      <a class="{% if request.url.path == '/rotation-study' %}active{% endif %}" href="/rotation-study{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Rotation Study</a>
-      <a class="{% if request.url.path == '/big-bull-deals' %}active{% endif %}" href="/big-bull-deals{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Big Bull Deals</a>
-      <a class="{% if request.url.path == '/login' %}active{% endif %}" href="/login{% if common_filter_query %}?{{ common_filter_query }}{% elif dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}">Kite Login</a>
-    </nav>
   </header>
 
   <main class="page-shell">
-    <section class="page-header">
-      <div>
-        <p class="eyebrow">Workspace</p>
-        <h2 class="page-title">
-          {% if request.url.path == '/' %}Dashboard{% elif request.url.path == '/stocks' %}Stocks{% elif request.url.path == '/signal-qa' %}Signal QA{% elif request.url.path == '/backtest' %}Backtest{% elif request.url.path == '/signal-outcome-study' %}Signal Outcome Study{% elif request.url.path == '/gtt-gain-study' %}GTT Study{% elif request.url.path == '/rotation-study' %}Rotation Study{% elif request.url.path == '/big-bull-deals' %}Big Bull Deals{% elif request.url.path == '/login' %}Kite Login{% else %}Workspace{% endif %}
-        </h2>
-      </div>
-    </section>
-
     <div class="page">
       {% if show_shared_filter_form %}
         <section class="panel shared-filter-panel">
-          <details class="shared-filter-details" {% if common_filter_summary == "None" %}{% else %}open{% endif %}>
+          <details class="shared-filter-details" {% if common_filter_summary and common_filter_summary != "None" %}open{% endif %}>
             <summary class="shared-filter-summary">
-              <div>
-                <h3>Common Filters</h3>
-                <p>Shared across the main analysis tabs.</p>
-              </div>
-              <span class="shared-filter-toggle">{% if common_filter_summary and common_filter_summary != "None" %}{{ common_filter_summary }}{% else %}No shared filters applied{% endif %}</span>
+              <span class="shared-filter-title">Filters</span>
+              <span class="shared-filter-toggle">{% if common_filter_summary and common_filter_summary != "None" %}{{ common_filter_summary }}{% else %}None active{% endif %}</span>
             </summary>
             <form action="{{ shared_filter_action | default(request.url.path) }}" method="get" class="filter-panel">
               {% if shared_token %}
                 <input type="hidden" name="token" value="{{ shared_token }}">
               {% endif %}
               <label>
-                Search stock
-                <input type="search" name="stock_search" value="{{ shared_stock_search | default('') }}" placeholder="Symbol or company name">
+                Search
+                <input type="search" name="stock_search" value="{{ shared_stock_search | default('') }}" placeholder="Symbol or company">
               </label>
               <label>
-                Structure Sensitivity
+                Sensitivity
                 <input type="range"
                        name="sensitivity"
                        data-sensitivity-source
-                       min="1"
-                       max="20"
-                       step="1"
+                       min="1" max="20" step="1"
                        value="{{ shared_sensitivity | default(selected_sensitivity) }}"
                        oninput="this.nextElementSibling.value = this.value">
                 <output data-sensitivity-output>{{ shared_sensitivity | default(selected_sensitivity) }}</output>
               </label>
               <label>
-                Market cap bucket
+                Market cap
                 <select name="market_cap_bucket">
                   <option value="">All</option>
                   {% for bucket in shared_market_cap_bucket_options | default([]) %}
@@ -85,11 +71,11 @@
                 </select>
               </label>
               <label>
-                Min market cap (Cr)
+                Min cap (Cr)
                 <input type="number" name="min_market_cap_cr" value="{{ shared_min_market_cap_cr | default('') }}" min="{{ shared_market_cap_bounds.min | default('') }}">
               </label>
               <label>
-                Max market cap (Cr)
+                Max cap (Cr)
                 <input type="number" name="max_market_cap_cr" value="{{ shared_max_market_cap_cr | default('') }}" max="{{ shared_market_cap_bounds.max | default('') }}">
               </label>
               <label>
@@ -102,18 +88,18 @@
               </label>
               <label class="inline-checkbox">
                 <input type="checkbox" name="require_volume_confirmation" value="1" {% if shared_require_volume_confirmation %}checked{% endif %}>
-                Volume confirmed
+                Volume
               </label>
               <label class="inline-checkbox">
                 <input type="checkbox" name="require_trend_confirmation" value="1" {% if shared_require_trend_confirmation %}checked{% endif %}>
-                Daily EMA stack
+                EMA stack
               </label>
               <label class="inline-checkbox">
                 <input type="checkbox" name="require_obv_confirmation" value="1" {% if shared_require_obv_confirmation %}checked{% endif %}>
                 OBV rising
               </label>
               <div class="filter-actions">
-                <button class="button secondary" type="submit">Apply Common Filters</button>
+                <button class="button secondary" type="submit">Apply</button>
                 <a class="table-link" href="{{ shared_filter_action | default(request.url.path) }}{% if shared_token %}?token={{ shared_token }}{% endif %}">Clear</a>
               </div>
             </form>
@@ -128,19 +114,12 @@
     document.addEventListener("DOMContentLoaded", () => {
       const sources = Array.from(document.querySelectorAll("[data-sensitivity-source]"));
       if (!sources.length) return;
-
       const sync = (value) => {
-        document.querySelectorAll("[data-sensitivity-target]").forEach((field) => {
-          field.value = value;
-        });
-        document.querySelectorAll("[data-sensitivity-output]").forEach((output) => {
-          output.textContent = value;
-        });
+        document.querySelectorAll("[data-sensitivity-target]").forEach((field) => { field.value = value; });
+        document.querySelectorAll("[data-sensitivity-output]").forEach((output) => { output.textContent = value; });
       };
-
       const primary = sources[0];
       sync(primary.value);
-
       sources.forEach((source) => {
         source.addEventListener("input", () => sync(source.value));
         source.addEventListener("change", () => sync(source.value));

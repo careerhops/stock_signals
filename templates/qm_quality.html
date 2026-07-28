@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">QUANTITATIVE MOMENTUM QUALITY</p>
+      <h1>{% if summary.get("mode", run_mode) == "latest_weekly_buy_bucket" or run_mode == "latest" %}Latest weekly BUY bucket ranked by momentum quality{% else %}April 2026 BUY cohort ranked by momentum quality{% endif %}</h1>
+      <p class="lede">{% if summary.get("mode", run_mode) == "latest_weekly_buy_bucket" or run_mode == "latest" %}Paper-inspired view of the stocks in the latest weekly BUY bucket. It ranks them by intermediate momentum and frog-in-the-pan style smoothness, then compares that to their gain today.{% else %}Paper-inspired view of the stocks that received weekly BUY signals in April 2026. It ranks them by intermediate momentum and frog-in-the-pan style smoothness, then compares that to their gain today.{% endif %}</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/qm-quality/run" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <input type="hidden" name="run_mode" id="qm-run-mode" value="{{ run_mode }}">
+      <label>
+        BUY start date
+        <input type="date" name="buy_start_date" value="{{ buy_start_date }}">
+      </label>
+      <label>
+        BUY end date
+        <input type="date" name="buy_end_date" value="{{ buy_end_date }}">
+      </label>
+      <label>
+        Price as of date
+        <input type="date" name="price_as_of_date" value="{{ price_as_of_date }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit" onclick="document.getElementById('qm-run-mode').value='date_range'">Run QM Quality</button>
+        <button class="button secondary" type="submit" onclick="document.getElementById('qm-run-mode').value='latest'">Run On Latest Weekly BUY Bucket</button>
+      </div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">QM Quality completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="qm-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="qm-progress-title">QM Quality is running</strong>
+          <span id="qm-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="qm-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="qm-progress-detail">Evaluating momentum path quality for the April BUY cohort...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if study_job %}
+    <script>
+      const qmProgressBox = document.getElementById("qm-progress");
+      const qmProgressTitle = document.getElementById("qm-progress-title");
+      const qmProgressPercent = document.getElementById("qm-progress-percent");
+      const qmProgressFill = document.getElementById("qm-progress-fill");
+      const qmProgressDetail = document.getElementById("qm-progress-detail");
+
+      async function pollQmProgress() {
+        if (!qmProgressBox) return;
+        const jobId = qmProgressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            qmProgressTitle.textContent = "QM Quality status unavailable";
+            qmProgressDetail.textContent = status.error || "Could not find the job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          qmProgressFill.style.width = `${percent}%`;
+          qmProgressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          qmProgressTitle.textContent = status.status === "queued" ? "QM Quality queued" : "QM Quality is running";
+          qmProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} symbols${current}`;
+
+          if (status.status === "completed") {
+            qmProgressTitle.textContent = "QM Quality completed";
+            qmProgressFill.style.width = "100%";
+            qmProgressPercent.textContent = "100%";
+            qmProgressDetail.textContent = "Loading results...";
+            window.location.href = status.redirect_url || "/qm-quality";
+            return;
+          }
+
+          if (status.status === "failed") {
+            qmProgressTitle.textContent = "QM Quality failed";
+            qmProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          qmProgressTitle.textContent = "Waiting for QM Quality";
+          qmProgressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollQmProgress, 1000);
+      }
+
+      pollQmProgress();
+    </script>
+  {% endif %}
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Run Mode</span>
+      <strong>{{ "Latest BUY Bucket" if summary.get("mode", run_mode) == "latest_weekly_buy_bucket" or run_mode == "latest" else "Date Range" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Price As Of</span>
+      <strong>{{ summary.get("price_as_of_date", "") or price_as_of_date or summary.get("latest_close_date", "") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>April BUY Symbols</span>
+      <strong>{{ summary.get("april_buy_symbols", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>April BUY Events</span>
+      <strong>{{ summary.get("april_buy_events", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Profitable Today</span>
+      <strong>{{ summary.get("profitable_today", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Elite QM Count</span>
+      <strong>{{ summary.get("elite_qm_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Outlier Pass Count</span>
+      <strong>{{ summary.get("outlier_pass_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Average Current Gain</span>
+      <strong>{% if summary.get("avg_current_gain_pct") is not none %}{{ summary.get("avg_current_gain_pct")|number }}%{% else %}-{% endif %}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/qm-quality" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="buy_start_date" value="{{ buy_start_date }}">
+      <input type="hidden" name="buy_end_date" value="{{ buy_end_date }}">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>High / Elite Momentum Quality</h2>
+      <p>Paper-inspired shortlist where momentum path is smoother and less dependent on large jumps.</p>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Latest April BUY</th>
+            <th>Current Gain %</th>
+            <th>QM Score</th>
+            <th>QM Bucket</th>
+            <th>12-1 Momentum %</th>
+            <th>Positive Days %</th>
+            <th>Top Gap Share %</th>
+            <th>Outlier Pass</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in elite_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("latest_april_buy_date", "") }}</td>
+              <td>{{ row.get("current_gain_pct", "")|number }}</td>
+              <td>{{ row.get("qm_composite_score", "")|number }}</td>
+              <td>{{ row.get("qm_quality_bucket", "") }}</td>
+              <td>{{ row.get("momentum_12_1_pct", "")|number }}</td>
+              <td>{{ row.get("positive_day_pct", "")|number }}</td>
+              <td>{{ row.get("top_gap_share_pct", "")|number }}</td>
+              <td>{{ "Yes" if row.get("qm_outlier_pass") else "No" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>{% if summary.get("mode", run_mode) == "latest_weekly_buy_bucket" or run_mode == "latest" %}All Latest Weekly BUY Stocks{% else %}All April BUY Stocks{% endif %}</h2>
+      <p>{% if summary.get("mode", run_mode) == "latest_weekly_buy_bucket" or run_mode == "latest" %}QM metrics are computed as of each stock’s latest weekly BUY signal date, then compared with the latest available close.{% else %}QM metrics are computed as of each stock’s latest April 2026 BUY signal date, then compared with the latest available close.{% endif %}</p>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>April BUY Count</th>
+            <th>S2 April Count</th>
+            <th>S3 April Count</th>
+            <th>Latest April BUY</th>
+            <th>April BUY Price</th>
+            <th>Current Price</th>
+            <th>Current Gain %</th>
+            <th>6M %</th>
+            <th>9M %</th>
+            <th>12-1 %</th>
+            <th>Beta 252</th>
+            <th>Positive Days %</th>
+            <th>Top Gap Share %</th>
+            <th>QM Score</th>
+            <th>QM Bucket</th>
+            <th>Outlier Pass</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("april_buy_count", 0) }}</td>
+              <td>{{ row.get("s2_april_buy_count", 0) }}</td>
+              <td>{{ row.get("s3_april_buy_count", 0) }}</td>
+              <td>{{ row.get("latest_april_buy_date", "") }}</td>
+              <td>{{ row.get("latest_april_buy_price", "")|number }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("current_gain_pct", "")|number }}</td>
+              <td>{{ row.get("momentum_6m_pct", "")|number }}</td>
+              <td>{{ row.get("momentum_9m_pct", "")|number }}</td>
+              <td>{{ row.get("momentum_12_1_pct", "")|number }}</td>
+              <td>{{ row.get("beta_252", "")|number }}</td>
+              <td>{{ row.get("positive_day_pct", "")|number }}</td>
+              <td>{{ row.get("top_gap_share_pct", "")|number }}</td>
+              <td>{{ row.get("qm_composite_score", "")|number }}</td>
+              <td>{{ row.get("qm_quality_bucket", "") }}</td>
+              <td>{{ "Yes" if row.get("qm_outlier_pass") else "No" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

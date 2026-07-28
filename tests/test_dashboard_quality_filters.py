@@ -3,16 +3,20 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch, MagicMock
 
 import pandas as pd
 
+from stock_screener.strategy.daily_confirmation import add_latest_daily_confirmation_columns
 from stock_screener.strategy.weekly_shortlist import benchmark_symbol_for_industry
 from stock_screener.data.storage import Storage
 from stock_screener.web.main import (
     _apply_cmp_filters,
     _apply_signal_quality_filters,
     _apply_weekly_shortlist_filters,
+    _enrich_with_latest_daily_close,
     _manual_screener_config,
+    _refresh_live_cmp,
 )
 
 
@@ -60,6 +64,58 @@ class DashboardQualityFilterTests(unittest.TestCase):
 
         self.assertEqual(screener_filtered["symbol"].tolist(), ["PASS"])
         self.assertEqual(gtt_filtered["symbol"].tolist(), ["PASS"])
+
+    def test_latest_daily_confirmation_adds_latest_close_fields(self) -> None:
+        daily = pd.DataFrame(
+            [
+                {"date": "2026-05-04", "close": 100.0, "volume": 1000},
+                {"date": "2026-05-05", "close": 105.5, "volume": 1200},
+            ]
+        )
+        frame = pd.DataFrame([{"symbol": "PASS", "signal": "BUY"}])
+
+        enriched = add_latest_daily_confirmation_columns(frame, daily)
+
+        self.assertEqual(float(enriched.iloc[0]["latest_close"]), 105.5)
+        self.assertIn("2026-05-05", str(enriched.iloc[0]["latest_close_date"]))
+
+    def test_enrich_with_latest_daily_close_backfills_from_scan_details(self) -> None:
+        frame = pd.DataFrame([{"exchange": "NSE", "symbol": "PASS", "close": 100.0}])
+        scan_details = pd.DataFrame(
+            [
+                {
+                    "exchange": "NSE",
+                    "symbol": "PASS",
+                    "latest_close": 105.5,
+                    "latest_close_date": "2026-05-05",
+                }
+            ]
+        )
+
+        enriched = _enrich_with_latest_daily_close(frame, scan_details)
+
+        self.assertEqual(float(enriched.iloc[0]["latest_close"]), 105.5)
+        self.assertEqual(str(enriched.iloc[0]["latest_close_date"]), "2026-05-05")
+
+    def test_refresh_live_cmp_overrides_latest_close_from_live_quote(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"exchange": "NSE", "symbol": "PASS", "latest_close": 105.5, "latest_close_date": "2026-05-05"},
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            with patch("stock_screener.web.main.load_access_token", return_value="token"), patch(
+                "stock_screener.web.main.KiteDataProvider"
+            ) as provider_cls:
+                provider = MagicMock()
+                provider.ltp.return_value = {"NSE:PASS": 111.25}
+                provider_cls.return_value = provider
+
+                refreshed = _refresh_live_cmp(frame, Path(temp_dir))
+
+        self.assertEqual(float(refreshed.iloc[0]["latest_close"]), 111.25)
+        self.assertEqual(str(refreshed.iloc[0]["cmp_source"]), "live")
 
     def test_quality_filters_require_volume_trend_and_return_threshold(self) -> None:
         signals = pd.DataFrame(

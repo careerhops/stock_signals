@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">VOLUME BURST</p>
+      <h1>Latest volume burst scan</h1>
+      <p class="lede">Scans the full local NSE candle universe and flags stocks where the latest daily volume is at least 3x the average of the prior 9 trading days.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/volume-burst/run" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Volume Burst Scan</button>
+      </div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Volume Burst Scan completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="volume-burst-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="volume-burst-progress-title">Volume Burst Scan is running</strong>
+          <span id="volume-burst-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="volume-burst-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="volume-burst-progress-detail">Scanning latest daily volume across the full local NSE universe...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if study_job %}
+    <script>
+      const volumeBurstProgressBox = document.getElementById("volume-burst-progress");
+      const volumeBurstProgressTitle = document.getElementById("volume-burst-progress-title");
+      const volumeBurstProgressPercent = document.getElementById("volume-burst-progress-percent");
+      const volumeBurstProgressFill = document.getElementById("volume-burst-progress-fill");
+      const volumeBurstProgressDetail = document.getElementById("volume-burst-progress-detail");
+
+      async function pollVolumeBurstProgress() {
+        if (!volumeBurstProgressBox) return;
+        const jobId = volumeBurstProgressBox.dataset.jobId;
+
+        try {
+          const response = await fetch(`/scan-status/${jobId}`, { cache: "no-store" });
+          const status = await response.json();
+
+          if (!response.ok) {
+            volumeBurstProgressTitle.textContent = "Volume Burst status unavailable";
+            volumeBurstProgressDetail.textContent = status.error || "Could not find the job.";
+            return;
+          }
+
+          const percent = Number(status.percent || 0);
+          volumeBurstProgressFill.style.width = `${percent}%`;
+          volumeBurstProgressPercent.textContent = `${percent}%`;
+
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          volumeBurstProgressTitle.textContent = status.status === "queued" ? "Volume Burst Scan queued" : "Volume Burst Scan is running";
+          volumeBurstProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} symbols${current}`;
+
+          if (status.status === "completed") {
+            volumeBurstProgressTitle.textContent = "Volume Burst Scan completed";
+            volumeBurstProgressFill.style.width = "100%";
+            volumeBurstProgressPercent.textContent = "100%";
+            volumeBurstProgressDetail.textContent = "Loading results...";
+            window.location.href = status.redirect_url || "/volume-burst";
+            return;
+          }
+
+          if (status.status === "failed") {
+            volumeBurstProgressTitle.textContent = "Volume Burst Scan failed";
+            volumeBurstProgressDetail.textContent = status.error || "The study could not complete.";
+            if (status.redirect_url) {
+              window.location.href = status.redirect_url;
+            }
+            return;
+          }
+        } catch (error) {
+          volumeBurstProgressTitle.textContent = "Waiting for Volume Burst Scan";
+          volumeBurstProgressDetail.textContent = "Still checking progress...";
+        }
+
+        window.setTimeout(pollVolumeBurstProgress, 1000);
+      }
+
+      pollVolumeBurstProgress();
+    </script>
+  {% endif %}
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Symbols Matching Filter</span>
+      <strong>{{ stock_stats_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Universe Scanned</span>
+      <strong>{{ summary.get("symbols_processed", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Average Volume Ratio</span>
+      <strong>{% if avg_ratio is not none %}{{ avg_ratio|number }}x{% else %}-{% endif %}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Highest Volume Ratio</span>
+      <strong>{% if max_ratio is not none %}{{ max_ratio|number }}x{% else %}-{% endif %}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/volume-burst" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="matches_only" value="0">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="matches_only" value="1" {% if matches_only %}checked{% endif %}>
+        Show only latest volume >= 3x prev 9D avg
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="copy-symbols-panel">
+      <div class="copy-symbols-heading">
+        <div>
+          <h2>Filtered Symbols</h2>
+          <p>Comma-separated list of the visible stocks after the volume-burst filter.</p>
+        </div>
+        <div class="copy-symbols-actions">
+          <button class="button secondary" type="button" data-copy-target="volume-burst-symbols-csv">Copy Symbols</button>
+        </div>
+      </div>
+      <textarea id="volume-burst-symbols-csv" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Volume Burst Stocks</h2>
+      <p>Latest daily volume compared with the average of the previous 9 trading days.</p>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Current Price</th>
+            <th>Current Price Date</th>
+            <th>Latest Volume</th>
+            <th>Prev 9D Avg Volume</th>
+            <th>Volume Ratio</th>
+            <th>Pass</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_close_date", "") }}</td>
+              <td>{{ row.get("latest_volume", "")|number }}</td>
+              <td>{{ row.get("prev_9d_avg_volume", "")|number }}</td>
+              <td>{{ row.get("latest_volume_ratio_prev_9d", "")|number }}</td>
+              <td>{% if row.get("latest_volume_3x_prev_9d") %}Yes{% else %}No{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const targetId = button.getAttribute("data-copy-target");
+        const target = targetId ? document.getElementById(targetId) : null;
+        if (!target) return;
+        const text = String(target.value || "").trim();
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1200);
+        } catch (error) {
+          target.focus();
+          target.select();
+          const original = button.textContent;
+          button.textContent = "Select and copy";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1600);
+        }
+      });
+    });
+  </script>
+{% endblock %}

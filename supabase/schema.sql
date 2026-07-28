@@ -70,3 +70,6 @@ create trigger set_nse_large_deals_updated_at
 before update on public.nse_large_deals
 for each row
 execute function public.set_nse_large_deals_updated_at();
+
+
+

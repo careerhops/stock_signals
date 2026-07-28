@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 from fastapi.testclient import TestClient
@@ -18,17 +19,25 @@ from stock_screener.gtt_gain_study import (
 from stock_screener.web.charts import build_gtt_opportunity_chart
 from stock_screener.web.main import (
     _align_gtt_stock_stats_to_latest_universe,
+    _ensure_gtt_s2_to_s3_markers,
     _ensure_gtt_latest_signal_context,
     _apply_gtt_stock_filters,
     _ensure_gtt_weekly_technical_ratings,
     _apply_peak_speed_bucket_filter,
     _build_gtt_universe_audit,
     _gtt_display_summary,
+    _run_gtt_gain_job,
+    _template_ratio,
     app,
 )
 
 
 class GttGainStudyTests(unittest.TestCase):
+    def test_template_ratio_formats_infinite_values_humanly(self) -> None:
+        self.assertEqual(_template_ratio(float("inf")), "No losses")
+        self.assertEqual(_template_ratio(float("-inf")), "No wins")
+        self.assertEqual(_template_ratio(1.5), "1.50")
+
     def test_pair_max_gain_uses_daily_high_between_buy_and_sell_only(self) -> None:
         buy_date = pd.Timestamp("2025-04-21")
         sell_date = pd.Timestamp("2025-08-25")
@@ -285,7 +294,7 @@ class GttGainStudyTests(unittest.TestCase):
     def test_gtt_gain_study_page_shows_selected_filters(self) -> None:
         client = TestClient(app)
         response = client.get(
-            "/gtt-gain-study?open_buy_regime_only=1&dashboard_buy_only=1&fresh_weekly_buy_only=1&fresh_daily_buy_only=1&trend_only=1&technical_rating_status=Strong%20Buy"
+            "/gtt-gain-study?open_buy_regime_only=1&dashboard_buy_only=1&fresh_weekly_buy_only=1&fresh_daily_buy_only=1&trend_only=1&technical_rating_status=Strong%20Buy&technical_rating_status=Buy"
         )
 
         self.assertEqual(response.status_code, 200)
@@ -293,7 +302,7 @@ class GttGainStudyTests(unittest.TestCase):
         self.assertIn("Filter: dashboard BUY signals only", response.text)
         self.assertIn("Filter: fresh weekly BUY only", response.text)
         self.assertIn("Filter: fresh daily BUY only", response.text)
-        self.assertIn("Filter: weekly technical rating is Strong Buy", response.text)
+        self.assertIn("Filter: weekly technical rating is Strong Buy, Buy", response.text)
         self.assertIn("Daily EMA", response.text)
         self.assertIn("GTT Peak Speed Buckets", response.text)
         self.assertNotIn("Apply Fresh weekly BUY only", response.text)
@@ -322,6 +331,69 @@ class GttGainStudyTests(unittest.TestCase):
         self.assertIn("AAA", chart_html)
         self.assertIn("31-60 days", chart_html)
         self.assertIn("Stocks in bucket", chart_html)
+
+    def test_gtt_page_shows_telegram_send_count_feedback(self) -> None:
+        client = TestClient(app)
+
+        response = client.get("/gtt-gain-study?telegram_sent=1&telegram_sent_count=22")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("GTT filtered stock list was sent to Telegram (22 stocks).", response.text)
+
+    def test_run_gtt_gain_job_skips_workbook_generation(self) -> None:
+        result = type(
+            "Result",
+            (),
+            {
+                "summary": {"symbols_processed": 321},
+                "stock_stats": pd.DataFrame([{"exchange": "NSE", "symbol": "AAA"}]),
+                "pair_details": pd.DataFrame(),
+                "open_positions": pd.DataFrame(),
+            },
+        )()
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "stock_screener.web.main.run_gtt_gain_study",
+            return_value=result,
+        ) as run_mock, patch(
+            "stock_screener.web.main.save_gtt_gain_outputs"
+        ) as save_mock, patch(
+            "stock_screener.web.main.write_gtt_gain_workbook"
+        ) as workbook_mock, patch(
+            "stock_screener.web.main._set_scan_job"
+        ) as set_job_mock:
+            _run_gtt_gain_job("job-1", {"strategy": {"sensitivity": 3}}, Path(temp_dir), "")
+
+        run_mock.assert_called_once()
+        save_mock.assert_called_once()
+        workbook_mock.assert_not_called()
+        self.assertGreaterEqual(set_job_mock.call_count, 2)
+        self.assertEqual(set_job_mock.call_args_list[-1].kwargs["status"], "completed")
+
+    def test_gtt_s2_to_s3_markers_stay_blank_without_cached_overlap_data(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"exchange": "NSE", "symbol": "AAA", "name": "A Ltd"},
+                {"exchange": "NSE", "symbol": "BBB", "name": "B Ltd"},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "stock_screener.web.main.load_sensitivity_overlap_outputs"
+        ) as load_mock:
+            load_mock.return_value.summary = {}
+            load_mock.return_value.conversion_details = pd.DataFrame()
+            enriched = _ensure_gtt_s2_to_s3_markers(
+                Path(temp_dir),
+                frame,
+                {"strategy": {"weekly_anchor": "W-FRI", "use_completed_weeks_only": True}},
+            )
+
+        aaa = enriched.loc[enriched["symbol"] == "AAA"].iloc[0]
+        bbb = enriched.loc[enriched["symbol"] == "BBB"].iloc[0]
+        self.assertFalse(bool(aaa["s2_to_s3_next_week_seen"]))
+        self.assertEqual(int(aaa["s2_to_s3_next_week_count"]), 0)
+        self.assertFalse(bool(bbb["s2_to_s3_next_week_seen"]))
+        self.assertEqual(int(bbb["s2_to_s3_next_week_count"]), 0)
 
     def test_peak_speed_bucket_filter_limits_gtt_stock_table(self) -> None:
         frame = pd.DataFrame(
@@ -408,7 +480,13 @@ class GttGainStudyTests(unittest.TestCase):
             frame,
             open_buy_regime_only=False,
             trend_only=False,
-            technical_rating_status="Buy",
+            technical_rating_statuses=["Buy"],
+        )
+        multi_rated = _apply_gtt_stock_filters(
+            frame,
+            open_buy_regime_only=False,
+            trend_only=False,
+            technical_rating_statuses=["Buy", "Strong Buy"],
         )
 
         self.assertEqual(set(open_regime["symbol"]), {"AAA", "CCC"})
@@ -418,6 +496,7 @@ class GttGainStudyTests(unittest.TestCase):
         self.assertEqual(set(obv_confirmed["symbol"]), {"AAA", "CCC"})
         self.assertEqual(set(fresh_daily_buy["symbol"]), {"AAA", "BBB"})
         self.assertEqual(set(buy_rated["symbol"]), {"BBB"})
+        self.assertEqual(set(multi_rated["symbol"]), {"AAA", "BBB"})
 
     def test_gtt_universe_audit_uses_kite_instruments_as_single_universe(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
