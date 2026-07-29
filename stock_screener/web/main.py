@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import date, timedelta
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,7 @@ from stock_screener.data.nse_market_cap import (
     load_nse_market_cap_excel,
 )
 from stock_screener.adx_di_study import (
+    _is_excluded_adx_symbol,
     load_adx_di_outputs,
     run_adx_di_study,
     save_adx_di_outputs,
@@ -3052,6 +3054,103 @@ def _run_resistance_breaks_job(
         )
 
 
+def _fetch_incremental_start_date(existing: pd.DataFrame, history_years: int) -> date:
+    if existing.empty:
+        return date.today() - timedelta(days=365 * int(history_years))
+    last_date = pd.to_datetime(existing["date"], errors="coerce").max()
+    if pd.isna(last_date):
+        return date.today() - timedelta(days=365 * int(history_years))
+    return pd.Timestamp(last_date).date() + timedelta(days=1)
+
+
+def _refresh_adx_di_candles(
+    storage: Storage,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[str]:
+    config = load_config()
+    history_years = int(config.get("data", {}).get("history_years", 10))
+    access_token = load_access_token(storage.data_root)
+    if not access_token:
+        raise RuntimeError("Kite access token not found. Refresh the Kite login before running the ADX screener.")
+
+    provider = KiteDataProvider(access_token=access_token)
+    provider.validate_session()
+    instruments = provider.instruments()
+    storage.save_instruments(instruments)
+
+    nse = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NSE")
+        & (instruments["segment"].astype(str).str.upper() != "INDICES")
+    ].copy()
+    if "instrument_type" in nse.columns:
+        nse = nse[nse["instrument_type"].astype(str).str.upper().isin({"EQ"})].copy()
+    nse["tradingsymbol"] = nse["tradingsymbol"].astype(str).str.upper().str.strip()
+    nse = nse[~nse["tradingsymbol"].apply(_is_excluded_adx_symbol)].drop_duplicates(subset=["tradingsymbol"])
+    candidates = nse.sort_values("tradingsymbol").reset_index(drop=True)
+    today = date.today()
+    refreshed_symbols: list[str] = []
+
+    if progress_callback:
+        progress_callback(
+            {
+                "phase": "Refreshing ADX / DI candles",
+                "completed": 0,
+                "total": len(candidates),
+                "current_symbol": "",
+                "current_exchange": "NSE",
+            }
+        )
+
+    for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
+        symbol = str(instrument["tradingsymbol"]).upper()
+        token = int(instrument["instrument_token"])
+        existing_daily = storage.load_candles("NSE", symbol, "1D")
+        from_date = _fetch_incremental_start_date(existing_daily, history_years)
+        if from_date <= today:
+            new_daily = provider.daily_candles(token, from_date, today)
+            daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
+        else:
+            daily = existing_daily
+        if daily.empty:
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "Refreshing ADX / DI candles",
+                        "completed": completed,
+                        "total": len(candidates),
+                        "current_symbol": symbol,
+                        "current_exchange": "NSE",
+                    }
+                )
+            continue
+        refreshed_symbols.append(symbol)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "Refreshing ADX / DI candles",
+                    "completed": completed,
+                    "total": len(candidates),
+                    "current_symbol": symbol,
+                    "current_exchange": "NSE",
+                }
+            )
+
+    benchmark_rows = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NSE")
+        & (instruments["tradingsymbol"].astype(str).str.upper() == "NIFTY 50")
+    ].drop_duplicates(subset=["tradingsymbol"])
+    if not benchmark_rows.empty:
+        benchmark = benchmark_rows.iloc[0]
+        existing_benchmark = storage.load_candles("NSE_INDEX", "NIFTY 50", "1D")
+        from_date = _fetch_incremental_start_date(existing_benchmark, history_years)
+        if from_date <= today:
+            new_benchmark = provider.daily_candles(int(benchmark["instrument_token"]), from_date, today)
+            storage.merge_and_save_candles("NSE_INDEX", "NIFTY 50", new_benchmark, "1D")
+
+    return refreshed_symbols
+
+
 def _run_adx_di_job(
     job_id: str,
     data_root: Path,
@@ -3066,15 +3165,18 @@ def _run_adx_di_job(
     breakout_lookback_days: int,
     rs_lookback_days: int,
     min_rs_spread_pct: float,
+    atr_channel_ma_length: int,
+    atr_channel_atr_length: int,
+    atr_channel_ma_type: str,
+    atr_lower1_proximity_pct: float,
 ) -> None:
     storage = Storage(data_root)
-    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
     _set_scan_job(
         job_id,
         status="running",
-        phase="Starting ADX / DI scan",
+        phase="Refreshing ADX / DI candles",
         completed=0,
-        total=symbol_total,
+        total=0,
         percent=0,
         current_symbol="",
         current_exchange="NSE",
@@ -3096,9 +3198,13 @@ def _run_adx_di_job(
         )
 
     try:
+        refreshed_symbols = _refresh_adx_di_candles(storage, progress_callback=progress_callback)
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh NSE daily candles were available for the ADX screener run.")
         result = run_adx_di_study(
             storage,
             exchange="NSE",
+            symbols=refreshed_symbols,
             length=length,
             threshold=threshold,
             cross_lookback_bars=cross_lookback_bars,
@@ -3109,6 +3215,10 @@ def _run_adx_di_job(
             breakout_lookback_days=breakout_lookback_days,
             rs_lookback_days=rs_lookback_days,
             min_rs_spread_pct=min_rs_spread_pct,
+            atr_channel_ma_length=atr_channel_ma_length,
+            atr_channel_atr_length=atr_channel_atr_length,
+            atr_channel_ma_type=atr_channel_ma_type,
+            atr_lower1_proximity_pct=atr_lower1_proximity_pct,
             progress_callback=progress_callback,
         )
         save_adx_di_outputs(result, _adx_di_dir(data_root))
@@ -4843,10 +4953,38 @@ def adx_di_page(request: Request) -> HTMLResponse:
     breakout_lookback_days = max(int(request.query_params.get("breakout_lookback_days", latest.summary.get("breakout_lookback_days", 20)) or 20), 2)
     rs_lookback_days = max(int(request.query_params.get("rs_lookback_days", latest.summary.get("rs_lookback_days", 20)) or 20), 1)
     min_rs_spread_pct = float(request.query_params.get("min_rs_spread_pct", latest.summary.get("min_rs_spread_pct", 0.0)) or 0.0)
+    atr_channel_ma_length = max(int(request.query_params.get("atr_channel_ma_length", latest.summary.get("atr_channel_ma_length", 20)) or 20), 1)
+    atr_channel_atr_length = max(int(request.query_params.get("atr_channel_atr_length", latest.summary.get("atr_channel_atr_length", 14)) or 14), 1)
+    atr_channel_ma_type = str(request.query_params.get("atr_channel_ma_type", latest.summary.get("atr_channel_ma_type", "EMA")) or "EMA").strip().upper()
+    if atr_channel_ma_type not in {"EMA", "SMA"}:
+        atr_channel_ma_type = "EMA"
+    atr_lower1_proximity_value = str(request.query_params.get("atr_lower1_proximity_pct", latest.summary.get("atr_lower1_proximity_pct", 2.0)) or 2.0).strip()
+    min_current_price_value = str(request.query_params.get("min_current_price", "")).strip()
+    min_support_distance_value = str(request.query_params.get("min_support_distance_pct", "20")).strip()
+    max_support_distance_value = str(request.query_params.get("max_support_distance_pct", "40")).strip()
+    try:
+        min_current_price = float(min_current_price_value) if min_current_price_value else None
+    except ValueError:
+        min_current_price = None
+    try:
+        min_support_distance_pct = float(min_support_distance_value) if min_support_distance_value else 20.0
+    except ValueError:
+        min_support_distance_pct = 20.0
+    try:
+        max_support_distance_pct = float(max_support_distance_value) if max_support_distance_value else 40.0
+    except ValueError:
+        max_support_distance_pct = 40.0
+    try:
+        atr_lower1_proximity_pct = float(atr_lower1_proximity_value) if atr_lower1_proximity_value else 2.0
+    except ValueError:
+        atr_lower1_proximity_pct = 2.0
     require_trend_filter = _truthy_param(request.query_params.getlist("require_trend_filter"), default=False)
     require_volume_filter = _truthy_param(request.query_params.getlist("require_volume_filter"), default=False)
     require_breakout_filter = _truthy_param(request.query_params.getlist("require_breakout_filter"), default=False)
     require_rs_filter = _truthy_param(request.query_params.getlist("require_rs_filter"), default=False)
+    require_support_filter = _truthy_param(request.query_params.getlist("require_support_filter"), default=False)
+    require_threshold_cross_filter = _truthy_param(request.query_params.getlist("require_threshold_cross_filter"), default=False)
+    require_atr_lower1_filter = _truthy_param(request.query_params.getlist("require_atr_lower1_filter"), default=False)
     chart_symbol = str(request.query_params.get("chart_symbol", "")).strip().upper()
     storage = Storage(data_root)
 
@@ -4859,6 +4997,11 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "latest_di_plus_cross_date": "",
             "di_plus_cross_above_di_minus_recent": False,
             "di_plus_cross_above_di_minus_latest": False,
+            "di_plus_cross_over_threshold_count": 0,
+            "recent_di_plus_cross_over_threshold_dates_csv": "",
+            "latest_di_plus_cross_over_threshold_date": "",
+            "di_plus_cross_over_threshold_recent": False,
+            "di_plus_cross_over_threshold_latest": False,
             "di_plus_lead_pending": False,
             "trend_fast_ma": pd.NA,
             "trend_slow_ma": pd.NA,
@@ -4872,6 +5015,15 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "breakout_level": pd.NA,
             "breakout_extension_pct": pd.NA,
             "breakout_filter_pass": False,
+            "support_level": pd.NA,
+            "support_level_date": "",
+            "support_distance_from_level_pct": pd.NA,
+            "support_filter_pass": False,
+            "atr_channel_ma": pd.NA,
+            "atr_channel_atr": pd.NA,
+            "atr_lower1": pd.NA,
+            "atr_lower1_distance_pct": pd.NA,
+            "atr_lower1_proximity_pass": False,
             "rs_stock_return_pct": pd.NA,
             "rs_benchmark_return_pct": pd.NA,
             "relative_strength_spread_pct": pd.NA,
@@ -4888,8 +5040,9 @@ def adx_di_page(request: Request) -> HTMLResponse:
         stock_stats = _apply_stock_search(stock_stats, stock_search)
         if matches_only:
             di_plus_matches = _truthy_series(stock_stats["di_plus_cross_above_di_minus_recent"]) if "di_plus_cross_above_di_minus_recent" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
-            if len(di_plus_matches) == len(stock_stats):
-                stock_stats = stock_stats[di_plus_matches].copy()
+            di_plus_still_above = _truthy_series(stock_stats["di_plus_above_di_minus"]) if "di_plus_above_di_minus" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            if len(di_plus_matches) == len(stock_stats) and len(di_plus_still_above) == len(stock_stats):
+                stock_stats = stock_stats[di_plus_matches & di_plus_still_above].copy()
             else:
                 stock_stats = stock_stats.iloc[0:0].copy()
         if require_trend_filter and "trend_filter_pass" in stock_stats.columns:
@@ -4900,6 +5053,26 @@ def adx_di_page(request: Request) -> HTMLResponse:
             stock_stats = stock_stats[_truthy_series(stock_stats["breakout_filter_pass"])].copy()
         if require_rs_filter and "rs_filter_pass" in stock_stats.columns:
             stock_stats = stock_stats[_truthy_series(stock_stats["rs_filter_pass"])].copy()
+        if require_threshold_cross_filter and "di_plus_cross_over_threshold_recent" in stock_stats.columns:
+            threshold_matches = _truthy_series(stock_stats["di_plus_cross_over_threshold_recent"])
+            di_plus_still_above = _truthy_series(stock_stats["di_plus_above_di_minus"]) if "di_plus_above_di_minus" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            stock_stats = stock_stats[threshold_matches & di_plus_still_above].copy()
+        if require_atr_lower1_filter and "atr_lower1_distance_pct" in stock_stats.columns:
+            atr_distance = pd.to_numeric(stock_stats["atr_lower1_distance_pct"], errors="coerce")
+            stock_stats = stock_stats[
+                atr_distance.notna()
+                & (atr_distance <= float(atr_lower1_proximity_pct))
+            ].copy()
+        if require_support_filter and "support_distance_from_level_pct" in stock_stats.columns:
+            support_distance = pd.to_numeric(stock_stats["support_distance_from_level_pct"], errors="coerce")
+            stock_stats = stock_stats[
+                support_distance.notna()
+                & (support_distance >= float(min_support_distance_pct))
+                & (support_distance <= float(max_support_distance_pct))
+            ].copy()
+        if min_current_price is not None and "latest_close" in stock_stats.columns:
+            latest_close = pd.to_numeric(stock_stats["latest_close"], errors="coerce")
+            stock_stats = stock_stats[latest_close >= float(min_current_price)].copy()
         if "symbol" in stock_stats.columns:
             stock_stats["symbol_display"] = stock_stats["symbol"].map(_display_symbol)
 
@@ -4968,10 +5141,20 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "breakout_lookback_days": breakout_lookback_days,
             "rs_lookback_days": rs_lookback_days,
             "min_rs_spread_pct": min_rs_spread_pct,
+            "atr_channel_ma_length": atr_channel_ma_length,
+            "atr_channel_atr_length": atr_channel_atr_length,
+            "atr_channel_ma_type": atr_channel_ma_type,
+            "atr_lower1_proximity_pct": atr_lower1_proximity_value,
+            "min_current_price": min_current_price_value,
+            "min_support_distance_pct": min_support_distance_value,
+            "max_support_distance_pct": max_support_distance_value,
             "require_trend_filter": require_trend_filter,
             "require_volume_filter": require_volume_filter,
             "require_breakout_filter": require_breakout_filter,
             "require_rs_filter": require_rs_filter,
+            "require_threshold_cross_filter": require_threshold_cross_filter,
+            "require_atr_lower1_filter": require_atr_lower1_filter,
+            "require_support_filter": require_support_filter,
             "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
             "study_error": request.query_params.get("study_error", ""),
@@ -5008,10 +5191,19 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
     breakout_lookback_days = max(int(str(form.get("breakout_lookback_days", "20")).strip() or "20"), 2)
     rs_lookback_days = max(int(str(form.get("rs_lookback_days", "20")).strip() or "20"), 1)
     min_rs_spread_pct = float(str(form.get("min_rs_spread_pct", "0")).strip() or "0")
+    atr_channel_ma_length = max(int(str(form.get("atr_channel_ma_length", "20")).strip() or "20"), 1)
+    atr_channel_atr_length = max(int(str(form.get("atr_channel_atr_length", "14")).strip() or "14"), 1)
+    atr_channel_ma_type = str(form.get("atr_channel_ma_type", "EMA")).strip().upper() or "EMA"
+    if atr_channel_ma_type not in {"EMA", "SMA"}:
+        atr_channel_ma_type = "EMA"
+    atr_lower1_proximity_pct = max(float(str(form.get("atr_lower1_proximity_pct", "2")).strip() or "2"), 0.0)
     require_trend_filter = _truthy_param(form.getlist("require_trend_filter"), default=False)
     require_volume_filter = _truthy_param(form.getlist("require_volume_filter"), default=False)
     require_breakout_filter = _truthy_param(form.getlist("require_breakout_filter"), default=False)
     require_rs_filter = _truthy_param(form.getlist("require_rs_filter"), default=False)
+    require_threshold_cross_filter = _truthy_param(form.getlist("require_threshold_cross_filter"), default=False)
+    require_atr_lower1_filter = _truthy_param(form.getlist("require_atr_lower1_filter"), default=False)
+    require_support_filter = _truthy_param(form.getlist("require_support_filter"), default=False)
     params = [
         f"length={length}",
         f"threshold={quote(str(threshold))}",
@@ -5023,6 +5215,10 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
         f"breakout_lookback_days={breakout_lookback_days}",
         f"rs_lookback_days={rs_lookback_days}",
         f"min_rs_spread_pct={quote(str(min_rs_spread_pct))}",
+        f"atr_channel_ma_length={atr_channel_ma_length}",
+        f"atr_channel_atr_length={atr_channel_atr_length}",
+        f"atr_channel_ma_type={quote(atr_channel_ma_type)}",
+        f"atr_lower1_proximity_pct={quote(str(atr_lower1_proximity_pct))}",
     ]
     if require_trend_filter:
         params.append("require_trend_filter=1")
@@ -5032,6 +5228,12 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
         params.append("require_breakout_filter=1")
     if require_rs_filter:
         params.append("require_rs_filter=1")
+    if require_threshold_cross_filter:
+        params.append("require_threshold_cross_filter=1")
+    if require_atr_lower1_filter:
+        params.append("require_atr_lower1_filter=1")
+    if require_support_filter:
+        params.append("require_support_filter=1")
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
     if sensitivity_text:
@@ -5056,6 +5258,10 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
             breakout_lookback_days,
             rs_lookback_days,
             min_rs_spread_pct,
+            atr_channel_ma_length,
+            atr_channel_atr_length,
+            atr_channel_ma_type,
+            atr_lower1_proximity_pct,
         )
         redirect_url = f"/adx-di?study_job={job_id}{query_suffix}"
     except Exception as exc:

@@ -1,0 +1,421 @@
+// This work contains code derived from:
+// "Support and Resistance Levels with Breaks" by LuxAlgo
+// Licensed under CC BY-NC-SA 4.0
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// Original Support/Resistance code © LuxAlgo
+// Combined and modified by Halfprisoner - Bikash Debnath
+
+//@version=6
+indicator(
+     title = "EMA 13/26 + Support Resistance + OBV + ATR Channels 1-2-3",
+     shorttitle = "EMA_SR_OBV_ATR",
+     overlay = false,
+     max_bars_back = 1000
+     )
+
+//======================================================
+// EMA SETTINGS
+//======================================================
+
+string emaGroup = "EMA Settings"
+
+bool showEMAs = input.bool(
+     true,
+     "Show EMA Lines",
+     group = emaGroup
+     )
+
+int ema13Length = input.int(
+     13,
+     "EMA 13 Length",
+     minval = 1,
+     group = emaGroup
+     )
+
+int ema26Length = input.int(
+     26,
+     "EMA 26 Length",
+     minval = 1,
+     group = emaGroup
+     )
+
+float ema13 = ta.ema(close, ema13Length)
+float ema26 = ta.ema(close, ema26Length)
+
+// These plots appear on the price chart.
+plot(
+     showEMAs ? ema13 : na,
+     title = "EMA 13",
+     color = color.red,
+     linewidth = 2,
+     force_overlay = true
+     )
+
+plot(
+     showEMAs ? ema26 : na,
+     title = "EMA 26",
+     color = color.blue,
+     linewidth = 2,
+     force_overlay = true
+     )
+
+//======================================================
+// ATR CHANNELS 1-2-3
+//======================================================
+
+string atrGroup = "ATR Channel Settings"
+
+int lengthMA = input.int(
+     20,
+     "MA Length",
+     minval = 1,
+     group = atrGroup
+     )
+
+int lengthATR = input.int(
+     14,
+     "ATR Length",
+     minval = 1,
+     group = atrGroup
+     )
+
+string maType = input.string(
+     "EMA",
+     title = "MA Type",
+     options = ["EMA", "SMA"],
+     group = atrGroup
+     )
+
+// Media
+float ma =
+     maType == "EMA"
+     ? ta.ema(close, lengthMA)
+     : ta.sma(close, lengthMA)
+
+// ATR
+float atr = ta.atr(lengthATR)
+
+// Canales
+float upper1 = ma + atr
+float lower1 = ma - atr
+
+float upper2 = ma + 2 * atr
+float lower2 = ma - 2 * atr
+
+float upper3 = ma + 3 * atr
+float lower3 = ma - 3 * atr
+
+// Plots
+plot(
+     ma,
+     color = color.white,
+     linewidth = 2,
+     title = "ATR Channel MA",
+     force_overlay = true
+     )
+
+plot(
+     upper1,
+     color = color.new(color.green, 0),
+     title = "+1 ATR",
+     force_overlay = true
+     )
+
+plot(
+     lower1,
+     color = color.new(color.green, 0),
+     title = "-1 ATR",
+     force_overlay = true
+     )
+
+plot(
+     upper2,
+     color = color.new(color.orange, 0),
+     title = "+2 ATR",
+     force_overlay = true
+     )
+
+plot(
+     lower2,
+     color = color.new(color.orange, 0),
+     title = "-2 ATR",
+     force_overlay = true
+     )
+
+plot(
+     upper3,
+     color = color.new(color.red, 0),
+     title = "+3 ATR",
+     force_overlay = true
+     )
+
+plot(
+     lower3,
+     color = color.new(color.red, 0),
+     title = "-3 ATR",
+     force_overlay = true
+     )
+
+//======================================================
+// SUPPORT AND RESISTANCE SETTINGS
+//======================================================
+
+string srGroup = "Support and Resistance Settings"
+
+bool showLevels = input.bool(
+     true,
+     "Show Support and Resistance",
+     group = srGroup
+     )
+
+bool showBreaks = input.bool(
+     true,
+     "Show Break Labels",
+     group = srGroup
+     )
+
+int leftBars = input.int(
+     15,
+     "Left Bars",
+     minval = 1,
+     group = srGroup
+     )
+
+int rightBars = input.int(
+     15,
+     "Right Bars",
+     minval = 1,
+     group = srGroup
+     )
+
+float volumeThreshold = input.float(
+     20.0,
+     "Volume Threshold",
+     minval = 0,
+     step = 1,
+     group = srGroup
+     )
+
+//======================================================
+// SUPPORT AND RESISTANCE CALCULATION
+//======================================================
+
+float resistanceLevel =
+     fixnan(ta.pivothigh(leftBars, rightBars)[1])
+
+float supportLevel =
+     fixnan(ta.pivotlow(leftBars, rightBars)[1])
+
+color resistanceColor =
+     ta.change(resistanceLevel) != 0
+     ? na
+     : color.red
+
+color supportColor =
+     ta.change(supportLevel) != 0
+     ? na
+     : #233DEE
+
+plot(
+     showLevels ? resistanceLevel : na,
+     title = "Resistance",
+     color = resistanceColor,
+     linewidth = 3,
+     offset = -(rightBars + 1),
+     force_overlay = true
+     )
+
+plot(
+     showLevels ? supportLevel : na,
+     title = "Support",
+     color = supportColor,
+     linewidth = 3,
+     offset = -(rightBars + 1),
+     force_overlay = true
+     )
+
+//======================================================
+// VOLUME OSCILLATOR
+//======================================================
+
+float volumeShortEMA = ta.ema(volume, 5)
+float volumeLongEMA = ta.ema(volume, 10)
+
+float volumeOscillator =
+     volumeLongEMA != 0
+     ? 100 * (volumeShortEMA - volumeLongEMA) / volumeLongEMA
+     : 0
+
+bool crossedBelowSupport =
+     ta.crossunder(close, supportLevel)
+
+bool crossedAboveResistance =
+     ta.crossover(close, resistanceLevel)
+
+//======================================================
+// BREAK CONDITIONS
+//======================================================
+
+bool supportBreak =
+     showBreaks and
+     crossedBelowSupport and
+     not (open - close < high - open) and
+     volumeOscillator > volumeThreshold
+
+bool resistanceBreak =
+     showBreaks and
+     crossedAboveResistance and
+     not (open - low > close - open) and
+     volumeOscillator > volumeThreshold
+
+bool bullWick =
+     showBreaks and
+     crossedAboveResistance and
+     open - low > close - open
+
+bool bearWick =
+     showBreaks and
+     crossedBelowSupport and
+     open - close < high - open
+
+//======================================================
+// BREAK LABELS ON PRICE CHART
+//======================================================
+
+plotshape(
+     supportBreak,
+     title = "Support Break",
+     text = "B",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny,
+     force_overlay = true
+     )
+
+plotshape(
+     resistanceBreak,
+     title = "Resistance Break",
+     text = "B",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.green,
+     textcolor = color.white,
+     size = size.tiny,
+     force_overlay = true
+     )
+
+plotshape(
+     bullWick,
+     title = "Bull Wick",
+     text = "Bull Wick",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.green,
+     textcolor = color.white,
+     size = size.tiny,
+     force_overlay = true
+     )
+
+plotshape(
+     bearWick,
+     title = "Bear Wick",
+     text = "Bear Wick",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny,
+     force_overlay = true
+     )
+
+//======================================================
+// OBV SETTINGS
+//======================================================
+
+string obvGroup = "OBV Settings"
+
+bool showOBV = input.bool(
+     true,
+     "Show OBV",
+     group = obvGroup
+     )
+
+int obvSmaLength = input.int(
+     100,
+     "OBV SMA Length",
+     minval = 1,
+     group = obvGroup
+     )
+
+// Manual On-Balance Volume calculation
+float volumeDirection =
+     close > close[1]
+     ? volume
+     : close < close[1]
+     ? -volume
+     : 0
+
+float obvValue = ta.cum(volumeDirection)
+
+// Moving average of OBV
+float obvSma = ta.sma(obvValue, obvSmaLength)
+
+//======================================================
+// OBV LOWER PANEL
+//======================================================
+
+// These plots do not use force_overlay,
+// so they appear in the separate lower pane.
+
+plot(
+     showOBV ? obvValue : na,
+     title = "OBV",
+     color = color.teal,
+     linewidth = 2
+     )
+
+plot(
+     showOBV ? obvSma : na,
+     title = "OBV 100 SMA",
+     color = color.orange,
+     linewidth = 3
+     )
+
+//======================================================
+// ALERT CONDITIONS
+//======================================================
+
+bool obvBullishCross =
+     ta.crossover(obvValue, obvSma)
+
+bool obvBearishCross =
+     ta.crossunder(obvValue, obvSma)
+
+alertcondition(
+     obvBullishCross,
+     title = "OBV Crossed Above SMA",
+     message = "OBV crossed above its moving average."
+     )
+
+alertcondition(
+     obvBearishCross,
+     title = "OBV Crossed Below SMA",
+     message = "OBV crossed below its moving average."
+     )
+
+alertcondition(
+     crossedBelowSupport and
+     volumeOscillator > volumeThreshold,
+     title = "Support Broken",
+     message = "Support Broken"
+     )
+
+alertcondition(
+     crossedAboveResistance and
+     volumeOscillator > volumeThreshold,
+     title = "Resistance Broken",
+     message = "Resistance Broken"
+     )

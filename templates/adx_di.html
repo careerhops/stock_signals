@@ -55,6 +55,25 @@
         Min RS Spread %
         <input type="number" name="min_rs_spread_pct" step="0.1" value="{{ min_rs_spread_pct }}">
       </label>
+      <label>
+        ATR Channel MA Length
+        <input type="number" name="atr_channel_ma_length" min="1" value="{{ atr_channel_ma_length }}">
+      </label>
+      <label>
+        ATR Channel ATR Length
+        <input type="number" name="atr_channel_atr_length" min="1" value="{{ atr_channel_atr_length }}">
+      </label>
+      <label>
+        ATR Channel MA Type
+        <select name="atr_channel_ma_type">
+          <option value="EMA" {% if atr_channel_ma_type == "EMA" %}selected{% endif %}>EMA</option>
+          <option value="SMA" {% if atr_channel_ma_type == "SMA" %}selected{% endif %}>SMA</option>
+        </select>
+      </label>
+      <label>
+        ATR -1 Proximity %
+        <input type="number" name="atr_lower1_proximity_pct" min="0" step="0.1" value="{{ atr_lower1_proximity_pct }}">
+      </label>
       <div class="filter-actions">
         <button class="button" type="submit">Run DI+ / DI- Scan</button>
       </div>
@@ -175,6 +194,10 @@
       <input type="hidden" name="breakout_lookback_days" value="{{ breakout_lookback_days }}">
       <input type="hidden" name="rs_lookback_days" value="{{ rs_lookback_days }}">
       <input type="hidden" name="min_rs_spread_pct" value="{{ min_rs_spread_pct }}">
+      <input type="hidden" name="atr_channel_ma_length" value="{{ atr_channel_ma_length }}">
+      <input type="hidden" name="atr_channel_atr_length" value="{{ atr_channel_atr_length }}">
+      <input type="hidden" name="atr_channel_ma_type" value="{{ atr_channel_ma_type }}">
+      <input type="hidden" name="atr_lower1_proximity_pct" value="{{ atr_lower1_proximity_pct }}">
       <input type="hidden" name="matches_only" value="0">
       <label>
         Search stock
@@ -183,6 +206,18 @@
       <label class="inline-checkbox">
         <input type="checkbox" name="matches_only" value="1" {% if matches_only %}checked{% endif %}>
         Show only DI+ crossing above DI- signals
+      </label>
+      <label>
+        Min CMP
+        <input type="number" name="min_current_price" min="0" step="0.01" value="{{ min_current_price }}" placeholder="e.g. 100">
+      </label>
+      <label>
+        Support Distance % Min
+        <input type="number" name="min_support_distance_pct" min="0" step="0.1" value="{{ min_support_distance_pct }}">
+      </label>
+      <label>
+        Support Distance % Max
+        <input type="number" name="max_support_distance_pct" min="0" step="0.1" value="{{ max_support_distance_pct }}">
       </label>
       <label class="inline-checkbox">
         <input type="checkbox" name="require_trend_filter" value="1" {% if require_trend_filter %}checked{% endif %}>
@@ -199,6 +234,18 @@
       <label class="inline-checkbox">
         <input type="checkbox" name="require_rs_filter" value="1" {% if require_rs_filter %}checked{% endif %}>
         Relative strength filter
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_threshold_cross_filter" value="1" {% if require_threshold_cross_filter %}checked{% endif %}>
+        DI+ cross above threshold
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_atr_lower1_filter" value="1" {% if require_atr_lower1_filter %}checked{% endif %}>
+        Close to ATR -1
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_support_filter" value="1" {% if require_support_filter %}checked{% endif %}>
+        Support distance filter
       </label>
       <div class="filter-actions">
         <button class="button secondary" type="submit">Apply</button>
@@ -328,6 +375,13 @@
       <input type="hidden" name="breakout_lookback_days" value="{{ breakout_lookback_days }}">
       <input type="hidden" name="rs_lookback_days" value="{{ rs_lookback_days }}">
       <input type="hidden" name="min_rs_spread_pct" value="{{ min_rs_spread_pct }}">
+      <input type="hidden" name="min_current_price" value="{{ min_current_price }}">
+      <input type="hidden" name="min_support_distance_pct" value="{{ min_support_distance_pct }}">
+      <input type="hidden" name="max_support_distance_pct" value="{{ max_support_distance_pct }}">
+      <input type="hidden" name="atr_channel_ma_length" value="{{ atr_channel_ma_length }}">
+      <input type="hidden" name="atr_channel_atr_length" value="{{ atr_channel_atr_length }}">
+      <input type="hidden" name="atr_channel_ma_type" value="{{ atr_channel_ma_type }}">
+      <input type="hidden" name="atr_lower1_proximity_pct" value="{{ atr_lower1_proximity_pct }}">
       <input type="hidden" name="stock_search" value="{{ stock_search }}">
       {% if matches_only %}
         <input type="hidden" name="matches_only" value="1">
@@ -343,6 +397,15 @@
       {% endif %}
       {% if require_rs_filter %}
         <input type="hidden" name="require_rs_filter" value="1">
+      {% endif %}
+      {% if require_threshold_cross_filter %}
+        <input type="hidden" name="require_threshold_cross_filter" value="1">
+      {% endif %}
+      {% if require_atr_lower1_filter %}
+        <input type="hidden" name="require_atr_lower1_filter" value="1">
+      {% endif %}
+      {% if require_support_filter %}
+        <input type="hidden" name="require_support_filter" value="1">
       {% endif %}
       <label>
         Stock
@@ -390,12 +453,23 @@
             <th>DI+ Crosses In Window</th>
             <th>Recent DI+ Cross Dates</th>
             <th>Latest DI+ Cross Date</th>
+            <th>DI+ Cross &gt; Threshold</th>
+            <th>Recent Threshold Cross Dates</th>
             <th>Trend Pass</th>
             <th>Cross Vol Ratio</th>
             <th>Volume Pass</th>
             <th>Breakout Level</th>
             <th>Breakout Ext %</th>
             <th>Breakout Pass</th>
+            <th>Support Level</th>
+            <th>Support Date</th>
+            <th>Close vs Support %</th>
+            <th>Support Pass</th>
+            <th>ATR MA</th>
+            <th>ATR</th>
+            <th>ATR -1</th>
+            <th>Close vs ATR -1 %</th>
+            <th>ATR -1 Pass</th>
             <th>RS Spread %</th>
             <th>RS Pass</th>
             <th>Quality Score</th>
@@ -419,12 +493,23 @@
               <td>{{ row.get("di_plus_crosses_in_lookback_bars", "") }}</td>
               <td>{{ row.get("recent_di_plus_cross_dates_csv", "") }}</td>
               <td>{{ row.get("latest_di_plus_cross_date", "") }}</td>
+              <td>{% if row.get("di_plus_cross_over_threshold_recent") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("recent_di_plus_cross_over_threshold_dates_csv", "") }}</td>
               <td>{% if row.get("trend_filter_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("cross_volume_ratio", "")|number }}</td>
               <td>{% if row.get("volume_filter_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("breakout_level", "")|number }}</td>
               <td>{{ row.get("breakout_extension_pct", "")|number }}</td>
               <td>{% if row.get("breakout_filter_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("support_level", "")|number }}</td>
+              <td>{{ row.get("support_level_date", "") }}</td>
+              <td>{{ row.get("support_distance_from_level_pct", "")|number }}</td>
+              <td>{% if row.get("support_filter_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("atr_channel_ma", "")|number }}</td>
+              <td>{{ row.get("atr_channel_atr", "")|number }}</td>
+              <td>{{ row.get("atr_lower1", "")|number }}</td>
+              <td>{{ row.get("atr_lower1_distance_pct", "")|number }}</td>
+              <td>{% if row.get("atr_lower1_proximity_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("relative_strength_spread_pct", "")|number }}</td>
               <td>{% if row.get("rs_filter_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("quality_score", "") }}</td>

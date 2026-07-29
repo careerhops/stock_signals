@@ -17,6 +17,17 @@ class AdxDiStudyResult:
     stock_stats: pd.DataFrame
 
 
+def _is_excluded_adx_symbol(symbol: str) -> bool:
+    value = str(symbol or "").strip().upper()
+    if not value:
+        return True
+    if "-" in value:
+        return True
+    if value.endswith("ETF"):
+        return True
+    return any(character.isdigit() for character in value)
+
+
 def calculate_adx_di(frame: pd.DataFrame, length: int = 14, threshold: float = 20.0) -> pd.DataFrame:
     prepared = frame.copy()
     prepared["date"] = pd.to_datetime(prepared["date"], errors="coerce")
@@ -85,6 +96,11 @@ def calculate_adx_di(frame: pd.DataFrame, length: int = 14, threshold: float = 2
         & (prepared["adx"] < prepared["di_plus"])
         & (prepared["adx"] < prepared["di_minus"])
     )
+    prepared["di_plus_crossed_above_di_minus_over_threshold"] = (
+        prepared["di_plus_crossed_above_di_minus"]
+        & (prepared["di_plus"] > float(threshold))
+        & (prepared["di_minus"] > float(threshold))
+    )
     prepared["adx_crossed_above_di_minus"] = (
         prepared["adx"].shift(1).notna()
         & prepared["di_minus"].shift(1).notna()
@@ -117,6 +133,7 @@ def run_adx_di_study(
     storage: Storage,
     exchange: str = "NSE",
     *,
+    symbols: list[str] | None = None,
     length: int = 14,
     threshold: float = 20.0,
     cross_lookback_bars: int = 3,
@@ -127,16 +144,31 @@ def run_adx_di_study(
     breakout_lookback_days: int = 20,
     rs_lookback_days: int = 20,
     min_rs_spread_pct: float = 0.0,
+    support_left_bars: int = 15,
+    support_right_bars: int = 15,
+    atr_channel_ma_length: int = 20,
+    atr_channel_atr_length: int = 14,
+    atr_channel_ma_type: str = "EMA",
+    atr_lower1_proximity_pct: float = 2.0,
     max_staleness_days: int = 10,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AdxDiStudyResult:
     data_root = storage.data_root
     benchmark_daily = _prepare_benchmark_daily(storage.load_candles("NSE_INDEX", "NIFTY 50", "1D"))
-    all_symbols = sorted(
-        p.stem
-        for p in (data_root / "candles" / exchange / "1D").glob("*.csv")
-        if "-" not in p.stem
-    )
+    if symbols is None:
+        all_symbols = sorted(
+            p.stem
+            for p in (data_root / "candles" / exchange / "1D").glob("*.csv")
+            if not _is_excluded_adx_symbol(p.stem)
+        )
+    else:
+        all_symbols = sorted(
+            {
+                str(symbol or "").strip().upper()
+                for symbol in symbols
+                if not _is_excluded_adx_symbol(str(symbol or "").strip().upper())
+            }
+        )
     name_map = _load_name_map(storage, exchange)
 
     rows: list[dict[str, Any]] = []
@@ -173,14 +205,25 @@ def run_adx_di_study(
 
         latest = frame.iloc[-1]
         di_plus_cross_series = frame["di_plus_crossed_above_di_minus"].fillna(False)
+        di_plus_cross_over_threshold_series = frame["di_plus_crossed_above_di_minus_over_threshold"].fillna(False)
         cross_series = frame["adx_bullish_cross_above_di_minus"].fillna(False)
         recent_di_plus_cross_rows = frame.iloc[-int(cross_lookback_bars):].loc[di_plus_cross_series.iloc[-int(cross_lookback_bars):]]
         all_di_plus_cross_rows = frame.loc[di_plus_cross_series]
         latest_di_plus_cross_row = all_di_plus_cross_rows.iloc[-1] if not all_di_plus_cross_rows.empty else None
+        recent_di_plus_cross_over_threshold_rows = frame.iloc[-int(cross_lookback_bars):].loc[
+            di_plus_cross_over_threshold_series.iloc[-int(cross_lookback_bars):]
+        ]
+        all_di_plus_cross_over_threshold_rows = frame.loc[di_plus_cross_over_threshold_series]
+        latest_di_plus_cross_over_threshold_row = (
+            all_di_plus_cross_over_threshold_rows.iloc[-1] if not all_di_plus_cross_over_threshold_rows.empty else None
+        )
         recent_cross_rows = frame.iloc[-int(cross_lookback_bars):].loc[cross_series.iloc[-int(cross_lookback_bars):]]
         all_cross_rows = frame.loc[cross_series]
         latest_cross_row = all_cross_rows.iloc[-1] if not all_cross_rows.empty else None
         recent_di_plus_cross_dates = [pd.Timestamp(value).strftime("%Y-%m-%d") for value in recent_di_plus_cross_rows["date"].tolist()]
+        recent_di_plus_cross_over_threshold_dates = [
+            pd.Timestamp(value).strftime("%Y-%m-%d") for value in recent_di_plus_cross_over_threshold_rows["date"].tolist()
+        ]
         recent_cross_dates = [pd.Timestamp(value).strftime("%Y-%m-%d") for value in recent_cross_rows["date"].tolist()]
 
         latest_di_plus_cross_ts = pd.Timestamp(latest_di_plus_cross_row["date"]) if latest_di_plus_cross_row is not None else pd.NaT
@@ -205,6 +248,12 @@ def run_adx_di_study(
             breakout_lookback_days=int(breakout_lookback_days),
             rs_lookback_days=int(rs_lookback_days),
             min_rs_spread_pct=float(min_rs_spread_pct),
+            support_left_bars=int(support_left_bars),
+            support_right_bars=int(support_right_bars),
+            atr_channel_ma_length=int(atr_channel_ma_length),
+            atr_channel_atr_length=int(atr_channel_atr_length),
+            atr_channel_ma_type=str(atr_channel_ma_type or "EMA"),
+            atr_lower1_proximity_pct=float(atr_lower1_proximity_pct),
         )
 
         rows.append(
@@ -225,6 +274,17 @@ def run_adx_di_study(
                 "latest_di_plus_cross_date": pd.Timestamp(latest_di_plus_cross_row["date"]).strftime("%Y-%m-%d") if latest_di_plus_cross_row is not None else "",
                 "di_plus_cross_above_di_minus_recent": bool(not recent_di_plus_cross_rows.empty),
                 "di_plus_cross_above_di_minus_latest": bool(di_plus_cross_series.iloc[-1]) if len(di_plus_cross_series) else False,
+                "di_plus_cross_over_threshold_count": int(len(recent_di_plus_cross_over_threshold_rows)),
+                "recent_di_plus_cross_over_threshold_dates_csv": ",".join(recent_di_plus_cross_over_threshold_dates),
+                "latest_di_plus_cross_over_threshold_date": (
+                    pd.Timestamp(latest_di_plus_cross_over_threshold_row["date"]).strftime("%Y-%m-%d")
+                    if latest_di_plus_cross_over_threshold_row is not None
+                    else ""
+                ),
+                "di_plus_cross_over_threshold_recent": bool(not recent_di_plus_cross_over_threshold_rows.empty),
+                "di_plus_cross_over_threshold_latest": (
+                    bool(di_plus_cross_over_threshold_series.iloc[-1]) if len(di_plus_cross_over_threshold_series) else False
+                ),
                 "di_plus_lead_pending": di_plus_lead_pending,
                 "adx_above_threshold": bool(pd.notna(latest.get("adx")) and float(latest.get("adx")) >= float(threshold)),
                 "crosses_in_lookback_bars": int(len(recent_cross_rows)),
@@ -250,6 +310,10 @@ def run_adx_di_study(
             stock_stats.loc[stale_mask, "recent_di_plus_cross_dates_csv"] = ""
             stock_stats.loc[stale_mask, "di_plus_cross_above_di_minus_recent"] = False
             stock_stats.loc[stale_mask, "di_plus_cross_above_di_minus_latest"] = False
+            stock_stats.loc[stale_mask, "di_plus_cross_over_threshold_count"] = 0
+            stock_stats.loc[stale_mask, "recent_di_plus_cross_over_threshold_dates_csv"] = ""
+            stock_stats.loc[stale_mask, "di_plus_cross_over_threshold_recent"] = False
+            stock_stats.loc[stale_mask, "di_plus_cross_over_threshold_latest"] = False
             stock_stats.loc[stale_mask, "di_plus_lead_pending"] = False
             stock_stats.loc[stale_mask, "crosses_in_lookback_bars"] = 0
             stock_stats.loc[stale_mask, "recent_cross_dates_csv"] = ""
@@ -261,6 +325,7 @@ def run_adx_di_study(
             "latest_adx",
             "adx_minus_di_minus_gap",
             "di_plus_crosses_in_lookback_bars",
+            "di_plus_cross_over_threshold_count",
             "crosses_in_lookback_bars",
             "trend_fast_ma",
             "trend_slow_ma",
@@ -269,6 +334,12 @@ def run_adx_di_study(
             "cross_volume_ratio",
             "breakout_level",
             "breakout_extension_pct",
+            "support_level",
+            "support_distance_from_level_pct",
+            "atr_channel_ma",
+            "atr_channel_atr",
+            "atr_lower1",
+            "atr_lower1_distance_pct",
             "rs_stock_return_pct",
             "rs_benchmark_return_pct",
             "relative_strength_spread_pct",
@@ -297,6 +368,12 @@ def run_adx_di_study(
         breakout_lookback_days=breakout_lookback_days,
         rs_lookback_days=rs_lookback_days,
         min_rs_spread_pct=min_rs_spread_pct,
+        support_left_bars=support_left_bars,
+        support_right_bars=support_right_bars,
+        atr_channel_ma_length=atr_channel_ma_length,
+        atr_channel_atr_length=atr_channel_atr_length,
+        atr_channel_ma_type=atr_channel_ma_type,
+        atr_lower1_proximity_pct=atr_lower1_proximity_pct,
         max_staleness_days=max_staleness_days,
     )
     return AdxDiStudyResult(summary=summary, stock_stats=stock_stats)
@@ -368,6 +445,12 @@ def _evaluate_quality_metrics(
     breakout_lookback_days: int,
     rs_lookback_days: int,
     min_rs_spread_pct: float,
+    support_left_bars: int,
+    support_right_bars: int,
+    atr_channel_ma_length: int,
+    atr_channel_atr_length: int,
+    atr_channel_ma_type: str,
+    atr_lower1_proximity_pct: float,
 ) -> dict[str, Any]:
     close = pd.to_numeric(frame["close"], errors="coerce")
     high = pd.to_numeric(frame["high"], errors="coerce")
@@ -423,6 +506,24 @@ def _evaluate_quality_metrics(
     rs_filter_pass = bool(
         pd.notna(relative_strength_spread_pct) and float(relative_strength_spread_pct) >= float(min_rs_spread_pct)
     )
+    support_level, support_level_date, support_distance_from_level_pct, support_filter_pass = _support_snapshot(
+        frame,
+        left_bars=int(support_left_bars),
+        right_bars=int(support_right_bars),
+    )
+    (
+        atr_channel_ma,
+        atr_channel_atr,
+        atr_lower1,
+        atr_lower1_distance_pct,
+        atr_lower1_proximity_pass,
+    ) = _atr_lower1_snapshot(
+        frame,
+        ma_length=int(atr_channel_ma_length),
+        atr_length=int(atr_channel_atr_length),
+        ma_type=str(atr_channel_ma_type or "EMA"),
+        proximity_pct=float(atr_lower1_proximity_pct),
+    )
     quality_score = int(sum([trend_filter_pass, volume_filter_pass, breakout_filter_pass, rs_filter_pass]))
 
     return {
@@ -442,8 +543,109 @@ def _evaluate_quality_metrics(
         "rs_benchmark_return_pct": rs_benchmark_return_pct,
         "relative_strength_spread_pct": relative_strength_spread_pct,
         "rs_filter_pass": rs_filter_pass,
+        "support_level": support_level,
+        "support_level_date": support_level_date,
+        "support_distance_from_level_pct": support_distance_from_level_pct,
+        "support_filter_pass": support_filter_pass,
+        "atr_channel_ma": atr_channel_ma,
+        "atr_channel_atr": atr_channel_atr,
+        "atr_lower1": atr_lower1,
+        "atr_lower1_distance_pct": atr_lower1_distance_pct,
+        "atr_lower1_proximity_pass": atr_lower1_proximity_pass,
         "quality_score": quality_score,
     }
+
+
+def _support_snapshot(
+    frame: pd.DataFrame,
+    *,
+    left_bars: int = 15,
+    right_bars: int = 15,
+) -> tuple[float | pd.NA, str, float | pd.NA, bool]:
+    if frame.empty or int(left_bars) < 1 or int(right_bars) < 1:
+        return (pd.NA, "", pd.NA, False)
+
+    lows = pd.to_numeric(frame["low"], errors="coerce").reset_index(drop=True)
+    closes = pd.to_numeric(frame["close"], errors="coerce").reset_index(drop=True)
+    dates = pd.to_datetime(frame["date"], errors="coerce").reset_index(drop=True)
+    if lows.empty or closes.empty or dates.empty:
+        return (pd.NA, "", pd.NA, False)
+
+    left_min = lows.shift(1).rolling(int(left_bars), min_periods=int(left_bars)).min()
+    right_min = lows.iloc[::-1].shift(1).rolling(int(right_bars), min_periods=int(right_bars)).min().iloc[::-1]
+    pivot_mask = left_min.notna() & right_min.notna() & lows.notna() & (lows <= left_min) & (lows < right_min)
+    pivot_lows = lows.where(pivot_mask)
+    pivot_dates = dates.where(pivot_mask)
+
+    # Mirrors fixnan(ta.pivotlow(leftBars, rightBars)[1]) as a forward-held latest pivot support.
+    support_series = pivot_lows.shift(1).ffill()
+    support_date_series = pivot_dates.shift(1).ffill()
+
+    latest_close = _to_float(closes.iloc[-1]) if len(closes) else None
+    latest_support = _to_float(support_series.iloc[-1]) if len(support_series) else None
+    latest_support_date = ""
+    latest_support_ts = support_date_series.iloc[-1] if len(support_date_series) else pd.NaT
+    if pd.notna(latest_support_ts):
+        latest_support_date = pd.Timestamp(latest_support_ts).strftime("%Y-%m-%d")
+    support_distance_from_level_pct: float | pd.NA = pd.NA
+    support_filter_pass = False
+    if latest_support is not None and latest_support > 0 and latest_close is not None:
+        support_distance_from_level_pct = ((latest_close - latest_support) / latest_support) * 100.0
+        support_filter_pass = bool(20.0 <= float(support_distance_from_level_pct) <= 40.0)
+    return (latest_support if latest_support is not None else pd.NA, latest_support_date, support_distance_from_level_pct, support_filter_pass)
+
+
+def _atr_lower1_snapshot(
+    frame: pd.DataFrame,
+    *,
+    ma_length: int = 20,
+    atr_length: int = 14,
+    ma_type: str = "EMA",
+    proximity_pct: float = 2.0,
+) -> tuple[float | pd.NA, float | pd.NA, float | pd.NA, float | pd.NA, bool]:
+    if frame.empty or int(ma_length) < 1 or int(atr_length) < 1:
+        return (pd.NA, pd.NA, pd.NA, pd.NA, False)
+
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    if close.empty or high.empty or low.empty:
+        return (pd.NA, pd.NA, pd.NA, pd.NA, False)
+
+    ma_type_value = str(ma_type or "EMA").strip().upper()
+    if ma_type_value == "SMA":
+        ma = close.rolling(int(ma_length), min_periods=int(ma_length)).mean()
+    else:
+        ma = close.ewm(span=int(ma_length), adjust=False, min_periods=int(ma_length)).mean()
+
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = _pine_rma(true_range, int(atr_length))
+    lower1 = ma - atr
+
+    latest_close = _to_float(close.iloc[-1]) if len(close) else None
+    latest_ma = _to_float(ma.iloc[-1]) if len(ma) else None
+    latest_atr = _to_float(atr.iloc[-1]) if len(atr) else None
+    latest_lower1 = _to_float(lower1.iloc[-1]) if len(lower1) else None
+    atr_lower1_distance_pct: float | pd.NA = pd.NA
+    atr_lower1_proximity_pass = False
+    if latest_close is not None and latest_lower1 is not None and latest_lower1 > 0:
+        atr_lower1_distance_pct = abs((latest_close - latest_lower1) / latest_lower1) * 100.0
+        atr_lower1_proximity_pass = bool(float(atr_lower1_distance_pct) <= float(proximity_pct))
+    return (
+        latest_ma if latest_ma is not None else pd.NA,
+        latest_atr if latest_atr is not None else pd.NA,
+        latest_lower1 if latest_lower1 is not None else pd.NA,
+        atr_lower1_distance_pct,
+        atr_lower1_proximity_pass,
+    )
 
 
 def _relative_strength_snapshot(frame: pd.DataFrame, benchmark_daily: pd.DataFrame, lookback_days: int) -> tuple[float | pd.NA, float | pd.NA, float | pd.NA]:
@@ -469,6 +671,26 @@ def _relative_strength_snapshot(frame: pd.DataFrame, benchmark_daily: pd.DataFra
     return (stock_return, benchmark_return, stock_return - benchmark_return)
 
 
+def _pine_rma(values: pd.Series, length: int) -> pd.Series:
+    series = pd.to_numeric(values, errors="coerce")
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+    if series.empty or int(length) < 1:
+        return result
+    if len(series) < int(length):
+        return result
+    seed = series.iloc[: int(length)].mean()
+    result.iloc[int(length) - 1] = seed
+    previous = seed
+    for index in range(int(length), len(series)):
+        value = series.iloc[index]
+        if pd.isna(value):
+            result.iloc[index] = previous
+            continue
+        previous = ((previous * (float(length) - 1.0)) + float(value)) / float(length)
+        result.iloc[index] = previous
+    return result
+
+
 def _build_summary(
     exchange: str,
     symbols_processed: int,
@@ -484,6 +706,12 @@ def _build_summary(
     breakout_lookback_days: int,
     rs_lookback_days: int,
     min_rs_spread_pct: float,
+    support_left_bars: int,
+    support_right_bars: int,
+    atr_channel_ma_length: int,
+    atr_channel_atr_length: int,
+    atr_channel_ma_type: str,
+    atr_lower1_proximity_pct: float,
     max_staleness_days: int,
 ) -> dict[str, Any]:
     latest_date = ""
@@ -519,5 +747,11 @@ def _build_summary(
         "breakout_lookback_days": int(breakout_lookback_days),
         "rs_lookback_days": int(rs_lookback_days),
         "min_rs_spread_pct": float(min_rs_spread_pct),
+        "support_left_bars": int(support_left_bars),
+        "support_right_bars": int(support_right_bars),
+        "atr_channel_ma_length": int(atr_channel_ma_length),
+        "atr_channel_atr_length": int(atr_channel_atr_length),
+        "atr_channel_ma_type": str(atr_channel_ma_type or "EMA"),
+        "atr_lower1_proximity_pct": float(atr_lower1_proximity_pct),
         "max_staleness_days": int(max_staleness_days),
     }

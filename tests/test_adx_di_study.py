@@ -32,6 +32,8 @@ class AdxDiStudyTests(unittest.TestCase):
                         {"exchange": "NSE", "tradingsymbol": "ADXHIGH", "name": "ADX High Ltd"},
                         {"exchange": "NSE", "tradingsymbol": "WRONGSLOPE", "name": "Wrong Slope Ltd"},
                         {"exchange": "NSE", "tradingsymbol": "SKIP-SM", "name": "Skip Ltd"},
+                        {"exchange": "NSE", "tradingsymbol": "AXISBNKETF", "name": "Axis Bank ETF"},
+                        {"exchange": "NSE", "tradingsymbol": "MOMENTUM50", "name": "Momentum 50"},
                     ]
                 )
             )
@@ -41,6 +43,8 @@ class AdxDiStudyTests(unittest.TestCase):
             storage.save_candles("NSE", "ADXHIGH", self._adx_high_frame(), "1D")
             storage.save_candles("NSE", "WRONGSLOPE", self._wrong_slope_frame(), "1D")
             storage.save_candles("NSE", "SKIP-SM", self._pass_frame(), "1D")
+            storage.save_candles("NSE", "AXISBNKETF", self._pass_frame(), "1D")
+            storage.save_candles("NSE", "MOMENTUM50", self._pass_frame(), "1D")
 
             result = run_adx_di_study(
                 storage,
@@ -61,6 +65,8 @@ class AdxDiStudyTests(unittest.TestCase):
         adx_high_row = loaded.stock_stats[loaded.stock_stats["symbol"] == "ADXHIGH"].iloc[0]
         wrong_slope_row = loaded.stock_stats[loaded.stock_stats["symbol"] == "WRONGSLOPE"].iloc[0]
         self.assertNotIn("SKIP-SM", loaded.stock_stats["symbol"].tolist())
+        self.assertNotIn("AXISBNKETF", loaded.stock_stats["symbol"].tolist())
+        self.assertNotIn("MOMENTUM50", loaded.stock_stats["symbol"].tolist())
         self.assertFalse(bool(pass_row["di_plus_cross_above_di_minus_recent"]))
         self.assertEqual(pass_row["latest_di_plus_cross_date"], "2026-03-20")
         self.assertTrue(pd.isna(pass_row["recent_di_plus_cross_dates_csv"]) or pass_row["recent_di_plus_cross_dates_csv"] == "")
@@ -70,6 +76,8 @@ class AdxDiStudyTests(unittest.TestCase):
         self.assertEqual(lead_row["latest_di_plus_cross_date"], "2026-03-10")
         self.assertTrue(pd.isna(lead_row["latest_cross_date"]) or lead_row["latest_cross_date"] == "")
         self.assertTrue(bool(lead_row["di_plus_cross_above_di_minus_recent"]))
+        self.assertTrue(bool(lead_row["di_plus_cross_over_threshold_recent"]))
+        self.assertEqual(lead_row["latest_di_plus_cross_over_threshold_date"], "2026-03-10")
         self.assertFalse(bool(lead_row["adx_bullish_cross_above_di_minus_recent"]))
         self.assertFalse(bool(fail_row["di_plus_cross_above_di_minus_recent"]))
         self.assertFalse(bool(adx_high_row["di_plus_cross_above_di_minus_recent"]))
@@ -108,6 +116,11 @@ class AdxDiStudyTests(unittest.TestCase):
                             "latest_di_plus_cross_date": "2026-07-21",
                             "di_plus_cross_above_di_minus_recent": True,
                             "di_plus_cross_above_di_minus_latest": False,
+                            "di_plus_cross_over_threshold_count": 1,
+                            "recent_di_plus_cross_over_threshold_dates_csv": "2026-07-21",
+                            "latest_di_plus_cross_over_threshold_date": "2026-07-21",
+                            "di_plus_cross_over_threshold_recent": True,
+                            "di_plus_cross_over_threshold_latest": False,
                             "di_plus_lead_pending": False,
                             "adx_above_threshold": False,
                             "crosses_in_lookback_bars": 1,
@@ -115,7 +128,44 @@ class AdxDiStudyTests(unittest.TestCase):
                             "latest_cross_date": "2026-07-22",
                             "adx_bullish_cross_above_di_minus_recent": True,
                             "adx_bullish_cross_above_di_minus_latest": False,
-                        }
+                            "support_level": 100.0,
+                            "support_level_date": "2026-06-30",
+                            "support_distance_from_level_pct": 21.0,
+                            "support_filter_pass": True,
+                        },
+                        {
+                            "exchange": "NSE",
+                            "symbol": "FAIL",
+                            "name": "Fail Ltd",
+                            "latest_close": 98.0,
+                            "latest_close_date": "2026-07-23",
+                            "latest_di_plus": 11.0,
+                            "latest_di_minus": 17.0,
+                            "latest_adx": 9.0,
+                            "adx_minus_di_minus_gap": -8.0,
+                            "di_plus_above_di_minus": False,
+                            "di_plus_crosses_in_lookback_bars": 1,
+                            "recent_di_plus_cross_dates_csv": "2026-07-22",
+                            "latest_di_plus_cross_date": "2026-07-22",
+                            "di_plus_cross_above_di_minus_recent": True,
+                            "di_plus_cross_above_di_minus_latest": False,
+                            "di_plus_cross_over_threshold_count": 1,
+                            "recent_di_plus_cross_over_threshold_dates_csv": "2026-07-22",
+                            "latest_di_plus_cross_over_threshold_date": "2026-07-22",
+                            "di_plus_cross_over_threshold_recent": True,
+                            "di_plus_cross_over_threshold_latest": False,
+                            "di_plus_lead_pending": False,
+                            "adx_above_threshold": False,
+                            "crosses_in_lookback_bars": 0,
+                            "recent_cross_dates_csv": "",
+                            "latest_cross_date": "",
+                            "adx_bullish_cross_above_di_minus_recent": False,
+                            "adx_bullish_cross_above_di_minus_latest": False,
+                            "support_level": 90.0,
+                            "support_level_date": "2026-06-20",
+                            "support_distance_from_level_pct": 8.0,
+                            "support_filter_pass": False,
+                        },
                     ]
                 ),
             )
@@ -143,10 +193,14 @@ class AdxDiStudyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Daily DI+ crossing above DI-", response.text)
         self.assertIn("PASS", response.text)
+        self.assertNotIn("FAIL", response.text)
         self.assertIn("Show only DI+ crossing above DI- signals", response.text)
         self.assertIn("Sector / Industry Mix", response.text)
         self.assertIn("Sector Leaders", response.text)
         self.assertIn("Information Technology", response.text)
+        self.assertIn("Close vs Support %", response.text)
+        self.assertIn("Support distance filter", response.text)
+        self.assertIn("DI+ cross above threshold", response.text)
 
     @staticmethod
     def _pass_frame() -> pd.DataFrame:
