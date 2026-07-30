@@ -34,6 +34,8 @@ class AdxDiStudyTests(unittest.TestCase):
                         {"exchange": "NSE", "tradingsymbol": "SKIP-SM", "name": "Skip Ltd"},
                         {"exchange": "NSE", "tradingsymbol": "AXISBNKETF", "name": "Axis Bank ETF"},
                         {"exchange": "NSE", "tradingsymbol": "MOMENTUM50", "name": "Momentum 50"},
+                        {"exchange": "NSE", "tradingsymbol": "NIFTYBEES", "name": "Nifty Bees"},
+                        {"exchange": "NSE", "tradingsymbol": "GOLDBEES", "name": "Gold Bees"},
                     ]
                 )
             )
@@ -45,6 +47,8 @@ class AdxDiStudyTests(unittest.TestCase):
             storage.save_candles("NSE", "SKIP-SM", self._pass_frame(), "1D")
             storage.save_candles("NSE", "AXISBNKETF", self._pass_frame(), "1D")
             storage.save_candles("NSE", "MOMENTUM50", self._pass_frame(), "1D")
+            storage.save_candles("NSE", "NIFTYBEES", self._pass_frame(), "1D")
+            storage.save_candles("NSE", "GOLDBEES", self._pass_frame(), "1D")
 
             result = run_adx_di_study(
                 storage,
@@ -67,6 +71,8 @@ class AdxDiStudyTests(unittest.TestCase):
         self.assertNotIn("SKIP-SM", loaded.stock_stats["symbol"].tolist())
         self.assertNotIn("AXISBNKETF", loaded.stock_stats["symbol"].tolist())
         self.assertNotIn("MOMENTUM50", loaded.stock_stats["symbol"].tolist())
+        self.assertNotIn("NIFTYBEES", loaded.stock_stats["symbol"].tolist())
+        self.assertNotIn("GOLDBEES", loaded.stock_stats["symbol"].tolist())
         self.assertFalse(bool(pass_row["di_plus_cross_above_di_minus_recent"]))
         self.assertEqual(pass_row["latest_di_plus_cross_date"], "2026-03-20")
         self.assertTrue(pd.isna(pass_row["recent_di_plus_cross_dates_csv"]) or pass_row["recent_di_plus_cross_dates_csv"] == "")
@@ -121,6 +127,14 @@ class AdxDiStudyTests(unittest.TestCase):
                             "latest_di_plus_cross_over_threshold_date": "2026-07-21",
                             "di_plus_cross_over_threshold_recent": True,
                             "di_plus_cross_over_threshold_latest": False,
+                            "obv_latest": 125000.0,
+                            "obv_sma13": 117500.0,
+                            "obv_above_sma13": True,
+                            "obv_cross_sma13_count": 1,
+                            "recent_obv_cross_sma13_dates_csv": "2026-07-21",
+                            "latest_obv_cross_sma13_date": "2026-07-21",
+                            "obv_cross_sma13_recent": True,
+                            "obv_cross_sma13_latest": False,
                             "di_plus_lead_pending": False,
                             "adx_above_threshold": False,
                             "crosses_in_lookback_bars": 1,
@@ -154,6 +168,14 @@ class AdxDiStudyTests(unittest.TestCase):
                             "latest_di_plus_cross_over_threshold_date": "2026-07-22",
                             "di_plus_cross_over_threshold_recent": True,
                             "di_plus_cross_over_threshold_latest": False,
+                            "obv_latest": 82000.0,
+                            "obv_sma13": 91000.0,
+                            "obv_above_sma13": False,
+                            "obv_cross_sma13_count": 0,
+                            "recent_obv_cross_sma13_dates_csv": "",
+                            "latest_obv_cross_sma13_date": "",
+                            "obv_cross_sma13_recent": False,
+                            "obv_cross_sma13_latest": False,
                             "di_plus_lead_pending": False,
                             "adx_above_threshold": False,
                             "crosses_in_lookback_bars": 0,
@@ -201,6 +223,7 @@ class AdxDiStudyTests(unittest.TestCase):
         self.assertIn("Close vs Support %", response.text)
         self.assertIn("Support distance filter", response.text)
         self.assertIn("DI+ cross above threshold", response.text)
+        self.assertIn("OBV crossed above 13D SMA", response.text)
 
     @staticmethod
     def _pass_frame() -> pd.DataFrame:

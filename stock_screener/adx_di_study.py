@@ -23,6 +23,8 @@ def _is_excluded_adx_symbol(symbol: str) -> bool:
         return True
     if "-" in value:
         return True
+    if "NIFTY" in value or "BEES" in value:
+        return True
     if value.endswith("ETF"):
         return True
     return any(character.isdigit() for character in value)
@@ -241,6 +243,7 @@ def run_adx_di_study(
             frame,
             latest_di_plus_cross_row,
             benchmark_daily,
+            cross_lookback_bars=int(cross_lookback_bars),
             trend_fast_ma_length=int(trend_fast_ma_length),
             trend_slow_ma_length=int(trend_slow_ma_length),
             volume_avg_lookback=int(volume_avg_lookback),
@@ -314,6 +317,10 @@ def run_adx_di_study(
             stock_stats.loc[stale_mask, "recent_di_plus_cross_over_threshold_dates_csv"] = ""
             stock_stats.loc[stale_mask, "di_plus_cross_over_threshold_recent"] = False
             stock_stats.loc[stale_mask, "di_plus_cross_over_threshold_latest"] = False
+            stock_stats.loc[stale_mask, "obv_cross_sma13_count"] = 0
+            stock_stats.loc[stale_mask, "recent_obv_cross_sma13_dates_csv"] = ""
+            stock_stats.loc[stale_mask, "obv_cross_sma13_recent"] = False
+            stock_stats.loc[stale_mask, "obv_cross_sma13_latest"] = False
             stock_stats.loc[stale_mask, "di_plus_lead_pending"] = False
             stock_stats.loc[stale_mask, "crosses_in_lookback_bars"] = 0
             stock_stats.loc[stale_mask, "recent_cross_dates_csv"] = ""
@@ -326,6 +333,9 @@ def run_adx_di_study(
             "adx_minus_di_minus_gap",
             "di_plus_crosses_in_lookback_bars",
             "di_plus_cross_over_threshold_count",
+            "obv_latest",
+            "obv_sma13",
+            "obv_cross_sma13_count",
             "crosses_in_lookback_bars",
             "trend_fast_ma",
             "trend_slow_ma",
@@ -438,6 +448,7 @@ def _evaluate_quality_metrics(
     latest_di_plus_cross_row: pd.Series | None,
     benchmark_daily: pd.DataFrame,
     *,
+    cross_lookback_bars: int,
     trend_fast_ma_length: int,
     trend_slow_ma_length: int,
     volume_avg_lookback: int,
@@ -455,6 +466,27 @@ def _evaluate_quality_metrics(
     close = pd.to_numeric(frame["close"], errors="coerce")
     high = pd.to_numeric(frame["high"], errors="coerce")
     volume = pd.to_numeric(frame["volume"], errors="coerce")
+    close_delta = close.diff()
+    obv_step = pd.Series(
+        np.where(close_delta > 0, volume, np.where(close_delta < 0, -volume, 0.0)),
+        index=frame.index,
+        dtype=float,
+    )
+    obv = obv_step.cumsum()
+    obv_sma13 = obv.rolling(13, min_periods=13).mean()
+    obv_cross_sma13_series = (
+        obv.shift(1).notna()
+        & obv_sma13.shift(1).notna()
+        & obv.notna()
+        & obv_sma13.notna()
+        & (obv.shift(1) <= obv_sma13.shift(1))
+        & (obv > obv_sma13)
+    )
+    obv_window = max(int(cross_lookback_bars), 1)
+    recent_obv_cross_rows = frame.iloc[-obv_window:].loc[obv_cross_sma13_series.iloc[-obv_window:]]
+    all_obv_cross_rows = frame.loc[obv_cross_sma13_series]
+    latest_obv_cross_row = all_obv_cross_rows.iloc[-1] if not all_obv_cross_rows.empty else None
+    recent_obv_cross_dates = [pd.Timestamp(value).strftime("%Y-%m-%d") for value in recent_obv_cross_rows["date"].tolist()]
 
     fast_ma = close.rolling(int(trend_fast_ma_length), min_periods=int(trend_fast_ma_length)).mean()
     slow_ma = close.rolling(int(trend_slow_ma_length), min_periods=int(trend_slow_ma_length)).mean()
@@ -466,6 +498,9 @@ def _evaluate_quality_metrics(
     latest_slow_ma = _to_float(slow_ma.iloc[-1]) if len(slow_ma) else None
     latest_fast_slope = _to_float(fast_slope.iloc[-1]) if len(fast_slope) else None
     latest_slow_slope = _to_float(slow_slope.iloc[-1]) if len(slow_slope) else None
+    latest_obv = _to_float(obv.iloc[-1]) if len(obv) else None
+    latest_obv_sma13 = _to_float(obv_sma13.iloc[-1]) if len(obv_sma13) else None
+    obv_above_sma13 = bool(latest_obv is not None and latest_obv_sma13 is not None and latest_obv > latest_obv_sma13)
     trend_filter_pass = bool(
         latest_close is not None
         and latest_fast_ma is not None
@@ -536,6 +571,16 @@ def _evaluate_quality_metrics(
         "cross_close": cross_close,
         "cross_volume_ratio": cross_volume_ratio,
         "volume_filter_pass": volume_filter_pass,
+        "obv_latest": latest_obv,
+        "obv_sma13": latest_obv_sma13,
+        "obv_above_sma13": obv_above_sma13,
+        "obv_cross_sma13_count": int(len(recent_obv_cross_rows)),
+        "recent_obv_cross_sma13_dates_csv": ",".join(recent_obv_cross_dates),
+        "latest_obv_cross_sma13_date": (
+            pd.Timestamp(latest_obv_cross_row["date"]).strftime("%Y-%m-%d") if latest_obv_cross_row is not None else ""
+        ),
+        "obv_cross_sma13_recent": bool(not recent_obv_cross_rows.empty),
+        "obv_cross_sma13_latest": bool(obv_cross_sma13_series.iloc[-1]) if len(obv_cross_sma13_series) else False,
         "breakout_level": breakout_level,
         "breakout_extension_pct": breakout_extension_pct,
         "breakout_filter_pass": breakout_filter_pass,

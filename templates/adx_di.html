@@ -240,6 +240,10 @@
         DI+ cross above threshold
       </label>
       <label class="inline-checkbox">
+        <input type="checkbox" name="require_obv_cross_filter" value="1" {% if require_obv_cross_filter %}checked{% endif %}>
+        OBV crossed above 13D SMA
+      </label>
+      <label class="inline-checkbox">
         <input type="checkbox" name="require_atr_lower1_filter" value="1" {% if require_atr_lower1_filter %}checked{% endif %}>
         Close to ATR -1
       </label>
@@ -401,6 +405,9 @@
       {% if require_threshold_cross_filter %}
         <input type="hidden" name="require_threshold_cross_filter" value="1">
       {% endif %}
+      {% if require_obv_cross_filter %}
+        <input type="hidden" name="require_obv_cross_filter" value="1">
+      {% endif %}
       {% if require_atr_lower1_filter %}
         <input type="hidden" name="require_atr_lower1_filter" value="1">
       {% endif %}
@@ -455,6 +462,11 @@
             <th>Latest DI+ Cross Date</th>
             <th>DI+ Cross &gt; Threshold</th>
             <th>Recent Threshold Cross Dates</th>
+            <th>OBV</th>
+            <th>OBV 13D SMA</th>
+            <th>OBV &gt; SMA</th>
+            <th>Recent OBV Cross Dates</th>
+            <th>OBV Cross Pass</th>
             <th>Trend Pass</th>
             <th>Cross Vol Ratio</th>
             <th>Volume Pass</th>
@@ -495,6 +507,11 @@
               <td>{{ row.get("latest_di_plus_cross_date", "") }}</td>
               <td>{% if row.get("di_plus_cross_over_threshold_recent") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("recent_di_plus_cross_over_threshold_dates_csv", "") }}</td>
+              <td>{{ row.get("obv_latest", "")|number }}</td>
+              <td>{{ row.get("obv_sma13", "")|number }}</td>
+              <td>{% if row.get("obv_above_sma13") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("recent_obv_cross_sma13_dates_csv", "") }}</td>
+              <td>{% if row.get("obv_cross_sma13_recent") %}Yes{% else %}No{% endif %}</td>
               <td>{% if row.get("trend_filter_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("cross_volume_ratio", "")|number }}</td>
               <td>{% if row.get("volume_filter_pass") %}Yes{% else %}No{% endif %}</td>

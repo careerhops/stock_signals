@@ -4985,6 +4985,7 @@ def adx_di_page(request: Request) -> HTMLResponse:
     require_support_filter = _truthy_param(request.query_params.getlist("require_support_filter"), default=False)
     require_threshold_cross_filter = _truthy_param(request.query_params.getlist("require_threshold_cross_filter"), default=False)
     require_atr_lower1_filter = _truthy_param(request.query_params.getlist("require_atr_lower1_filter"), default=False)
+    require_obv_cross_filter = _truthy_param(request.query_params.getlist("require_obv_cross_filter"), default=False)
     chart_symbol = str(request.query_params.get("chart_symbol", "")).strip().upper()
     storage = Storage(data_root)
 
@@ -5002,6 +5003,14 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "latest_di_plus_cross_over_threshold_date": "",
             "di_plus_cross_over_threshold_recent": False,
             "di_plus_cross_over_threshold_latest": False,
+            "obv_latest": pd.NA,
+            "obv_sma13": pd.NA,
+            "obv_above_sma13": False,
+            "obv_cross_sma13_count": 0,
+            "recent_obv_cross_sma13_dates_csv": "",
+            "latest_obv_cross_sma13_date": "",
+            "obv_cross_sma13_recent": False,
+            "obv_cross_sma13_latest": False,
             "di_plus_lead_pending": False,
             "trend_fast_ma": pd.NA,
             "trend_slow_ma": pd.NA,
@@ -5057,6 +5066,10 @@ def adx_di_page(request: Request) -> HTMLResponse:
             threshold_matches = _truthy_series(stock_stats["di_plus_cross_over_threshold_recent"])
             di_plus_still_above = _truthy_series(stock_stats["di_plus_above_di_minus"]) if "di_plus_above_di_minus" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
             stock_stats = stock_stats[threshold_matches & di_plus_still_above].copy()
+        if require_obv_cross_filter and "obv_cross_sma13_recent" in stock_stats.columns:
+            obv_cross_matches = _truthy_series(stock_stats["obv_cross_sma13_recent"])
+            obv_still_above = _truthy_series(stock_stats["obv_above_sma13"]) if "obv_above_sma13" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            stock_stats = stock_stats[obv_cross_matches & obv_still_above].copy()
         if require_atr_lower1_filter and "atr_lower1_distance_pct" in stock_stats.columns:
             atr_distance = pd.to_numeric(stock_stats["atr_lower1_distance_pct"], errors="coerce")
             stock_stats = stock_stats[
@@ -5154,6 +5167,7 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "require_rs_filter": require_rs_filter,
             "require_threshold_cross_filter": require_threshold_cross_filter,
             "require_atr_lower1_filter": require_atr_lower1_filter,
+            "require_obv_cross_filter": require_obv_cross_filter,
             "require_support_filter": require_support_filter,
             "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
@@ -5203,6 +5217,7 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
     require_rs_filter = _truthy_param(form.getlist("require_rs_filter"), default=False)
     require_threshold_cross_filter = _truthy_param(form.getlist("require_threshold_cross_filter"), default=False)
     require_atr_lower1_filter = _truthy_param(form.getlist("require_atr_lower1_filter"), default=False)
+    require_obv_cross_filter = _truthy_param(form.getlist("require_obv_cross_filter"), default=False)
     require_support_filter = _truthy_param(form.getlist("require_support_filter"), default=False)
     params = [
         f"length={length}",
@@ -5232,6 +5247,8 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
         params.append("require_threshold_cross_filter=1")
     if require_atr_lower1_filter:
         params.append("require_atr_lower1_filter=1")
+    if require_obv_cross_filter:
+        params.append("require_obv_cross_filter=1")
     if require_support_filter:
         params.append("require_support_filter=1")
     if dashboard_token:
