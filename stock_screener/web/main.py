@@ -3060,7 +3060,8 @@ def _fetch_incremental_start_date(existing: pd.DataFrame, history_years: int) ->
     last_date = pd.to_datetime(existing["date"], errors="coerce").max()
     if pd.isna(last_date):
         return date.today() - timedelta(days=365 * int(history_years))
-    return pd.Timestamp(last_date).date() + timedelta(days=1)
+    # Overlap the latest saved day so corrected EOD candles replace stale values.
+    return pd.Timestamp(last_date).date()
 
 
 def _refresh_adx_di_candles(
@@ -4655,6 +4656,7 @@ def weekly_buy_gains_page(request: Request) -> HTMLResponse:
             "selected_sensitivity": selected_sensitivity,
             "default_sensitivity": base_sensitivity,
             "summary": latest.summary,
+            "quality_benchmark_symbol": str(latest.summary.get("quality_benchmark_symbol", "") or ""),
             "stock_stats": _records(stock_stats),
             "stock_stats_count": len(stock_stats),
             "gainers": _records(gainers),
@@ -4729,7 +4731,7 @@ def volume_burst_page(request: Request) -> HTMLResponse:
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_volume_burst_outputs(_volume_burst_dir(data_root))
     stock_search = request.query_params.get("stock_search", "").strip()
-    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=False)
 
     stock_stats = latest.stock_stats.copy()
     if not stock_stats.empty:
@@ -4813,7 +4815,7 @@ def resistance_breaks_page(request: Request) -> HTMLResponse:
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_resistance_breaks_outputs(_resistance_breaks_dir(data_root))
     stock_search = request.query_params.get("stock_search", "").strip()
-    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=False)
     left_bars = int(request.query_params.get("left_bars", latest.summary.get("left_bars", 15)) or 15)
     right_bars = int(request.query_params.get("right_bars", latest.summary.get("right_bars", 15)) or 15)
     volume_avg_window = int(request.query_params.get("volume_avg_window", latest.summary.get("volume_avg_window", 20)) or 20)
@@ -4942,7 +4944,7 @@ def adx_di_page(request: Request) -> HTMLResponse:
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_adx_di_outputs(_adx_di_dir(data_root))
     stock_search = request.query_params.get("stock_search", "").strip()
-    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=False)
     length = max(int(request.query_params.get("length", latest.summary.get("length", 14)) or 14), 2)
     threshold = float(request.query_params.get("threshold", latest.summary.get("threshold", 20.0)) or 20.0)
     cross_lookback_bars = max(int(request.query_params.get("cross_lookback_bars", latest.summary.get("cross_lookback_bars", 3)) or 3), 1)
@@ -4986,6 +4988,7 @@ def adx_di_page(request: Request) -> HTMLResponse:
     require_threshold_cross_filter = _truthy_param(request.query_params.getlist("require_threshold_cross_filter"), default=False)
     require_atr_lower1_filter = _truthy_param(request.query_params.getlist("require_atr_lower1_filter"), default=False)
     require_obv_cross_filter = _truthy_param(request.query_params.getlist("require_obv_cross_filter"), default=False)
+    require_divergence_filter = _truthy_param(request.query_params.getlist("require_divergence_filter"), default=False)
     chart_symbol = str(request.query_params.get("chart_symbol", "")).strip().upper()
     storage = Storage(data_root)
 
@@ -4998,6 +5001,21 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "latest_di_plus_cross_date": "",
             "di_plus_cross_above_di_minus_recent": False,
             "di_plus_cross_above_di_minus_latest": False,
+            "latest_adx_20": pd.NA,
+            "adx_3d_ago": pd.NA,
+            "adx_above_adx20": False,
+            "adx_above_3d_ago": False,
+            "adx_shortlist_pass": False,
+            "di_plus_divergence_count": 0,
+            "recent_di_plus_divergence_dates_csv": "",
+            "latest_di_plus_divergence_date": "",
+            "di_plus_divergence_recent": False,
+            "di_plus_divergence_expanding_latest": False,
+            "di_plus_pre_cross_threshold_divergence_count": 0,
+            "recent_di_plus_pre_cross_threshold_divergence_dates_csv": "",
+            "latest_di_plus_pre_cross_threshold_divergence_date": "",
+            "di_plus_pre_cross_threshold_divergence_recent": False,
+            "di_plus_pre_cross_threshold_divergence_expanding_latest": False,
             "di_plus_cross_over_threshold_count": 0,
             "recent_di_plus_cross_over_threshold_dates_csv": "",
             "latest_di_plus_cross_over_threshold_date": "",
@@ -5011,6 +5029,32 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "latest_obv_cross_sma13_date": "",
             "obv_cross_sma13_recent": False,
             "obv_cross_sma13_latest": False,
+            "pine_ema13": pd.NA,
+            "pine_ema26": pd.NA,
+            "pine_obv": pd.NA,
+            "pine_obv_sma100": pd.NA,
+            "pine_obv_above_sma100": False,
+            "pine_obv_bullish_cross": False,
+            "pine_ma50": pd.NA,
+            "pine_ma150": pd.NA,
+            "pine_ma200": pd.NA,
+            "pine_high52week": pd.NA,
+            "pine_low52week": pd.NA,
+            "pine_trend_template_passed": False,
+            "pine_trend_template_text": "",
+            "pine_distance_from_50_sma_pct": pd.NA,
+            "pine_buy_risk_text": "",
+            "pine_buy_risk_pass": False,
+            "pine_buy_volume_20": pd.NA,
+            "pine_sell_volume_20": pd.NA,
+            "pine_buying_pressure": False,
+            "pine_pressure_text": "",
+            "pine_relative_price_strength": pd.NA,
+            "pine_relative_price_strength_text": "",
+            "pine_relative_price_strength_pass": False,
+            "pine_vcp_range_percent": pd.NA,
+            "pine_vcp_triggered": False,
+            "pine_vcp_text": "",
             "di_plus_lead_pending": False,
             "trend_fast_ma": pd.NA,
             "trend_slow_ma": pd.NA,
@@ -5050,8 +5094,13 @@ def adx_di_page(request: Request) -> HTMLResponse:
         if matches_only:
             di_plus_matches = _truthy_series(stock_stats["di_plus_cross_above_di_minus_recent"]) if "di_plus_cross_above_di_minus_recent" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
             di_plus_still_above = _truthy_series(stock_stats["di_plus_above_di_minus"]) if "di_plus_above_di_minus" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
-            if len(di_plus_matches) == len(stock_stats) and len(di_plus_still_above) == len(stock_stats):
-                stock_stats = stock_stats[di_plus_matches & di_plus_still_above].copy()
+            adx_shortlist_pass = _truthy_series(stock_stats["adx_shortlist_pass"]) if "adx_shortlist_pass" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            if (
+                len(di_plus_matches) == len(stock_stats)
+                and len(di_plus_still_above) == len(stock_stats)
+                and len(adx_shortlist_pass) == len(stock_stats)
+            ):
+                stock_stats = stock_stats[di_plus_matches & di_plus_still_above & adx_shortlist_pass].copy()
             else:
                 stock_stats = stock_stats.iloc[0:0].copy()
         if require_trend_filter and "trend_filter_pass" in stock_stats.columns:
@@ -5066,6 +5115,11 @@ def adx_di_page(request: Request) -> HTMLResponse:
             threshold_matches = _truthy_series(stock_stats["di_plus_cross_over_threshold_recent"])
             di_plus_still_above = _truthy_series(stock_stats["di_plus_above_di_minus"]) if "di_plus_above_di_minus" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
             stock_stats = stock_stats[threshold_matches & di_plus_still_above].copy()
+        if require_divergence_filter and "di_plus_divergence_recent" in stock_stats.columns:
+            divergence_recent = _truthy_series(stock_stats["di_plus_divergence_recent"])
+            divergence_expanding = _truthy_series(stock_stats["di_plus_divergence_expanding_latest"]) if "di_plus_divergence_expanding_latest" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            di_plus_still_above = _truthy_series(stock_stats["di_plus_above_di_minus"]) if "di_plus_above_di_minus" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            stock_stats = stock_stats[divergence_recent & divergence_expanding & di_plus_still_above].copy()
         if require_obv_cross_filter and "obv_cross_sma13_recent" in stock_stats.columns:
             obv_cross_matches = _truthy_series(stock_stats["obv_cross_sma13_recent"])
             obv_still_above = _truthy_series(stock_stats["obv_above_sma13"]) if "obv_above_sma13" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
@@ -5088,6 +5142,23 @@ def adx_di_page(request: Request) -> HTMLResponse:
             stock_stats = stock_stats[latest_close >= float(min_current_price)].copy()
         if "symbol" in stock_stats.columns:
             stock_stats["symbol_display"] = stock_stats["symbol"].map(_display_symbol)
+        if not stock_stats.empty:
+            crossover_signal = _truthy_series(stock_stats["di_plus_cross_above_di_minus_recent"]) if "di_plus_cross_above_di_minus_recent" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            threshold_divergence_signal = _truthy_series(stock_stats["di_plus_pre_cross_threshold_divergence_recent"]) if "di_plus_pre_cross_threshold_divergence_recent" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            shortlist_pass = _truthy_series(stock_stats["adx_shortlist_pass"]) if "adx_shortlist_pass" in stock_stats.columns else pd.Series(False, index=stock_stats.index)
+            stock_stats["di_plus_signal_text"] = np.select(
+                [
+                    crossover_signal & shortlist_pass,
+                    crossover_signal,
+                    threshold_divergence_signal,
+                ],
+                [
+                    "Cross above DI- + shortlist",
+                    "Cross above DI-",
+                    "Threshold divergence",
+                ],
+                default="",
+            )
 
     stock_stats, sector_summary, sector_leaders = _build_adx_di_sector_views(stock_stats)
     adx_di_sorted_stats = stock_stats.copy()
@@ -5168,6 +5239,7 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "require_threshold_cross_filter": require_threshold_cross_filter,
             "require_atr_lower1_filter": require_atr_lower1_filter,
             "require_obv_cross_filter": require_obv_cross_filter,
+            "require_divergence_filter": require_divergence_filter,
             "require_support_filter": require_support_filter,
             "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
@@ -5218,6 +5290,7 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
     require_threshold_cross_filter = _truthy_param(form.getlist("require_threshold_cross_filter"), default=False)
     require_atr_lower1_filter = _truthy_param(form.getlist("require_atr_lower1_filter"), default=False)
     require_obv_cross_filter = _truthy_param(form.getlist("require_obv_cross_filter"), default=False)
+    require_divergence_filter = _truthy_param(form.getlist("require_divergence_filter"), default=False)
     require_support_filter = _truthy_param(form.getlist("require_support_filter"), default=False)
     params = [
         f"length={length}",
@@ -5245,6 +5318,8 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
         params.append("require_rs_filter=1")
     if require_threshold_cross_filter:
         params.append("require_threshold_cross_filter=1")
+    if require_divergence_filter:
+        params.append("require_divergence_filter=1")
     if require_atr_lower1_filter:
         params.append("require_atr_lower1_filter=1")
     if require_obv_cross_filter:

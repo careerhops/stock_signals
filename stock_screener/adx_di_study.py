@@ -73,6 +73,7 @@ def calculate_adx_di(frame: pd.DataFrame, length: int = 14, threshold: float = 2
         dx = np.where(di_sum > 0, np.abs(di_plus - di_minus) / di_sum * 100.0, np.nan)
 
     adx = pd.Series(dx, index=prepared.index).rolling(int(length), min_periods=int(length)).mean()
+    adx_20 = pd.Series(dx, index=prepared.index).rolling(20, min_periods=20).mean()
 
     prepared["true_range"] = true_range
     prepared["dm_plus"] = directional_movement_plus
@@ -84,9 +85,14 @@ def calculate_adx_di(frame: pd.DataFrame, length: int = 14, threshold: float = 2
     prepared["di_minus"] = di_minus
     prepared["dx"] = dx
     prepared["adx"] = adx
+    prepared["adx_20"] = adx_20
     prepared["threshold"] = float(threshold)
+    prepared["di_plus_minus_spread"] = prepared["di_plus"] - prepared["di_minus"]
+    prepared["di_plus_minus_spread_delta"] = prepared["di_plus_minus_spread"].diff()
     prepared["adx_slope_positive"] = prepared["adx"] > prepared["adx"].shift(1)
     prepared["di_minus_slope_negative"] = prepared["di_minus"] < prepared["di_minus"].shift(1)
+    prepared["adx_above_adx20"] = prepared["adx"].notna() & prepared["adx_20"].notna() & (prepared["adx"] > prepared["adx_20"])
+    prepared["adx_above_3d_ago"] = prepared["adx"].notna() & prepared["adx"].shift(3).notna() & (prepared["adx"] > prepared["adx"].shift(3))
     prepared["di_plus_crossed_above_di_minus"] = (
         prepared["di_plus"].shift(1).notna()
         & prepared["di_minus"].shift(1).notna()
@@ -102,6 +108,64 @@ def calculate_adx_di(frame: pd.DataFrame, length: int = 14, threshold: float = 2
         prepared["di_plus_crossed_above_di_minus"]
         & (prepared["di_plus"] > float(threshold))
         & (prepared["di_minus"] > float(threshold))
+    )
+    prepared["di_plus_divergence_start"] = (
+        prepared["di_plus"].shift(1).notna()
+        & prepared["di_plus"].shift(2).notna()
+        & prepared["di_minus"].shift(1).notna()
+        & prepared["di_minus"].shift(2).notna()
+        & prepared["di_plus_minus_spread"].shift(1).notna()
+        & prepared["di_plus_minus_spread"].shift(2).notna()
+        & (prepared["di_plus"] > prepared["di_minus"])
+        & (prepared["di_plus_minus_spread"].shift(1) <= prepared["di_plus_minus_spread"].shift(2))
+        & (prepared["di_plus_minus_spread"] > prepared["di_plus_minus_spread"].shift(1))
+        & (prepared["di_plus"] >= prepared["di_plus"].shift(1))
+        & (prepared["di_minus"] <= prepared["di_minus"].shift(1))
+    )
+    prepared["di_plus_divergence_expanding"] = (
+        prepared["di_plus"].shift(1).notna()
+        & prepared["di_plus"].shift(2).notna()
+        & prepared["di_minus"].shift(1).notna()
+        & prepared["di_minus"].shift(2).notna()
+        & prepared["di_plus_minus_spread"].shift(1).notna()
+        & prepared["di_plus_minus_spread"].shift(2).notna()
+        & (prepared["di_plus"] > prepared["di_minus"])
+        & (prepared["di_plus_minus_spread"] > prepared["di_plus_minus_spread"].shift(1))
+        & (prepared["di_plus_minus_spread"].shift(1) > prepared["di_plus_minus_spread"].shift(2))
+        & (prepared["di_plus"] >= prepared["di_plus"].shift(1))
+        & (prepared["di_minus"] <= prepared["di_minus"].shift(1))
+    )
+    prepared["di_plus_pre_cross_threshold_divergence_start"] = (
+        prepared["di_plus"].shift(1).notna()
+        & prepared["di_plus"].shift(2).notna()
+        & prepared["di_minus"].shift(1).notna()
+        & prepared["di_minus"].shift(2).notna()
+        & prepared["di_plus_minus_spread"].shift(1).notna()
+        & prepared["di_plus_minus_spread"].shift(2).notna()
+        & (prepared["di_plus"] < prepared["di_minus"])
+        & (prepared["di_plus"] < float(threshold))
+        & ((float(threshold) - prepared["di_plus"]) < (float(threshold) - prepared["di_plus"].shift(1)))
+        & ((float(threshold) - prepared["di_plus"].shift(1)) <= (float(threshold) - prepared["di_plus"].shift(2)))
+        & (prepared["di_plus_minus_spread"].shift(1) <= prepared["di_plus_minus_spread"].shift(2))
+        & (prepared["di_plus_minus_spread"] > prepared["di_plus_minus_spread"].shift(1))
+        & (prepared["di_plus"] >= prepared["di_plus"].shift(1))
+        & (prepared["di_minus"] <= prepared["di_minus"].shift(1))
+    )
+    prepared["di_plus_pre_cross_threshold_divergence_expanding"] = (
+        prepared["di_plus"].shift(1).notna()
+        & prepared["di_plus"].shift(2).notna()
+        & prepared["di_minus"].shift(1).notna()
+        & prepared["di_minus"].shift(2).notna()
+        & prepared["di_plus_minus_spread"].shift(1).notna()
+        & prepared["di_plus_minus_spread"].shift(2).notna()
+        & (prepared["di_plus"] < prepared["di_minus"])
+        & (prepared["di_plus"] < float(threshold))
+        & ((float(threshold) - prepared["di_plus"]) < (float(threshold) - prepared["di_plus"].shift(1)))
+        & ((float(threshold) - prepared["di_plus"].shift(1)) < (float(threshold) - prepared["di_plus"].shift(2)))
+        & (prepared["di_plus_minus_spread"] > prepared["di_plus_minus_spread"].shift(1))
+        & (prepared["di_plus_minus_spread"].shift(1) > prepared["di_plus_minus_spread"].shift(2))
+        & (prepared["di_plus"] >= prepared["di_plus"].shift(1))
+        & (prepared["di_minus"] <= prepared["di_minus"].shift(1))
     )
     prepared["adx_crossed_above_di_minus"] = (
         prepared["adx"].shift(1).notna()
@@ -156,7 +220,7 @@ def run_adx_di_study(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AdxDiStudyResult:
     data_root = storage.data_root
-    benchmark_daily = _prepare_benchmark_daily(storage.load_candles("NSE_INDEX", "NIFTY 50", "1D"))
+    benchmark_daily, quality_benchmark_symbol = _load_quality_benchmark(storage)
     if symbols is None:
         all_symbols = sorted(
             p.stem
@@ -208,10 +272,30 @@ def run_adx_di_study(
         latest = frame.iloc[-1]
         di_plus_cross_series = frame["di_plus_crossed_above_di_minus"].fillna(False)
         di_plus_cross_over_threshold_series = frame["di_plus_crossed_above_di_minus_over_threshold"].fillna(False)
+        di_plus_divergence_start_series = frame["di_plus_divergence_start"].fillna(False)
+        di_plus_divergence_expanding_series = frame["di_plus_divergence_expanding"].fillna(False)
+        di_plus_pre_cross_divergence_start_series = frame["di_plus_pre_cross_threshold_divergence_start"].fillna(False)
+        di_plus_pre_cross_divergence_expanding_series = frame["di_plus_pre_cross_threshold_divergence_expanding"].fillna(False)
         cross_series = frame["adx_bullish_cross_above_di_minus"].fillna(False)
         recent_di_plus_cross_rows = frame.iloc[-int(cross_lookback_bars):].loc[di_plus_cross_series.iloc[-int(cross_lookback_bars):]]
         all_di_plus_cross_rows = frame.loc[di_plus_cross_series]
         latest_di_plus_cross_row = all_di_plus_cross_rows.iloc[-1] if not all_di_plus_cross_rows.empty else None
+        recent_di_plus_divergence_rows = frame.iloc[-int(cross_lookback_bars):].loc[
+            di_plus_divergence_start_series.iloc[-int(cross_lookback_bars):]
+        ]
+        all_di_plus_divergence_rows = frame.loc[di_plus_divergence_start_series]
+        latest_di_plus_divergence_row = (
+            all_di_plus_divergence_rows.iloc[-1] if not all_di_plus_divergence_rows.empty else None
+        )
+        recent_di_plus_pre_cross_divergence_rows = frame.iloc[-int(cross_lookback_bars):].loc[
+            di_plus_pre_cross_divergence_start_series.iloc[-int(cross_lookback_bars):]
+        ]
+        all_di_plus_pre_cross_divergence_rows = frame.loc[di_plus_pre_cross_divergence_start_series]
+        latest_di_plus_pre_cross_divergence_row = (
+            all_di_plus_pre_cross_divergence_rows.iloc[-1]
+            if not all_di_plus_pre_cross_divergence_rows.empty
+            else None
+        )
         recent_di_plus_cross_over_threshold_rows = frame.iloc[-int(cross_lookback_bars):].loc[
             di_plus_cross_over_threshold_series.iloc[-int(cross_lookback_bars):]
         ]
@@ -223,6 +307,13 @@ def run_adx_di_study(
         all_cross_rows = frame.loc[cross_series]
         latest_cross_row = all_cross_rows.iloc[-1] if not all_cross_rows.empty else None
         recent_di_plus_cross_dates = [pd.Timestamp(value).strftime("%Y-%m-%d") for value in recent_di_plus_cross_rows["date"].tolist()]
+        recent_di_plus_divergence_dates = [
+            pd.Timestamp(value).strftime("%Y-%m-%d") for value in recent_di_plus_divergence_rows["date"].tolist()
+        ]
+        recent_di_plus_pre_cross_divergence_dates = [
+            pd.Timestamp(value).strftime("%Y-%m-%d")
+            for value in recent_di_plus_pre_cross_divergence_rows["date"].tolist()
+        ]
         recent_di_plus_cross_over_threshold_dates = [
             pd.Timestamp(value).strftime("%Y-%m-%d") for value in recent_di_plus_cross_over_threshold_rows["date"].tolist()
         ]
@@ -269,14 +360,57 @@ def run_adx_di_study(
                 "latest_di_plus": _to_float(latest.get("di_plus")),
                 "latest_di_minus": _to_float(latest.get("di_minus")),
                 "latest_adx": _to_float(latest.get("adx")),
+                "latest_adx_20": _to_float(latest.get("adx_20")),
+                "adx_3d_ago": _to_float(frame["adx"].shift(3).iloc[-1] if len(frame) >= 4 else None),
                 "threshold": float(threshold),
                 "adx_minus_di_minus_gap": _to_float((latest.get("adx") - latest.get("di_minus")) if pd.notna(latest.get("adx")) and pd.notna(latest.get("di_minus")) else None),
+                "di_plus_minus_spread": _to_float(latest.get("di_plus_minus_spread")),
+                "di_plus_minus_spread_delta": _to_float(latest.get("di_plus_minus_spread_delta")),
                 "di_plus_above_di_minus": bool(pd.notna(latest.get("di_plus")) and pd.notna(latest.get("di_minus")) and float(latest.get("di_plus")) > float(latest.get("di_minus"))),
+                "adx_above_adx20": bool(latest.get("adx_above_adx20")) if pd.notna(latest.get("adx_above_adx20")) else False,
+                "adx_above_3d_ago": bool(latest.get("adx_above_3d_ago")) if pd.notna(latest.get("adx_above_3d_ago")) else False,
+                "adx_shortlist_pass": bool(
+                    pd.notna(latest.get("adx_above_adx20"))
+                    and pd.notna(latest.get("adx_above_3d_ago"))
+                    and bool(latest.get("adx_above_adx20"))
+                    and bool(latest.get("adx_above_3d_ago"))
+                    and pd.notna(latest.get("di_plus"))
+                    and pd.notna(latest.get("di_minus"))
+                    and float(latest.get("di_plus")) > float(latest.get("di_minus"))
+                ),
                 "di_plus_crosses_in_lookback_bars": int(len(recent_di_plus_cross_rows)),
                 "recent_di_plus_cross_dates_csv": ",".join(recent_di_plus_cross_dates),
                 "latest_di_plus_cross_date": pd.Timestamp(latest_di_plus_cross_row["date"]).strftime("%Y-%m-%d") if latest_di_plus_cross_row is not None else "",
                 "di_plus_cross_above_di_minus_recent": bool(not recent_di_plus_cross_rows.empty),
                 "di_plus_cross_above_di_minus_latest": bool(di_plus_cross_series.iloc[-1]) if len(di_plus_cross_series) else False,
+                "di_plus_divergence_count": int(len(recent_di_plus_divergence_rows)),
+                "recent_di_plus_divergence_dates_csv": ",".join(recent_di_plus_divergence_dates),
+                "latest_di_plus_divergence_date": (
+                    pd.Timestamp(latest_di_plus_divergence_row["date"]).strftime("%Y-%m-%d")
+                    if latest_di_plus_divergence_row is not None
+                    else ""
+                ),
+                "di_plus_divergence_recent": bool(not recent_di_plus_divergence_rows.empty),
+                "di_plus_divergence_expanding_latest": (
+                    bool(di_plus_divergence_expanding_series.iloc[-1]) if len(di_plus_divergence_expanding_series) else False
+                ),
+                "di_plus_pre_cross_threshold_divergence_count": int(len(recent_di_plus_pre_cross_divergence_rows)),
+                "recent_di_plus_pre_cross_threshold_divergence_dates_csv": ",".join(
+                    recent_di_plus_pre_cross_divergence_dates
+                ),
+                "latest_di_plus_pre_cross_threshold_divergence_date": (
+                    pd.Timestamp(latest_di_plus_pre_cross_divergence_row["date"]).strftime("%Y-%m-%d")
+                    if latest_di_plus_pre_cross_divergence_row is not None
+                    else ""
+                ),
+                "di_plus_pre_cross_threshold_divergence_recent": bool(
+                    not recent_di_plus_pre_cross_divergence_rows.empty
+                ),
+                "di_plus_pre_cross_threshold_divergence_expanding_latest": (
+                    bool(di_plus_pre_cross_divergence_expanding_series.iloc[-1])
+                    if len(di_plus_pre_cross_divergence_expanding_series)
+                    else False
+                ),
                 "di_plus_cross_over_threshold_count": int(len(recent_di_plus_cross_over_threshold_rows)),
                 "recent_di_plus_cross_over_threshold_dates_csv": ",".join(recent_di_plus_cross_over_threshold_dates),
                 "latest_di_plus_cross_over_threshold_date": (
@@ -313,6 +447,14 @@ def run_adx_di_study(
             stock_stats.loc[stale_mask, "recent_di_plus_cross_dates_csv"] = ""
             stock_stats.loc[stale_mask, "di_plus_cross_above_di_minus_recent"] = False
             stock_stats.loc[stale_mask, "di_plus_cross_above_di_minus_latest"] = False
+            stock_stats.loc[stale_mask, "di_plus_divergence_count"] = 0
+            stock_stats.loc[stale_mask, "recent_di_plus_divergence_dates_csv"] = ""
+            stock_stats.loc[stale_mask, "di_plus_divergence_recent"] = False
+            stock_stats.loc[stale_mask, "di_plus_divergence_expanding_latest"] = False
+            stock_stats.loc[stale_mask, "di_plus_pre_cross_threshold_divergence_count"] = 0
+            stock_stats.loc[stale_mask, "recent_di_plus_pre_cross_threshold_divergence_dates_csv"] = ""
+            stock_stats.loc[stale_mask, "di_plus_pre_cross_threshold_divergence_recent"] = False
+            stock_stats.loc[stale_mask, "di_plus_pre_cross_threshold_divergence_expanding_latest"] = False
             stock_stats.loc[stale_mask, "di_plus_cross_over_threshold_count"] = 0
             stock_stats.loc[stale_mask, "recent_di_plus_cross_over_threshold_dates_csv"] = ""
             stock_stats.loc[stale_mask, "di_plus_cross_over_threshold_recent"] = False
@@ -330,12 +472,32 @@ def run_adx_di_study(
             "latest_di_plus",
             "latest_di_minus",
             "latest_adx",
+            "latest_adx_20",
+            "adx_3d_ago",
             "adx_minus_di_minus_gap",
+            "di_plus_minus_spread",
+            "di_plus_minus_spread_delta",
             "di_plus_crosses_in_lookback_bars",
+            "di_plus_divergence_count",
+            "di_plus_pre_cross_threshold_divergence_count",
             "di_plus_cross_over_threshold_count",
             "obv_latest",
             "obv_sma13",
             "obv_cross_sma13_count",
+            "pine_ema13",
+            "pine_ema26",
+            "pine_obv",
+            "pine_obv_sma100",
+            "pine_ma50",
+            "pine_ma150",
+            "pine_ma200",
+            "pine_high52week",
+            "pine_low52week",
+            "pine_distance_from_50_sma_pct",
+            "pine_buy_volume_20",
+            "pine_sell_volume_20",
+            "pine_relative_price_strength",
+            "pine_vcp_range_percent",
             "crosses_in_lookback_bars",
             "trend_fast_ma",
             "trend_slow_ma",
@@ -385,6 +547,7 @@ def run_adx_di_study(
         atr_channel_ma_type=atr_channel_ma_type,
         atr_lower1_proximity_pct=atr_lower1_proximity_pct,
         max_staleness_days=max_staleness_days,
+        quality_benchmark_symbol=quality_benchmark_symbol,
     )
     return AdxDiStudyResult(summary=summary, stock_stats=stock_stats)
 
@@ -443,6 +606,21 @@ def _prepare_benchmark_daily(frame: pd.DataFrame) -> pd.DataFrame:
     return prepared[["date", "close"]]
 
 
+def _load_quality_benchmark(storage: Storage) -> tuple[pd.DataFrame, str]:
+    benchmark_candidates = [
+        ("NSE_INDEX", "CNX500"),
+        ("NSE_INDEX", "CNX 500"),
+        ("NSE_INDEX", "NIFTY 500"),
+        ("NSE_INDEX", "NIFTY50"),
+        ("NSE_INDEX", "NIFTY 50"),
+    ]
+    for exchange, symbol in benchmark_candidates:
+        daily = _prepare_benchmark_daily(storage.load_candles(exchange, symbol, "1D"))
+        if not daily.empty:
+            return daily, symbol
+    return pd.DataFrame(columns=["date", "close"]), ""
+
+
 def _evaluate_quality_metrics(
     frame: pd.DataFrame,
     latest_di_plus_cross_row: pd.Series | None,
@@ -464,7 +642,9 @@ def _evaluate_quality_metrics(
     atr_lower1_proximity_pct: float,
 ) -> dict[str, Any]:
     close = pd.to_numeric(frame["close"], errors="coerce")
+    open_ = pd.to_numeric(frame["open"], errors="coerce")
     high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
     volume = pd.to_numeric(frame["volume"], errors="coerce")
     close_delta = close.diff()
     obv_step = pd.Series(
@@ -501,6 +681,119 @@ def _evaluate_quality_metrics(
     latest_obv = _to_float(obv.iloc[-1]) if len(obv) else None
     latest_obv_sma13 = _to_float(obv_sma13.iloc[-1]) if len(obv_sma13) else None
     obv_above_sma13 = bool(latest_obv is not None and latest_obv_sma13 is not None and latest_obv > latest_obv_sma13)
+
+    pine_ema13 = close.ewm(span=13, adjust=False, min_periods=13).mean()
+    pine_ema26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
+    pine_obv = obv
+    pine_obv_sma100 = pine_obv.rolling(100, min_periods=100).mean()
+    pine_obv_bullish_cross_series = (
+        pine_obv.shift(1).notna()
+        & pine_obv_sma100.shift(1).notna()
+        & pine_obv.notna()
+        & pine_obv_sma100.notna()
+        & (pine_obv.shift(1) <= pine_obv_sma100.shift(1))
+        & (pine_obv > pine_obv_sma100)
+    )
+    latest_pine_ema13 = _to_float(pine_ema13.iloc[-1]) if len(pine_ema13) else None
+    latest_pine_ema26 = _to_float(pine_ema26.iloc[-1]) if len(pine_ema26) else None
+    latest_pine_obv = _to_float(pine_obv.iloc[-1]) if len(pine_obv) else None
+    latest_pine_obv_sma100 = _to_float(pine_obv_sma100.iloc[-1]) if len(pine_obv_sma100) else None
+    pine_obv_above_sma100 = bool(
+        latest_pine_obv is not None and latest_pine_obv_sma100 is not None and latest_pine_obv > latest_pine_obv_sma100
+    )
+    pine_obv_bullish_cross = bool(pine_obv_bullish_cross_series.iloc[-1]) if len(pine_obv_bullish_cross_series) else False
+
+    pine_ma50 = close.rolling(50, min_periods=50).mean()
+    pine_ma150 = close.rolling(150, min_periods=150).mean()
+    pine_ma200 = close.rolling(200, min_periods=200).mean()
+    pine_ma200_20_ago = pine_ma200.shift(20)
+    pine_high52 = high.rolling(252, min_periods=252).max()
+    pine_low52 = low.rolling(252, min_periods=252).min()
+    latest_pine_ma50 = _to_float(pine_ma50.iloc[-1]) if len(pine_ma50) else None
+    latest_pine_ma150 = _to_float(pine_ma150.iloc[-1]) if len(pine_ma150) else None
+    latest_pine_ma200 = _to_float(pine_ma200.iloc[-1]) if len(pine_ma200) else None
+    latest_pine_ma200_20_ago = _to_float(pine_ma200_20_ago.iloc[-1]) if len(pine_ma200_20_ago) else None
+    latest_pine_high52 = _to_float(pine_high52.iloc[-1]) if len(pine_high52) else None
+    latest_pine_low52 = _to_float(pine_low52.iloc[-1]) if len(pine_low52) else None
+
+    pine_trend_criterion1 = bool(
+        latest_close is not None
+        and latest_pine_ma150 is not None
+        and latest_pine_ma200 is not None
+        and latest_close > latest_pine_ma150
+        and latest_close > latest_pine_ma200
+    )
+    pine_trend_criterion2 = bool(
+        latest_pine_ma150 is not None and latest_pine_ma200 is not None and latest_pine_ma150 > latest_pine_ma200
+    )
+    pine_trend_criterion3 = bool(
+        latest_pine_ma200 is not None and latest_pine_ma200_20_ago is not None and latest_pine_ma200 > latest_pine_ma200_20_ago
+    )
+    pine_trend_criterion4 = bool(
+        latest_pine_ma50 is not None
+        and latest_pine_ma150 is not None
+        and latest_pine_ma200 is not None
+        and latest_pine_ma50 > latest_pine_ma150
+        and latest_pine_ma50 > latest_pine_ma200
+    )
+    pine_trend_criterion5 = bool(latest_close is not None and latest_pine_ma50 is not None and latest_close > latest_pine_ma50)
+    pine_trend_criterion6 = bool(
+        latest_close is not None and latest_pine_low52 is not None and latest_pine_low52 > 0 and latest_close > latest_pine_low52 * 1.25
+    )
+    pine_trend_criterion7 = bool(
+        latest_close is not None and latest_pine_high52 is not None and latest_pine_high52 > 0 and latest_close > latest_pine_high52 * 0.75
+    )
+    pine_trend_template_passed = bool(
+        pine_trend_criterion1
+        and pine_trend_criterion2
+        and pine_trend_criterion3
+        and pine_trend_criterion4
+        and pine_trend_criterion5
+        and pine_trend_criterion6
+        and pine_trend_criterion7
+    )
+    pine_trend_template_text = "PASSED" if pine_trend_template_passed else "WAIT"
+
+    pine_distance_from_50_sma_pct: float | pd.NA = pd.NA
+    pine_buy_risk_text = "N/A"
+    pine_buy_risk_pass = False
+    if latest_pine_ma50 is not None and latest_pine_ma50 != 0 and latest_close is not None:
+        pine_distance_from_50_sma_pct = ((latest_close - latest_pine_ma50) / latest_pine_ma50) * 100.0
+        if float(pine_distance_from_50_sma_pct) < 0:
+            pine_buy_risk_text = "Broken"
+        elif float(pine_distance_from_50_sma_pct) <= 15.0:
+            pine_buy_risk_text = "Low Risk"
+            pine_buy_risk_pass = True
+        elif float(pine_distance_from_50_sma_pct) <= 25.0:
+            pine_buy_risk_text = "Caution"
+        else:
+            pine_buy_risk_text = "Extended"
+
+    pine_buy_volume_20 = volume.where(close > open_, 0.0).rolling(20, min_periods=20).sum()
+    pine_sell_volume_20 = volume.where(close <= open_, 0.0).rolling(20, min_periods=20).sum()
+    latest_pine_buy_volume_20 = _to_float(pine_buy_volume_20.iloc[-1]) if len(pine_buy_volume_20) else None
+    latest_pine_sell_volume_20 = _to_float(pine_sell_volume_20.iloc[-1]) if len(pine_sell_volume_20) else None
+    pine_buying_pressure = bool(
+        latest_pine_buy_volume_20 is not None
+        and latest_pine_sell_volume_20 is not None
+        and latest_pine_buy_volume_20 > latest_pine_sell_volume_20
+    )
+    pine_pressure_text = "Buying" if pine_buying_pressure else "Selling"
+
+    pine_relative_price_strength, pine_relative_price_strength_pass = _pine_relative_price_strength(frame, benchmark_daily)
+    pine_relative_price_strength_text = f"{float(pine_relative_price_strength):.1f}" if pd.notna(pine_relative_price_strength) else "N/A"
+
+    pine_vcp_highest_close = close.rolling(5, min_periods=5).max()
+    pine_vcp_lowest_close = close.rolling(5, min_periods=5).min()
+    pine_vcp_range_percent: float | pd.NA = pd.NA
+    pine_vcp_triggered = False
+    if latest_close is not None and latest_close != 0:
+        highest_close_latest = _to_float(pine_vcp_highest_close.iloc[-1]) if len(pine_vcp_highest_close) else None
+        lowest_close_latest = _to_float(pine_vcp_lowest_close.iloc[-1]) if len(pine_vcp_lowest_close) else None
+        if highest_close_latest is not None and lowest_close_latest is not None:
+            pine_vcp_range_percent = ((highest_close_latest - lowest_close_latest) / latest_close) * 100.0
+            pine_vcp_triggered = bool(float(pine_vcp_range_percent) < 2.5)
+    pine_vcp_text = "SQUEEZE" if pine_vcp_triggered else "Normal"
     trend_filter_pass = bool(
         latest_close is not None
         and latest_fast_ma is not None
@@ -559,7 +852,17 @@ def _evaluate_quality_metrics(
         ma_type=str(atr_channel_ma_type or "EMA"),
         proximity_pct=float(atr_lower1_proximity_pct),
     )
-    quality_score = int(sum([trend_filter_pass, volume_filter_pass, breakout_filter_pass, rs_filter_pass]))
+    quality_score = int(
+        sum(
+            [
+                pine_buying_pressure,
+                pine_buy_risk_pass,
+                pine_trend_template_passed,
+                pine_relative_price_strength_pass,
+                pine_vcp_triggered,
+            ]
+        )
+    )
 
     return {
         "trend_fast_ma": latest_fast_ma,
@@ -581,6 +884,32 @@ def _evaluate_quality_metrics(
         ),
         "obv_cross_sma13_recent": bool(not recent_obv_cross_rows.empty),
         "obv_cross_sma13_latest": bool(obv_cross_sma13_series.iloc[-1]) if len(obv_cross_sma13_series) else False,
+        "pine_ema13": latest_pine_ema13,
+        "pine_ema26": latest_pine_ema26,
+        "pine_obv": latest_pine_obv,
+        "pine_obv_sma100": latest_pine_obv_sma100,
+        "pine_obv_above_sma100": pine_obv_above_sma100,
+        "pine_obv_bullish_cross": pine_obv_bullish_cross,
+        "pine_ma50": latest_pine_ma50,
+        "pine_ma150": latest_pine_ma150,
+        "pine_ma200": latest_pine_ma200,
+        "pine_high52week": latest_pine_high52,
+        "pine_low52week": latest_pine_low52,
+        "pine_trend_template_passed": pine_trend_template_passed,
+        "pine_trend_template_text": pine_trend_template_text,
+        "pine_distance_from_50_sma_pct": pine_distance_from_50_sma_pct,
+        "pine_buy_risk_text": pine_buy_risk_text,
+        "pine_buy_risk_pass": pine_buy_risk_pass,
+        "pine_buy_volume_20": latest_pine_buy_volume_20 if latest_pine_buy_volume_20 is not None else pd.NA,
+        "pine_sell_volume_20": latest_pine_sell_volume_20 if latest_pine_sell_volume_20 is not None else pd.NA,
+        "pine_buying_pressure": pine_buying_pressure,
+        "pine_pressure_text": pine_pressure_text,
+        "pine_relative_price_strength": pine_relative_price_strength,
+        "pine_relative_price_strength_text": pine_relative_price_strength_text,
+        "pine_relative_price_strength_pass": pine_relative_price_strength_pass,
+        "pine_vcp_range_percent": pine_vcp_range_percent,
+        "pine_vcp_triggered": pine_vcp_triggered,
+        "pine_vcp_text": pine_vcp_text,
         "breakout_level": breakout_level,
         "breakout_extension_pct": breakout_extension_pct,
         "breakout_filter_pass": breakout_filter_pass,
@@ -716,6 +1045,47 @@ def _relative_strength_snapshot(frame: pd.DataFrame, benchmark_daily: pd.DataFra
     return (stock_return, benchmark_return, stock_return - benchmark_return)
 
 
+def _pine_relative_price_strength(frame: pd.DataFrame, benchmark_daily: pd.DataFrame) -> tuple[float | pd.NA, bool]:
+    if frame.empty or benchmark_daily.empty:
+        return (pd.NA, False)
+    stock = frame[["date", "close"]].copy()
+    stock["date"] = pd.to_datetime(stock["date"], errors="coerce")
+    stock["close"] = pd.to_numeric(stock["close"], errors="coerce")
+    stock = stock.dropna(subset=["date", "close"]).sort_values("date")
+    benchmark = benchmark_daily.copy()
+    benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
+    benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
+    benchmark = benchmark.dropna(subset=["date", "close"]).sort_values("date")
+    merged = pd.merge(stock, benchmark, on="date", how="inner", suffixes=("_stock", "_benchmark"))
+    if merged.empty or len(merged) <= 252:
+        return (pd.NA, False)
+
+    def _roc(series: pd.Series, length: int) -> pd.Series:
+        base = series.shift(int(length))
+        result = ((series - base) / base) * 100.0
+        return result.where(base.notna() & (base != 0))
+
+    stock_close = pd.to_numeric(merged["close_stock"], errors="coerce")
+    benchmark_close = pd.to_numeric(merged["close_benchmark"], errors="coerce")
+    stock_weighted = (
+        _roc(stock_close, 63) * 0.40
+        + _roc(stock_close, 126) * 0.20
+        + _roc(stock_close, 189) * 0.20
+        + _roc(stock_close, 252) * 0.20
+    )
+    benchmark_weighted = (
+        _roc(benchmark_close, 63) * 0.40
+        + _roc(benchmark_close, 126) * 0.20
+        + _roc(benchmark_close, 189) * 0.20
+        + _roc(benchmark_close, 252) * 0.20
+    )
+    latest_calc = (50.0 + stock_weighted - benchmark_weighted).iloc[-1]
+    if pd.isna(latest_calc):
+        return (pd.NA, False)
+    latest_rps = max(1.0, min(99.0, float(latest_calc)))
+    return (latest_rps, bool(latest_rps > 80.0))
+
+
 def _pine_rma(values: pd.Series, length: int) -> pd.Series:
     series = pd.to_numeric(values, errors="coerce")
     result = pd.Series(np.nan, index=series.index, dtype=float)
@@ -758,6 +1128,7 @@ def _build_summary(
     atr_channel_ma_type: str,
     atr_lower1_proximity_pct: float,
     max_staleness_days: int,
+    quality_benchmark_symbol: str,
 ) -> dict[str, Any]:
     latest_date = ""
     if not stock_stats.empty and "latest_close_date" in stock_stats.columns:
@@ -799,4 +1170,5 @@ def _build_summary(
         "atr_channel_ma_type": str(atr_channel_ma_type or "EMA"),
         "atr_lower1_proximity_pct": float(atr_lower1_proximity_pct),
         "max_staleness_days": int(max_staleness_days),
+        "quality_benchmark_symbol": str(quality_benchmark_symbol or ""),
     }

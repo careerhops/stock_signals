@@ -115,13 +115,23 @@ class AdxDiStudyTests(unittest.TestCase):
                             "latest_di_plus": 26.66,
                             "latest_di_minus": 11.86,
                             "latest_adx": 14.57,
+                            "latest_adx_20": 12.25,
+                            "adx_3d_ago": 11.42,
                             "adx_minus_di_minus_gap": 2.71,
                             "di_plus_above_di_minus": True,
+                            "adx_above_adx20": True,
+                            "adx_above_3d_ago": True,
+                            "adx_shortlist_pass": True,
                             "di_plus_crosses_in_lookback_bars": 1,
                             "recent_di_plus_cross_dates_csv": "2026-07-21",
                             "latest_di_plus_cross_date": "2026-07-21",
                             "di_plus_cross_above_di_minus_recent": True,
                             "di_plus_cross_above_di_minus_latest": False,
+                            "di_plus_divergence_count": 1,
+                            "recent_di_plus_divergence_dates_csv": "2026-07-23",
+                            "latest_di_plus_divergence_date": "2026-07-23",
+                            "di_plus_divergence_recent": True,
+                            "di_plus_divergence_expanding_latest": True,
                             "di_plus_cross_over_threshold_count": 1,
                             "recent_di_plus_cross_over_threshold_dates_csv": "2026-07-21",
                             "latest_di_plus_cross_over_threshold_date": "2026-07-21",
@@ -149,6 +159,62 @@ class AdxDiStudyTests(unittest.TestCase):
                         },
                         {
                             "exchange": "NSE",
+                            "symbol": "PRE",
+                            "name": "Pre Divergence Ltd",
+                            "latest_close": 111.0,
+                            "latest_close_date": "2026-07-23",
+                            "latest_di_plus": 18.5,
+                            "latest_di_minus": 22.0,
+                            "latest_adx": 12.0,
+                            "latest_adx_20": 10.5,
+                            "adx_3d_ago": 10.8,
+                            "adx_minus_di_minus_gap": -10.0,
+                            "di_plus_above_di_minus": False,
+                            "adx_above_adx20": True,
+                            "adx_above_3d_ago": True,
+                            "adx_shortlist_pass": False,
+                            "di_plus_crosses_in_lookback_bars": 0,
+                            "recent_di_plus_cross_dates_csv": "",
+                            "latest_di_plus_cross_date": "",
+                            "di_plus_cross_above_di_minus_recent": False,
+                            "di_plus_cross_above_di_minus_latest": False,
+                            "di_plus_divergence_count": 0,
+                            "recent_di_plus_divergence_dates_csv": "",
+                            "latest_di_plus_divergence_date": "",
+                            "di_plus_divergence_recent": False,
+                            "di_plus_divergence_expanding_latest": False,
+                            "di_plus_pre_cross_threshold_divergence_count": 1,
+                            "recent_di_plus_pre_cross_threshold_divergence_dates_csv": "2026-07-23",
+                            "latest_di_plus_pre_cross_threshold_divergence_date": "2026-07-23",
+                            "di_plus_pre_cross_threshold_divergence_recent": True,
+                            "di_plus_pre_cross_threshold_divergence_expanding_latest": True,
+                            "di_plus_cross_over_threshold_count": 0,
+                            "recent_di_plus_cross_over_threshold_dates_csv": "",
+                            "latest_di_plus_cross_over_threshold_date": "",
+                            "di_plus_cross_over_threshold_recent": False,
+                            "di_plus_cross_over_threshold_latest": False,
+                            "obv_latest": 90000.0,
+                            "obv_sma13": 87000.0,
+                            "obv_above_sma13": True,
+                            "obv_cross_sma13_count": 0,
+                            "recent_obv_cross_sma13_dates_csv": "",
+                            "latest_obv_cross_sma13_date": "",
+                            "obv_cross_sma13_recent": False,
+                            "obv_cross_sma13_latest": False,
+                            "di_plus_lead_pending": False,
+                            "adx_above_threshold": False,
+                            "crosses_in_lookback_bars": 0,
+                            "recent_cross_dates_csv": "",
+                            "latest_cross_date": "",
+                            "adx_bullish_cross_above_di_minus_recent": False,
+                            "adx_bullish_cross_above_di_minus_latest": False,
+                            "support_level": 103.0,
+                            "support_level_date": "2026-06-30",
+                            "support_distance_from_level_pct": 7.5,
+                            "support_filter_pass": False,
+                        },
+                        {
+                            "exchange": "NSE",
                             "symbol": "FAIL",
                             "name": "Fail Ltd",
                             "latest_close": 98.0,
@@ -156,13 +222,23 @@ class AdxDiStudyTests(unittest.TestCase):
                             "latest_di_plus": 11.0,
                             "latest_di_minus": 17.0,
                             "latest_adx": 9.0,
+                            "latest_adx_20": 9.5,
+                            "adx_3d_ago": 10.0,
                             "adx_minus_di_minus_gap": -8.0,
                             "di_plus_above_di_minus": False,
+                            "adx_above_adx20": False,
+                            "adx_above_3d_ago": False,
+                            "adx_shortlist_pass": False,
                             "di_plus_crosses_in_lookback_bars": 1,
                             "recent_di_plus_cross_dates_csv": "2026-07-22",
                             "latest_di_plus_cross_date": "2026-07-22",
                             "di_plus_cross_above_di_minus_recent": True,
                             "di_plus_cross_above_di_minus_latest": False,
+                            "di_plus_divergence_count": 0,
+                            "recent_di_plus_divergence_dates_csv": "",
+                            "latest_di_plus_divergence_date": "",
+                            "di_plus_divergence_recent": False,
+                            "di_plus_divergence_expanding_latest": False,
                             "di_plus_cross_over_threshold_count": 1,
                             "recent_di_plus_cross_over_threshold_dates_csv": "2026-07-22",
                             "latest_di_plus_cross_over_threshold_date": "2026-07-22",
@@ -210,13 +286,14 @@ class AdxDiStudyTests(unittest.TestCase):
                 ),
             ):
                 client = TestClient(app)
-                response = client.get("/adx-di")
+                response = client.get("/adx-di?matches_only=1")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Daily DI+ crossing above DI-", response.text)
+        self.assertIn("Daily DI+ signal scan", response.text)
         self.assertIn("PASS", response.text)
+        self.assertNotIn("PRE", response.text)
         self.assertNotIn("FAIL", response.text)
-        self.assertIn("Show only DI+ crossing above DI- signals", response.text)
+        self.assertIn("Show only shortlisted DI+ setups", response.text)
         self.assertIn("Sector / Industry Mix", response.text)
         self.assertIn("Sector Leaders", response.text)
         self.assertIn("Information Technology", response.text)
@@ -224,6 +301,10 @@ class AdxDiStudyTests(unittest.TestCase):
         self.assertIn("Support distance filter", response.text)
         self.assertIn("DI+ cross above threshold", response.text)
         self.assertIn("OBV crossed above 13D SMA", response.text)
+        self.assertIn("DI+ divergence expanding", response.text)
+        self.assertIn("Pre-Cross Threshold Divergence", response.text)
+        self.assertIn("ADX(20)", response.text)
+        self.assertIn("Shortlist Pass", response.text)
 
     @staticmethod
     def _pass_frame() -> pd.DataFrame:

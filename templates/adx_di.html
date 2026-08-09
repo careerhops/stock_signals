@@ -4,8 +4,8 @@
   <section class="hero">
     <div>
       <p class="eyebrow">ADX / DI SCAN</p>
-      <h1>Daily DI+ crossing above DI-</h1>
-      <p class="lede">Runs the PineScript-style ADX, DI+, and DI- calculation on the full local NSE daily universe and currently uses only the DI+ crossing above DI- signal for screening. ADX values remain visible for reference.</p>
+      <h1>Daily DI+ signal scan</h1>
+      <p class="lede">Runs the PineScript-style ADX, DI+, and DI- calculation on the full local NSE daily universe. The shortlist now requires DI+ crossover context plus these checks: ADX({{ length }}) &gt; ADX(20), DI+ &gt; DI-, and ADX today &gt; ADX 3 days ago.</p>
     </div>
   </section>
 
@@ -27,53 +27,6 @@
         Cross Lookback Bars
         <input type="number" name="cross_lookback_bars" min="1" value="{{ cross_lookback_bars }}">
       </label>
-      <label>
-        Trend Fast MA
-        <input type="number" name="trend_fast_ma_length" min="2" value="{{ trend_fast_ma_length }}">
-      </label>
-      <label>
-        Trend Slow MA
-        <input type="number" name="trend_slow_ma_length" min="3" value="{{ trend_slow_ma_length }}">
-      </label>
-      <label>
-        Volume Avg Days
-        <input type="number" name="volume_avg_lookback" min="2" value="{{ volume_avg_lookback }}">
-      </label>
-      <label>
-        Min Volume Ratio (x)
-        <input type="number" name="min_volume_ratio" min="0" step="0.1" value="{{ min_volume_ratio }}">
-      </label>
-      <label>
-        Breakout Lookback
-        <input type="number" name="breakout_lookback_days" min="2" value="{{ breakout_lookback_days }}">
-      </label>
-      <label>
-        RS Lookback Days
-        <input type="number" name="rs_lookback_days" min="1" value="{{ rs_lookback_days }}">
-      </label>
-      <label>
-        Min RS Spread %
-        <input type="number" name="min_rs_spread_pct" step="0.1" value="{{ min_rs_spread_pct }}">
-      </label>
-      <label>
-        ATR Channel MA Length
-        <input type="number" name="atr_channel_ma_length" min="1" value="{{ atr_channel_ma_length }}">
-      </label>
-      <label>
-        ATR Channel ATR Length
-        <input type="number" name="atr_channel_atr_length" min="1" value="{{ atr_channel_atr_length }}">
-      </label>
-      <label>
-        ATR Channel MA Type
-        <select name="atr_channel_ma_type">
-          <option value="EMA" {% if atr_channel_ma_type == "EMA" %}selected{% endif %}>EMA</option>
-          <option value="SMA" {% if atr_channel_ma_type == "SMA" %}selected{% endif %}>SMA</option>
-        </select>
-      </label>
-      <label>
-        ATR -1 Proximity %
-        <input type="number" name="atr_lower1_proximity_pct" min="0" step="0.1" value="{{ atr_lower1_proximity_pct }}">
-      </label>
       <div class="filter-actions">
         <button class="button" type="submit">Run DI+ / DI- Scan</button>
       </div>
@@ -93,7 +46,7 @@
         <div class="progress-track">
           <div class="progress-fill" id="adx-di-progress-fill" style="width: 0%"></div>
         </div>
-        <p id="adx-di-progress-detail">Scanning local daily candles for DI+ crossing above DI-...</p>
+        <p id="adx-di-progress-detail">Scanning local daily candles for DI+ setups and shortlist checks...</p>
       </div>
     {% endif %}
   </section>
@@ -205,7 +158,7 @@
       </label>
       <label class="inline-checkbox">
         <input type="checkbox" name="matches_only" value="1" {% if matches_only %}checked{% endif %}>
-        Show only DI+ crossing above DI- signals
+        Show only shortlisted DI+ setups
       </label>
       <label>
         Min CMP
@@ -240,6 +193,10 @@
         DI+ cross above threshold
       </label>
       <label class="inline-checkbox">
+        <input type="checkbox" name="require_divergence_filter" value="1" {% if require_divergence_filter %}checked{% endif %}>
+        DI+ divergence expanding
+      </label>
+      <label class="inline-checkbox">
         <input type="checkbox" name="require_obv_cross_filter" value="1" {% if require_obv_cross_filter %}checked{% endif %}>
         OBV crossed above 13D SMA
       </label>
@@ -262,7 +219,7 @@
       <div class="copy-symbols-heading">
         <div>
           <h2>Filtered Symbols</h2>
-          <p>Comma-separated list of the visible stocks after the DI+ / DI- crossover filter.</p>
+          <p>Comma-separated list of the visible stocks after the DI+ shortlist filter.</p>
         </div>
         <div class="copy-symbols-actions">
           <button class="button secondary" type="button" data-copy-target="adx-di-symbols-csv">Copy Symbols</button>
@@ -405,6 +362,9 @@
       {% if require_threshold_cross_filter %}
         <input type="hidden" name="require_threshold_cross_filter" value="1">
       {% endif %}
+      {% if require_divergence_filter %}
+        <input type="hidden" name="require_divergence_filter" value="1">
+      {% endif %}
       {% if require_obv_cross_filter %}
         <input type="hidden" name="require_obv_cross_filter" value="1">
       {% endif %}
@@ -440,10 +400,21 @@
   <section class="panel">
     <div class="panel-heading">
       <h2>DI+ / DI- Stocks</h2>
-      <p>Daily values from the same PineScript-style calculation used by the scan, with DI+ crossover as the active screener signal.</p>
+      <p>Daily values from the same PineScript-style calculation used by the scan. Shortlist pass means: ADX({{ length }}) &gt; ADX(20), DI+ &gt; DI-, and ADX today &gt; ADX 3 days ago. Quality uses the Pine-derived table metrics{% if quality_benchmark_symbol %} and benchmarks RS against {{ quality_benchmark_symbol }}{% endif %}.</p>
+    </div>
+    <div class="copy-symbols-panel">
+      <div class="copy-symbols-heading">
+        <div>
+          <h2>Export Table</h2>
+          <p>Copies the currently visible table rows in an Excel-friendly tab-separated format.</p>
+        </div>
+        <div class="copy-symbols-actions">
+          <button class="button secondary" type="button" data-copy-table="adx-di-stocks-table">Copy Table for Excel</button>
+        </div>
+      </div>
     </div>
     <div class="table-wrap signal-history">
-      <table>
+      <table id="adx-di-stocks-table">
         <thead>
           <tr>
             <th>Symbol</th>
@@ -455,11 +426,24 @@
             <th>DI+</th>
             <th>DI-</th>
             <th>ADX</th>
+            <th>ADX(20)</th>
+            <th>ADX 3D Ago</th>
             <th>ADX - DI-</th>
+            <th>DI+ - DI- Spread</th>
+            <th>Spread Δ</th>
             <th>DI+ &gt; DI-</th>
+            <th>ADX &gt; ADX(20)</th>
+            <th>ADX &gt; ADX 3D Ago</th>
+            <th>Shortlist Pass</th>
             <th>DI+ Crosses In Window</th>
             <th>Recent DI+ Cross Dates</th>
             <th>Latest DI+ Cross Date</th>
+            <th>DI+ Divergence Start</th>
+            <th>Recent Divergence Dates</th>
+            <th>Divergence Expanding Now</th>
+            <th>Pre-Cross Threshold Divergence</th>
+            <th>Recent Pre-Cross Divergence Dates</th>
+            <th>Pre-Cross Divergence Active</th>
             <th>DI+ Cross &gt; Threshold</th>
             <th>Recent Threshold Cross Dates</th>
             <th>OBV</th>
@@ -467,6 +451,16 @@
             <th>OBV &gt; SMA</th>
             <th>Recent OBV Cross Dates</th>
             <th>OBV Cross Pass</th>
+            <th>Pine EMA13</th>
+            <th>Pine EMA26</th>
+            <th>Pine OBV</th>
+            <th>Pine OBV 100 SMA</th>
+            <th>Pine OBV Cross</th>
+            <th>Pressure</th>
+            <th>Risk (50d)</th>
+            <th>Trend (TPR)</th>
+            <th>RS vs Benchmark</th>
+            <th>VCP (5d)</th>
             <th>Trend Pass</th>
             <th>Cross Vol Ratio</th>
             <th>Volume Pass</th>
@@ -500,11 +494,24 @@
               <td>{{ row.get("latest_di_plus", "")|number }}</td>
               <td>{{ row.get("latest_di_minus", "")|number }}</td>
               <td>{{ row.get("latest_adx", "")|number }}</td>
+              <td>{{ row.get("latest_adx_20", "")|number }}</td>
+              <td>{{ row.get("adx_3d_ago", "")|number }}</td>
               <td>{{ row.get("adx_minus_di_minus_gap", "")|number }}</td>
+              <td>{{ row.get("di_plus_minus_spread", "")|number }}</td>
+              <td>{{ row.get("di_plus_minus_spread_delta", "")|number }}</td>
               <td>{% if row.get("di_plus_above_di_minus") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("adx_above_adx20") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("adx_above_3d_ago") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("adx_shortlist_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("di_plus_crosses_in_lookback_bars", "") }}</td>
               <td>{{ row.get("recent_di_plus_cross_dates_csv", "") }}</td>
               <td>{{ row.get("latest_di_plus_cross_date", "") }}</td>
+              <td>{% if row.get("di_plus_divergence_recent") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("recent_di_plus_divergence_dates_csv", "") }}</td>
+              <td>{% if row.get("di_plus_divergence_expanding_latest") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("di_plus_pre_cross_threshold_divergence_recent") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("recent_di_plus_pre_cross_threshold_divergence_dates_csv", "") }}</td>
+              <td>{% if row.get("di_plus_pre_cross_threshold_divergence_expanding_latest") %}Yes{% else %}No{% endif %}</td>
               <td>{% if row.get("di_plus_cross_over_threshold_recent") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("recent_di_plus_cross_over_threshold_dates_csv", "") }}</td>
               <td>{{ row.get("obv_latest", "")|number }}</td>
@@ -512,6 +519,16 @@
               <td>{% if row.get("obv_above_sma13") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("recent_obv_cross_sma13_dates_csv", "") }}</td>
               <td>{% if row.get("obv_cross_sma13_recent") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("pine_ema13", "")|number }}</td>
+              <td>{{ row.get("pine_ema26", "")|number }}</td>
+              <td>{{ row.get("pine_obv", "")|number }}</td>
+              <td>{{ row.get("pine_obv_sma100", "")|number }}</td>
+              <td>{% if row.get("pine_obv_bullish_cross") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("pine_pressure_text", "") }}</td>
+              <td>{{ row.get("pine_buy_risk_text", "") }}</td>
+              <td>{{ row.get("pine_trend_template_text", "") }}</td>
+              <td>{{ row.get("pine_relative_price_strength_text", "") }}</td>
+              <td>{{ row.get("pine_vcp_text", "") }}</td>
               <td>{% if row.get("trend_filter_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("cross_volume_ratio", "")|number }}</td>
               <td>{% if row.get("volume_filter_pass") %}Yes{% else %}No{% endif %}</td>
@@ -530,7 +547,7 @@
               <td>{{ row.get("relative_strength_spread_pct", "")|number }}</td>
               <td>{% if row.get("rs_filter_pass") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("quality_score", "") }}</td>
-              <td>{% if row.get("di_plus_cross_above_di_minus_recent") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("di_plus_signal_text", "") }}</td>
             </tr>
           {% endfor %}
         </tbody>
@@ -558,6 +575,38 @@
           target.select();
           const original = button.textContent;
           button.textContent = "Select and copy";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1600);
+        }
+      });
+    });
+
+    document.querySelectorAll("[data-copy-table]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const tableId = button.getAttribute("data-copy-table");
+        const table = tableId ? document.getElementById(tableId) : null;
+        if (!table) return;
+        const rows = Array.from(table.querySelectorAll("tr"));
+        const text = rows
+          .map((row) =>
+            Array.from(row.querySelectorAll("th, td"))
+              .map((cell) => String(cell.textContent || "").replace(/\s+/g, " ").trim())
+              .join("\t")
+          )
+          .filter((line) => line.trim().length > 0)
+          .join("\n");
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => {
+            button.textContent = original;
+          }, 1200);
+        } catch (error) {
+          const original = button.textContent;
+          button.textContent = "Copy failed";
           window.setTimeout(() => {
             button.textContent = original;
           }, 1600);

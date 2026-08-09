@@ -23,7 +23,8 @@ def _fetch_start_date(existing: pd.DataFrame, history_years: int) -> date:
     if existing.empty:
         return date.today() - timedelta(days=365 * history_years)
     last_date = pd.to_datetime(existing["date"]).max().date()
-    return last_date + timedelta(days=1)
+    # Overlap the latest saved day so corrected EOD candles replace stale values.
+    return last_date
 
 
 def daily_signal_config(config: dict[str, Any]) -> dict[str, Any]:
