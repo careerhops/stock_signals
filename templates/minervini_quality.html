@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">Extended Minervini checklist</p>
+      <h1>Stock, setup, and entry quality</h1>
+      <p class="lede">Qualified stocks are green in all three quality groups and score strictly above {{ score_threshold|number(0) }} in each.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/minervini-quality/run" method="post" class="filter-panel">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        Score threshold
+        <input type="number" name="score_threshold" min="0" max="99" step="1" value="{{ score_threshold|number(0) }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Minervini Quality Scan</button>
+      </div>
+    </form>
+    <p class="status">Uses NSE daily candles and the Kite NIFTY 500 benchmark. A score equal to the threshold does not pass.</p>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Minervini Quality Scan completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="minervini-quality-progress" data-job-id="{{ study_job }}">
+        <div class="progress-header">
+          <strong id="minervini-quality-progress-title">Minervini Quality Scan is running</strong>
+          <span id="minervini-quality-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="minervini-quality-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="minervini-quality-progress-detail">Preparing the NIFTY 500 benchmark...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("minervini-quality-progress");
+          if (!box) return;
+          const jobId = box.dataset.jobId;
+          const title = document.getElementById("minervini-quality-progress-title");
+          const percent = document.getElementById("minervini-quality-progress-percent");
+          const fill = document.getElementById("minervini-quality-progress-fill");
+          const detail = document.getElementById("minervini-quality-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${jobId}`);
+              if (!response.ok) return;
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "Minervini Quality Scan queued" : (status.phase || "Minervini Quality Scan is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              detail.textContent = status.current_symbol ? `${status.phase || "Running"}: ${status.current_symbol}` : (status.phase || "Running");
+              if (status.status === "completed") {
+                window.location.href = status.redirect_url || "/minervini-quality";
+                return;
+              }
+              if (status.status === "failed") {
+                window.location.href = status.redirect_url || "/minervini-quality?study_error=Scan+failed";
+                return;
+              }
+              window.setTimeout(poll, 1200);
+            } catch (error) {
+              title.textContent = "Minervini Quality status unavailable";
+              detail.textContent = "Refresh the page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 700);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card">
+      <span>Qualified Stocks</span>
+      <strong>{{ summary.get("qualified_stocks", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Stocks Scored</span>
+      <strong>{{ summary.get("stocks_scored", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Latest Stock Date</span>
+      <strong>{{ summary.get("latest_stock_date", "-") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Benchmark Date</span>
+      <strong>{{ summary.get("benchmark_latest_date", "-") or "-" }}</strong>
+    </article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/minervini-quality" class="filter-panel compact-form">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <label>
+        Score threshold
+        <input type="number" name="score_threshold" min="0" max="99" step="1" value="{{ score_threshold|number(0) }}">
+      </label>
+      <label class="inline-checkbox">
+        <input type="hidden" name="qualified_only" value="0">
+        <input type="checkbox" name="qualified_only" value="1" {% if qualified_only %}checked{% endif %}>
+        Qualified stocks only
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+
+    {% if stock_symbols_csv %}
+      <div class="copy-block">
+        <div class="copy-row">
+          <div>
+            <h3>Qualified symbols</h3>
+            <p>{{ stock_stats_count }} visible stocks.</p>
+          </div>
+          <button class="button secondary" type="button" data-copy-target="minervini-quality-symbols-csv">Copy Symbols</button>
+        </div>
+        <textarea id="minervini-quality-symbols-csv" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+      </div>
+    {% endif %}
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Name</th>
+            <th>Date</th>
+            <th>CMP</th>
+            <th>Stock Quality</th>
+            <th>Setup Quality</th>
+            <th>Entry Quality</th>
+            <th>Pass</th>
+            <th>Trend</th>
+            <th>Relative Performance %</th>
+            <th>RS Near High</th>
+            <th>Turnover Cr</th>
+            <th>VCP</th>
+            <th>Buy Pressure %</th>
+            <th>Distribution 20D</th>
+            <th>OBV</th>
+            <th>V5 / V20</th>
+            <th>RVOL</th>
+            <th>Pivot Distance %</th>
+            <th>Distance From 50 SMA %</th>
+            <th>ATR Extension</th>
+            <th>Market</th>
+            <th>Data</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("latest_date", "") }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td><span class="badge {% if row.get('stock_quality_score', 0) >= 75 and row.get('stock_quality_score', 0) > score_threshold %}buy{% else %}hot{% endif %}">{{ row.get("stock_quality_score", "")|number }} {{ row.get("stock_quality_grade", "") }}</span></td>
+              <td><span class="badge {% if row.get('setup_quality_score', 0) >= 70 and row.get('setup_quality_score', 0) > score_threshold %}buy{% else %}hot{% endif %}">{{ row.get("setup_quality_score", "")|number }} {{ row.get("setup_quality_grade", "") }}</span></td>
+              <td><span class="badge {% if row.get('entry_quality_score', 0) >= 70 and row.get('entry_quality_score', 0) > score_threshold %}buy{% else %}hot{% endif %}">{{ row.get("entry_quality_score", "")|number }} {{ row.get("entry_quality_grade", "") }}</span></td>
+              <td>{% if row.get("quality_pass") %}<span class="badge buy">Yes</span>{% else %}<span class="badge hot">No</span>{% endif %}</td>
+              <td>{{ row.get("trend_pass_count", "") }}/7</td>
+              <td>{{ row.get("relative_performance_pct", "")|number }}</td>
+              <td>{% if row.get("rs_line_near_high") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("avg_turnover_cr", "")|number }}</td>
+              <td>{{ row.get("vcp_score", "") }}/5</td>
+              <td>{{ row.get("pressure_pct", "")|number }}</td>
+              <td>{{ row.get("distribution_count_20d", "")|number(0) }}</td>
+              <td>{{ row.get("obv_state", "") }}</td>
+              <td>{{ row.get("volume_dry_ratio", "")|number }}</td>
+              <td>{{ row.get("rvol", "")|number }}</td>
+              <td>{{ row.get("pivot_distance_pct", "")|number }}</td>
+              <td>{{ row.get("distance_from_sma50_pct", "")|number }}</td>
+              <td>{{ row.get("atr_extension", "")|number }}</td>
+              <td>{{ row.get("market_regime", "") }}</td>
+              <td>{{ row.get("data_status", "") }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const target = document.getElementById(button.dataset.copyTarget);
+        if (!target || !target.value.trim()) return;
+        try {
+          await navigator.clipboard.writeText(target.value.trim());
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => { button.textContent = original; }, 1200);
+        } catch (error) {
+          target.focus();
+          target.select();
+        }
+      });
+    });
+  </script>
+{% endblock %}

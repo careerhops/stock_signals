@@ -115,6 +115,13 @@ from stock_screener.minervini_sheet_sync import (
     run_minervini_sheet_sync,
     save_minervini_sheet_sync_outputs,
 )
+from stock_screener.minervini_quality_study import (
+    DEFAULT_BENCHMARK_SYMBOL as MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+    DEFAULT_SCORE_THRESHOLD as MINERVINI_QUALITY_DEFAULT_THRESHOLD,
+    load_minervini_quality_outputs,
+    run_minervini_quality_study,
+    save_minervini_quality_outputs,
+)
 from stock_screener.universe import build_universe
 from stock_screener.weekday_pressure_study import (
     WEEKDAY_ORDER,
@@ -3054,6 +3061,109 @@ def _run_resistance_breaks_job(
         )
 
 
+def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str) -> None:
+    access_token = load_access_token(storage.data_root)
+    if not access_token:
+        if not storage.load_candles("NSE_INDEX", benchmark_symbol, "1D").empty:
+            return
+        raise RuntimeError("Kite access token not found. Refresh the Kite login before the first quality scan.")
+
+    provider = KiteDataProvider(access_token=access_token)
+    provider.validate_session()
+    instruments = storage.load_instruments()
+    if instruments.empty:
+        instruments = provider.instruments()
+        storage.save_instruments(instruments)
+
+    rows = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NSE")
+        & (instruments["tradingsymbol"].astype(str).str.upper() == benchmark_symbol.upper())
+    ]
+    if rows.empty:
+        instruments = provider.instruments()
+        storage.save_instruments(instruments)
+        rows = instruments[
+            (instruments["exchange"].astype(str).str.upper() == "NSE")
+            & (instruments["tradingsymbol"].astype(str).str.upper() == benchmark_symbol.upper())
+        ]
+    if rows.empty:
+        raise RuntimeError(f"Kite instrument {benchmark_symbol} was not found.")
+
+    history_years = int(load_config().get("data", {}).get("history_years", 10))
+    existing = storage.load_candles("NSE_INDEX", benchmark_symbol, "1D")
+    from_date = _fetch_incremental_start_date(existing, history_years)
+    today = date.today()
+    if from_date <= today:
+        new_daily = provider.daily_candles(int(rows.iloc[0]["instrument_token"]), from_date, today)
+        storage.merge_and_save_candles("NSE_INDEX", benchmark_symbol, new_daily, "1D")
+
+
+def _run_minervini_quality_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    score_threshold: float,
+) -> None:
+    storage = Storage(data_root)
+    symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Refreshing NIFTY 500 benchmark",
+        completed=0,
+        total=symbol_total,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        _refresh_minervini_quality_benchmark(storage, MINERVINI_QUALITY_DEFAULT_BENCHMARK)
+        result = run_minervini_quality_study(
+            storage,
+            exchange="NSE",
+            benchmark_symbol=MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+            score_threshold=score_threshold,
+            progress_callback=progress_callback,
+        )
+        save_minervini_quality_outputs(result, _minervini_quality_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/minervini-quality?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/minervini-quality?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
 def _fetch_incremental_start_date(existing: pd.DataFrame, history_years: int) -> date:
     if existing.empty:
         return date.today() - timedelta(days=365 * int(history_years))
@@ -3868,6 +3978,12 @@ def _adx_di_dir(data_root: Path) -> Path:
 
 def _minervini_sheet_sync_dir(data_root: Path) -> Path:
     path = data_root / "minervini_sheet_sync"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _minervini_quality_dir(data_root: Path) -> Path:
+    path = data_root / "minervini_quality"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -4926,6 +5042,125 @@ async def run_resistance_breaks_from_dashboard(request: Request, background_task
         redirect_url = f"/resistance-breaks?study_job={job_id}{query_suffix}"
     except Exception as exc:
         redirect_url = f"/resistance-breaks?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/minervini-quality", response_class=HTMLResponse)
+def minervini_quality_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = load_minervini_quality_outputs(_minervini_quality_dir(data_root))
+    stock_search = request.query_params.get("stock_search", "").strip()
+    qualified_only = _truthy_param(request.query_params.getlist("qualified_only"), default=True)
+    try:
+        score_threshold = float(
+            request.query_params.get(
+                "score_threshold",
+                latest.summary.get("score_threshold", MINERVINI_QUALITY_DEFAULT_THRESHOLD),
+            )
+            or MINERVINI_QUALITY_DEFAULT_THRESHOLD
+        )
+    except (TypeError, ValueError):
+        score_threshold = MINERVINI_QUALITY_DEFAULT_THRESHOLD
+    score_threshold = max(0.0, min(score_threshold, 99.0))
+
+    stock_stats = latest.stock_stats.copy()
+    qualified_stock_stats = pd.DataFrame()
+    view_summary = dict(latest.summary)
+    if not stock_stats.empty:
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        score_columns = ("stock_quality_score", "setup_quality_score", "entry_quality_score")
+        for column in score_columns:
+            if column not in stock_stats.columns:
+                stock_stats[column] = np.nan
+            stock_stats[column] = pd.to_numeric(stock_stats[column], errors="coerce")
+        threshold_mask = (
+            (stock_stats["stock_quality_score"] >= 75.0)
+            & (stock_stats["setup_quality_score"] >= 70.0)
+            & (stock_stats["entry_quality_score"] >= 70.0)
+        )
+        for column in score_columns:
+            threshold_mask &= stock_stats[column] > score_threshold
+        stock_stats["quality_pass"] = threshold_mask
+        view_summary["qualified_stocks"] = int(threshold_mask.sum())
+        qualified_stock_stats = stock_stats[threshold_mask].copy()
+        if qualified_only:
+            stock_stats = qualified_stock_stats.copy()
+        stock_stats = stock_stats.sort_values(
+            ["entry_quality_score", "setup_quality_score", "stock_quality_score", "symbol"],
+            ascending=[False, False, False, True],
+            na_position="last",
+        )
+
+    return templates.TemplateResponse(
+        "minervini_quality.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": view_summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "stock_symbols_csv": _comma_separated_symbols(qualified_stock_stats),
+            "stock_search": stock_search,
+            "qualified_only": qualified_only,
+            "score_threshold": score_threshold,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/minervini-quality/run")
+async def run_minervini_quality_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    try:
+        score_threshold = float(
+            str(form.get("score_threshold", MINERVINI_QUALITY_DEFAULT_THRESHOLD)).strip()
+            or MINERVINI_QUALITY_DEFAULT_THRESHOLD
+        )
+    except ValueError:
+        score_threshold = MINERVINI_QUALITY_DEFAULT_THRESHOLD
+    score_threshold = max(0.0, min(score_threshold, 99.0))
+    params = [f"score_threshold={quote(str(score_threshold))}", "qualified_only=1"]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(
+            _run_minervini_quality_job,
+            job_id,
+            data_root,
+            query_suffix,
+            score_threshold,
+        )
+        redirect_url = f"/minervini-quality?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/minervini-quality?study_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
 
 
