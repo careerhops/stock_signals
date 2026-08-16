@@ -28,6 +28,7 @@ def run_minervini_quality_study(
     storage: Storage,
     exchange: str = "NSE",
     *,
+    symbols: list[str] | None = None,
     benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -39,7 +40,16 @@ def run_minervini_quality_study(
         )
 
     data_root = storage.data_root
-    all_symbols = sorted(path.stem for path in (data_root / "candles" / exchange / "1D").glob("*.csv"))
+    if symbols is None:
+        all_symbols = sorted(path.stem for path in (data_root / "candles" / exchange / "1D").glob("*.csv"))
+    else:
+        all_symbols = sorted(
+            {
+                str(symbol or "").strip().upper()
+                for symbol in symbols
+                if str(symbol or "").strip()
+            }
+        )
     name_map = _load_name_map(storage, exchange)
     rows: list[dict[str, Any]] = []
 
@@ -81,6 +91,13 @@ def run_minervini_quality_study(
 
     stock_stats = pd.DataFrame(rows)
     if not stock_stats.empty:
+        benchmark_latest_date = pd.Timestamp(benchmark.iloc[-1]["date"]).normalize()
+        stock_dates = pd.to_datetime(stock_stats["latest_date"], errors="coerce").dt.normalize()
+        stock_stats["is_latest_market_date"] = stock_dates.eq(benchmark_latest_date)
+        stock_stats["quality_pass"] = (
+            stock_stats["quality_pass"].fillna(False).astype(bool)
+            & stock_stats["is_latest_market_date"]
+        )
         numeric_columns = (
             "latest_close",
             "stock_quality_score",
@@ -123,6 +140,9 @@ def run_minervini_quality_study(
         "missing_or_short_history": int(
             (stock_stats.get("data_status", pd.Series(dtype="object")) != "READY").sum()
         ),
+        "stale_stock_dates": int(
+            (~stock_stats.get("is_latest_market_date", pd.Series(dtype=bool))).sum()
+        ) if not stock_stats.empty else 0,
         "score_threshold": float(score_threshold),
         "latest_stock_date": latest_dates.max().strftime("%Y-%m-%d") if not latest_dates.empty else "",
     }

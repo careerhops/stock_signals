@@ -23,7 +23,7 @@
         <button class="button" type="submit">Run Minervini Quality Scan</button>
       </div>
     </form>
-    <p class="status">Uses NSE daily candles and the Kite NIFTY 500 benchmark. A score equal to the threshold does not pass.</p>
+    <p class="status">Refreshes the current Kite NSE universe and NIFTY 500 before scoring. Stocks whose candle date does not match the benchmark date cannot qualify. A score equal to the threshold does not pass.</p>
     {% if study_error %}
       <p class="status error">{{ study_error }}</p>
     {% elif study_ran %}
@@ -96,6 +96,10 @@
     <article class="stat-card">
       <span>Benchmark Date</span>
       <strong>{{ summary.get("benchmark_latest_date", "-") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Stale Stocks Excluded</span>
+      <strong>{{ summary.get("stale_stock_dates", 0) }}</strong>
     </article>
   </section>
 

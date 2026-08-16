@@ -122,6 +122,14 @@ from stock_screener.minervini_quality_study import (
     run_minervini_quality_study,
     save_minervini_quality_outputs,
 )
+from stock_screener.minervini_di_divergence_study import (
+    DEFAULT_ADX_LENGTH as MINERVINI_DI_DEFAULT_ADX_LENGTH,
+    DEFAULT_DIVERGENCE_DAYS as MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS,
+    DEFAULT_MIN_SCORE as MINERVINI_DI_DEFAULT_MIN_SCORE,
+    load_minervini_di_divergence_outputs,
+    run_minervini_di_divergence_study,
+    save_minervini_di_divergence_outputs,
+)
 from stock_screener.universe import build_universe
 from stock_screener.weekday_pressure_study import (
     WEEKDAY_ORDER,
@@ -3098,6 +3106,68 @@ def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str
         storage.merge_and_save_candles("NSE_INDEX", benchmark_symbol, new_daily, "1D")
 
 
+def _refresh_minervini_quality_candles(
+    storage: Storage,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[str]:
+    config = load_config()
+    history_years = int(config.get("data", {}).get("history_years", 10))
+    access_token = load_access_token(storage.data_root)
+    if not access_token:
+        raise RuntimeError("Kite access token not found. Refresh the Kite login before running Minervini Quality.")
+
+    provider = KiteDataProvider(access_token=access_token)
+    provider.validate_session()
+    instruments = provider.instruments()
+    storage.save_instruments(instruments)
+    universe = build_universe(instruments, config)
+    candidates = universe[
+        universe["exchange"].astype(str).str.upper().eq("NSE")
+    ].drop_duplicates(subset=["tradingsymbol"]).sort_values("tradingsymbol").reset_index(drop=True)
+    today = date.today()
+    refreshed_symbols: list[str] = []
+
+    if progress_callback:
+        progress_callback(
+            {
+                "phase": "Refreshing Minervini NSE candles",
+                "completed": 0,
+                "total": len(candidates),
+                "current_symbol": "",
+                "current_exchange": "NSE",
+            }
+        )
+
+    for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
+        symbol = str(instrument["tradingsymbol"]).strip().upper()
+        existing = storage.load_candles("NSE", symbol, "1D")
+        from_date = _fetch_incremental_start_date(existing, history_years)
+        if from_date <= today:
+            new_daily = provider.daily_candles(
+                int(instrument["instrument_token"]),
+                from_date,
+                today,
+            )
+            daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
+        else:
+            daily = existing
+        if not daily.empty:
+            refreshed_symbols.append(symbol)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "Refreshing Minervini NSE candles",
+                    "completed": completed,
+                    "total": len(candidates),
+                    "current_symbol": symbol,
+                    "current_exchange": "NSE",
+                }
+            )
+
+    return refreshed_symbols
+
+
 def _run_minervini_quality_job(
     job_id: str,
     data_root: Path,
@@ -3109,7 +3179,7 @@ def _run_minervini_quality_job(
     _set_scan_job(
         job_id,
         status="running",
-        phase="Refreshing NIFTY 500 benchmark",
+        phase="Refreshing Minervini NSE candles",
         completed=0,
         total=symbol_total,
         percent=0,
@@ -3117,10 +3187,10 @@ def _run_minervini_quality_job(
         current_exchange="NSE",
     )
 
-    def progress_callback(payload: dict[str, Any]) -> None:
+    def refresh_progress_callback(payload: dict[str, Any]) -> None:
         total = int(payload.get("total") or 0)
         completed = int(payload.get("completed") or 0)
-        percent = int((completed / total) * 100) if total else 0
+        percent = int((completed / total) * 50) if total else 0
         _set_scan_job(
             job_id,
             status="running",
@@ -3132,14 +3202,46 @@ def _run_minervini_quality_job(
             current_exchange=payload.get("current_exchange", ""),
         )
 
+    def scan_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 50 + (int((completed / total) * 50) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(50, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
     try:
+        refreshed_symbols = _refresh_minervini_quality_candles(
+            storage,
+            progress_callback=refresh_progress_callback,
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh NSE daily candles were available for the Minervini Quality scan.")
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase="Refreshing NIFTY 500 benchmark",
+            completed=0,
+            total=len(refreshed_symbols),
+            percent=50,
+            current_symbol="",
+            current_exchange="NSE",
+        )
         _refresh_minervini_quality_benchmark(storage, MINERVINI_QUALITY_DEFAULT_BENCHMARK)
         result = run_minervini_quality_study(
             storage,
             exchange="NSE",
+            symbols=refreshed_symbols,
             benchmark_symbol=MINERVINI_QUALITY_DEFAULT_BENCHMARK,
             score_threshold=score_threshold,
-            progress_callback=progress_callback,
+            progress_callback=scan_progress_callback,
         )
         save_minervini_quality_outputs(result, _minervini_quality_dir(data_root))
         _set_scan_job(
@@ -3352,6 +3454,104 @@ def _run_adx_di_job(
             phase="Failed",
             error=str(exc),
             redirect_url=f"/adx-di?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _run_minervini_di_divergence_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    adx_length: int,
+    divergence_days: int,
+    min_score: float,
+) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Refreshing NSE daily candles",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def refresh_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 50) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    def scan_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 50 + (int((completed / total) * 50) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(50, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        refreshed_symbols = _refresh_adx_di_candles(storage, progress_callback=refresh_progress_callback)
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh NSE daily candles were available for the combined screener run.")
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase="Refreshing NIFTY 500 benchmark",
+            completed=0,
+            total=len(refreshed_symbols),
+            percent=50,
+            current_symbol="",
+            current_exchange="NSE",
+        )
+        _refresh_minervini_quality_benchmark(storage, MINERVINI_QUALITY_DEFAULT_BENCHMARK)
+        result = run_minervini_di_divergence_study(
+            storage,
+            exchange="NSE",
+            symbols=refreshed_symbols,
+            adx_length=adx_length,
+            divergence_days=divergence_days,
+            min_score=min_score,
+            benchmark_symbol=MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+            progress_callback=scan_progress_callback,
+        )
+        save_minervini_di_divergence_outputs(result, _minervini_di_divergence_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/minervini-di-divergence?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/minervini-di-divergence?study_error={quote(str(exc)[:500])}{query_suffix}",
         )
 
 
@@ -3984,6 +4184,12 @@ def _minervini_sheet_sync_dir(data_root: Path) -> Path:
 
 def _minervini_quality_dir(data_root: Path) -> Path:
     path = data_root / "minervini_quality"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _minervini_di_divergence_dir(data_root: Path) -> Path:
+    path = data_root / "minervini_di_divergence"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -5083,8 +5289,26 @@ def minervini_quality_page(request: Request) -> HTMLResponse:
             if column not in stock_stats.columns:
                 stock_stats[column] = np.nan
             stock_stats[column] = pd.to_numeric(stock_stats[column], errors="coerce")
+        if "is_latest_market_date" in stock_stats.columns:
+            current_date_mask = _truthy_series(stock_stats["is_latest_market_date"])
+        else:
+            benchmark_date = pd.to_datetime(
+                latest.summary.get("benchmark_latest_date"),
+                errors="coerce",
+            )
+            stock_dates = pd.to_datetime(
+                stock_stats.get("latest_date", pd.Series(pd.NaT, index=stock_stats.index)),
+                errors="coerce",
+            )
+            current_date_mask = stock_dates.dt.normalize().eq(benchmark_date)
+        ready_mask = stock_stats.get(
+            "data_status",
+            pd.Series("", index=stock_stats.index),
+        ).astype(str).eq("READY")
         threshold_mask = (
-            (stock_stats["stock_quality_score"] >= 75.0)
+            current_date_mask
+            & ready_mask
+            & (stock_stats["stock_quality_score"] >= 75.0)
             & (stock_stats["setup_quality_score"] >= 70.0)
             & (stock_stats["entry_quality_score"] >= 70.0)
         )
@@ -5161,6 +5385,180 @@ async def run_minervini_quality_from_dashboard(request: Request, background_task
         redirect_url = f"/minervini-quality?study_job={job_id}{query_suffix}"
     except Exception as exc:
         redirect_url = f"/minervini-quality?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/minervini-di-divergence", response_class=HTMLResponse)
+def minervini_di_divergence_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = load_minervini_di_divergence_outputs(_minervini_di_divergence_dir(data_root))
+    stock_search = request.query_params.get("stock_search", "").strip()
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+
+    try:
+        adx_length = max(
+            int(request.query_params.get("adx_length", latest.summary.get("adx_length", MINERVINI_DI_DEFAULT_ADX_LENGTH)) or MINERVINI_DI_DEFAULT_ADX_LENGTH),
+            2,
+        )
+    except (TypeError, ValueError):
+        adx_length = MINERVINI_DI_DEFAULT_ADX_LENGTH
+    try:
+        divergence_days = max(
+            int(request.query_params.get("divergence_days", latest.summary.get("divergence_days", MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS)) or MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS),
+            1,
+        )
+    except (TypeError, ValueError):
+        divergence_days = MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS
+    try:
+        min_score = float(
+            request.query_params.get("min_score", latest.summary.get("min_score", MINERVINI_DI_DEFAULT_MIN_SCORE))
+            or MINERVINI_DI_DEFAULT_MIN_SCORE
+        )
+    except (TypeError, ValueError):
+        min_score = MINERVINI_DI_DEFAULT_MIN_SCORE
+    min_score = max(0.0, min(min_score, 100.0))
+
+    stock_stats = latest.stock_stats.copy()
+    combined_stock_stats = pd.DataFrame()
+    pre_breakout_stock_stats = pd.DataFrame()
+    view_summary = dict(latest.summary)
+    if not stock_stats.empty:
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        score_columns = ("stock_quality_score", "setup_quality_score", "entry_quality_score")
+        for column in score_columns:
+            if column not in stock_stats.columns:
+                stock_stats[column] = np.nan
+            stock_stats[column] = pd.to_numeric(stock_stats[column], errors="coerce")
+        if "spread_change_2d" not in stock_stats.columns:
+            stock_stats["spread_change_2d"] = np.nan
+        stock_stats["spread_change_2d"] = pd.to_numeric(stock_stats["spread_change_2d"], errors="coerce")
+        divergence_mask = _truthy_series(
+            stock_stats.get("di_divergence_pass", pd.Series(False, index=stock_stats.index))
+        )
+        ready_mask = stock_stats.get("data_status", pd.Series("", index=stock_stats.index)).astype(str).eq("READY")
+        current_date_mask = _truthy_series(
+            stock_stats.get("is_latest_market_date", pd.Series(True, index=stock_stats.index))
+        )
+        minervini_mask = ready_mask & current_date_mask
+        for column in score_columns:
+            minervini_mask &= stock_stats[column] >= min_score
+        combined_mask = divergence_mask & minervini_mask & current_date_mask
+        stock_stats["minervini_threshold_pass"] = minervini_mask
+        stock_stats["combined_pass"] = combined_mask
+        pre_breakout_mask = _truthy_series(
+            stock_stats.get("pre_breakout_pass", pd.Series(False, index=stock_stats.index))
+        ) & current_date_mask
+        stock_stats["pre_breakout_pass"] = pre_breakout_mask
+        combined_stock_stats = stock_stats[combined_mask].copy()
+        pre_breakout_stock_stats = stock_stats[pre_breakout_mask].copy()
+        if not pre_breakout_stock_stats.empty:
+            pre_breakout_stock_stats = pre_breakout_stock_stats.sort_values(
+                ["stock_quality_score", "setup_quality_score", "entry_quality_score", "spread_change_2d", "symbol"],
+                ascending=[False, False, False, False, True],
+                na_position="last",
+            )
+        view_summary["di_divergence_matches"] = int((divergence_mask & current_date_mask).sum())
+        view_summary["minervini_threshold_matches"] = int(minervini_mask.sum())
+        view_summary["combined_matches"] = int(combined_mask.sum())
+        view_summary["pre_breakout_matches"] = int(pre_breakout_mask.sum())
+        if matches_only:
+            stock_stats = combined_stock_stats.copy()
+        stock_stats = stock_stats.sort_values(
+            ["combined_pass", "spread_change_2d", "entry_quality_score", "setup_quality_score", "stock_quality_score", "symbol"],
+            ascending=[False, False, False, False, False, True],
+            na_position="last",
+        )
+
+    return templates.TemplateResponse(
+        "minervini_di_divergence.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": view_summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "stock_symbols_csv": _comma_separated_symbols(combined_stock_stats),
+            "pre_breakout_stock_stats": _records(pre_breakout_stock_stats),
+            "pre_breakout_stock_symbols_csv": _comma_separated_symbols(pre_breakout_stock_stats),
+            "stock_search": stock_search,
+            "matches_only": matches_only,
+            "adx_length": adx_length,
+            "divergence_days": divergence_days,
+            "min_score": min_score,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/minervini-di-divergence/run")
+async def run_minervini_di_divergence_from_dashboard(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    try:
+        adx_length = max(int(str(form.get("adx_length", MINERVINI_DI_DEFAULT_ADX_LENGTH)).strip()), 2)
+    except ValueError:
+        adx_length = MINERVINI_DI_DEFAULT_ADX_LENGTH
+    try:
+        divergence_days = max(int(str(form.get("divergence_days", MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS)).strip()), 1)
+    except ValueError:
+        divergence_days = MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS
+    try:
+        min_score = float(str(form.get("min_score", MINERVINI_DI_DEFAULT_MIN_SCORE)).strip())
+    except ValueError:
+        min_score = MINERVINI_DI_DEFAULT_MIN_SCORE
+    min_score = max(0.0, min(min_score, 100.0))
+
+    params = [
+        f"adx_length={adx_length}",
+        f"divergence_days={divergence_days}",
+        f"min_score={quote(str(min_score))}",
+        "matches_only=1",
+    ]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(
+            _run_minervini_di_divergence_job,
+            job_id,
+            data_root,
+            query_suffix,
+            adx_length,
+            divergence_days,
+            min_score,
+        )
+        redirect_url = f"/minervini-di-divergence?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/minervini-di-divergence?study_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
 
 

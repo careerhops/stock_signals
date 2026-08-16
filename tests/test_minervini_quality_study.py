@@ -63,6 +63,29 @@ class MinerviniQualityStudyTests(unittest.TestCase):
         self.assertEqual(loaded.summary["benchmark_symbol"], "NIFTY 500")
         self.assertEqual(loaded.stock_stats.iloc[0]["symbol"], "QUALITY")
 
+    def test_scan_uses_requested_current_universe_and_rejects_stale_stock_date(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            stock, benchmark = self._quality_frames()
+            storage.save_candles("NSE", "CURRENT", stock, "1D")
+            storage.save_candles("NSE", "STALE", stock.iloc[:-1], "1D")
+            storage.save_candles("NSE", "OLD-CACHE", stock, "1D")
+            storage.save_candles("NSE_INDEX", "NIFTY 500", benchmark, "1D")
+
+            result = run_minervini_quality_study(
+                storage,
+                symbols=["CURRENT", "STALE"],
+            )
+
+        self.assertEqual(set(result.stock_stats["symbol"]), {"CURRENT", "STALE"})
+        current = result.stock_stats.set_index("symbol").loc["CURRENT"]
+        stale = result.stock_stats.set_index("symbol").loc["STALE"]
+        self.assertTrue(bool(current["is_latest_market_date"]))
+        self.assertTrue(bool(current["quality_pass"]))
+        self.assertFalse(bool(stale["is_latest_market_date"]))
+        self.assertFalse(bool(stale["quality_pass"]))
+        self.assertEqual(int(result.summary["stale_stock_dates"]), 1)
+
     def test_page_renders_qualified_results(self) -> None:
         with TemporaryDirectory() as temp_dir:
             data_root = Path(temp_dir)
