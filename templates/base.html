@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name or "Investment Screener" }}</title>
   <link rel="stylesheet" href="/static/css/styles.css">
-  <link rel="stylesheet" href="/static/css/simpler.css">
+  <link rel="stylesheet" href="/static/css/simpler.css?v=2">
 </head>
 <body class="simple-ui">
   {% set _qs = '' %}
@@ -21,15 +21,12 @@
       <nav class="topnav" aria-label="Primary">
         <a class="{% if request.url.path == '/' %}active{% endif %}" href="/{{ _qs }}">Dashboard</a>
         <a class="{% if request.url.path == '/gtt-gain-study' %}active{% endif %}" href="/gtt-gain-study{{ _qs }}">GTT</a>
-        <a class="{% if request.url.path == '/weekday-study' %}active{% endif %}" href="/weekday-study{{ _qs }}">Weekday Study</a>
-        <a class="{% if request.url.path == '/weekly-buy-gains' %}active{% endif %}" href="/weekly-buy-gains{{ _qs }}">Buy Gains</a>
-        <a class="{% if request.url.path == '/volume-burst' %}active{% endif %}" href="/volume-burst{{ _qs }}">Volume Burst</a>
-        <a class="{% if request.url.path == '/resistance-breaks' %}active{% endif %}" href="/resistance-breaks{{ _qs }}">Resistance Breaks</a>
+        <a class="{% if request.url.path == '/trader-setup-backtest' %}active{% endif %}" href="/trader-setup-backtest{{ _qs }}">Trader Backtest</a>
         <a class="{% if request.url.path == '/adx-di' %}active{% endif %}" href="/adx-di{{ _qs }}">ADX / DI</a>
+        <a class="{% if request.url.path == '/knox-envelope' %}active{% endif %}" href="/knox-envelope{{ _qs }}">Knox + Envelope</a>
+        <a class="{% if request.url.path == '/knox-recovery' %}active{% endif %}" href="/knox-recovery{{ _qs }}">Knox Recovery</a>
         <a class="{% if request.url.path == '/minervini-quality' %}active{% endif %}" href="/minervini-quality{{ _qs }}">Minervini Quality</a>
         <a class="{% if request.url.path == '/minervini-di-divergence' %}active{% endif %}" href="/minervini-di-divergence{{ _qs }}">DI + Minervini</a>
-        <a class="{% if request.url.path == '/minervini-sheet' %}active{% endif %}" href="/minervini-sheet{{ _qs }}">Minervini Sheet</a>
-        <a class="{% if request.url.path == '/qm-quality' %}active{% endif %}" href="/qm-quality{{ _qs }}">QM Quality</a>
         <a class="{% if request.url.path == '/big-bull-deals' %}active{% endif %}" href="/big-bull-deals{{ _qs }}">Deals</a>
         <a class="{% if request.url.path == '/login' %}active{% endif %}" href="/login{{ _qs }}">Kite</a>
       </nav>

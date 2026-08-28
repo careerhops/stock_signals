@@ -101,6 +101,22 @@
       <span>Stale Stocks Excluded</span>
       <strong>{{ summary.get("stale_stock_dates", 0) }}</strong>
     </article>
+    <article class="stat-card">
+      <span>Expected Kite OHLC Date</span>
+      <strong>{{ summary.get("refresh_expected_date", "-") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Fresh OHLC Coverage</span>
+      <strong>{{ summary.get("refresh_coverage_pct", 0)|number }}%</strong>
+    </article>
+    <article class="stat-card">
+      <span>Fresh / Universe</span>
+      <strong>{{ summary.get("refresh_current_count", 0) }} / {{ summary.get("refresh_universe_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Stale / Failed</span>
+      <strong>{{ summary.get("refresh_stale_count", 0) }} / {{ summary.get("refresh_failed_count", 0) }}</strong>
+    </article>
   </section>
 
   <section class="panel">
@@ -148,6 +164,8 @@
             <th>Name</th>
             <th>Date</th>
             <th>CMP</th>
+            <th>52W High</th>
+            <th>Below 52W High %</th>
             <th>Stock Quality</th>
             <th>Setup Quality</th>
             <th>Entry Quality</th>
@@ -176,6 +194,8 @@
               <td>{{ row.get("name", "") }}</td>
               <td>{{ row.get("latest_date", "") }}</td>
               <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_52w_high", "")|number }}</td>
+              <td>{{ row.get("distance_below_52w_high_pct", "")|number }}</td>
               <td><span class="badge {% if row.get('stock_quality_score', 0) >= 75 and row.get('stock_quality_score', 0) > score_threshold %}buy{% else %}hot{% endif %}">{{ row.get("stock_quality_score", "")|number }} {{ row.get("stock_quality_grade", "") }}</span></td>
               <td><span class="badge {% if row.get('setup_quality_score', 0) >= 70 and row.get('setup_quality_score', 0) > score_threshold %}buy{% else %}hot{% endif %}">{{ row.get("setup_quality_score", "")|number }} {{ row.get("setup_quality_grade", "") }}</span></td>
               <td><span class="badge {% if row.get('entry_quality_score', 0) >= 70 and row.get('entry_quality_score', 0) > score_threshold %}buy{% else %}hot{% endif %}">{{ row.get("entry_quality_score", "")|number }} {{ row.get("entry_quality_grade", "") }}</span></td>

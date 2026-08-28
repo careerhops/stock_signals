@@ -32,6 +32,10 @@ class MinerviniQualityStudyTests(unittest.TestCase):
         self.assertAlmostEqual(result["stock_quality_score"], 85.0)
         self.assertAlmostEqual(result["setup_quality_score"], 79.0)
         self.assertAlmostEqual(result["entry_quality_score"], 90.0)
+        expected_high = float(stock.tail(252)["high"].max())
+        expected_distance = (expected_high - float(stock.iloc[-1]["close"])) / expected_high * 100.0
+        self.assertAlmostEqual(result["latest_52w_high"], expected_high)
+        self.assertAlmostEqual(result["distance_below_52w_high_pct"], expected_distance)
         self.assertTrue(result["quality_pass"])
         self.assertFalse(strict_result["quality_pass"])
 
@@ -107,6 +111,8 @@ class MinerviniQualityStudyTests(unittest.TestCase):
                             "name": "Quality Ltd",
                             "latest_date": "2026-08-07",
                             "latest_close": 150.0,
+                            "latest_52w_high": 160.0,
+                            "distance_below_52w_high_pct": 6.25,
                             "stock_quality_score": 85.0,
                             "stock_quality_grade": "LEADER",
                             "setup_quality_score": 79.0,
@@ -145,6 +151,8 @@ class MinerviniQualityStudyTests(unittest.TestCase):
         self.assertIn("QUALITY", response.text)
         self.assertNotIn(">FAIL<", response.text)
         self.assertIn("Run Minervini Quality Scan", response.text)
+        self.assertIn("Below 52W High %", response.text)
+        self.assertIn("6.25", response.text)
 
     @staticmethod
     def _quality_frames() -> tuple[pd.DataFrame, pd.DataFrame]:

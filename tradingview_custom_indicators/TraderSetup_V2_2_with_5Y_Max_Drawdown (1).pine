@@ -1,0 +1,814 @@
+// This work contains code derived from:
+// "Support and Resistance Levels with Breaks" by LuxAlgo
+// Licensed under CC BY-NC-SA 4.0
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// Original Support/Resistance code © LuxAlgo
+// Combined and modified by Halfprisoner
+//
+// Minervini table logic based on:
+// "Minervini Ultimate +VCP" by noam73
+// Subject to Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//
+// V2 enhancements:
+// - Daily timeframe safety warning
+// - 7/7 Trend Template score
+// - Relative performance + RS line high check
+// - Multi-factor VCP score
+// - Volume dry-up + RVOL
+// - 20-day momentum pivot + pivot distance
+// - 50DMA + ATR extension risk
+// - Market regime filter
+// - Pressure percentage
+// - Distribution-day count
+// - Liquidity filter
+// - OBV accumulation state
+// - Three separate scores: Stock Quality, Setup Quality, Entry Quality
+// - Improved breakout candle quality and close confirmation
+//@version=6
+indicator(
+     title = "TraderSetup V2.2",
+     shorttitle = "TraderSetup_V2_2",
+     overlay = false,
+     max_bars_back = 1000
+     )
+//======================================================
+// EMA SETTINGS
+//======================================================
+string emaGroup = "EMA Settings"
+bool showEMAs = input.bool(true, "Show EMA Lines", group = emaGroup)
+int ema13Length = input.int(13, "EMA 13 Length", minval = 1, group = emaGroup)
+int ema26Length = input.int(26, "EMA 26 Length", minval = 1, group = emaGroup)
+float ema13 = ta.ema(close, ema13Length)
+float ema26 = ta.ema(close, ema26Length)
+plot(showEMAs ? ema13 : na, title = "EMA 13", color = color.red, linewidth = 2, force_overlay = true)
+plot(showEMAs ? ema26 : na, title = "EMA 26", color = color.blue, linewidth = 2, force_overlay = true)
+//======================================================
+// ATR CHANNELS 1-2-3
+//======================================================
+string atrGroup = "ATR Channel Settings"
+int lengthMA = input.int(20, "MA Length", minval = 1, group = atrGroup)
+int lengthATR = input.int(14, "ATR Length", minval = 1, group = atrGroup)
+string maType = input.string("EMA", title = "MA Type", options = ["EMA", "SMA"], group = atrGroup)
+bool showAtrChannels = input.bool(true, "Show ATR Channels", group = atrGroup)
+float ma = maType == "EMA" ? ta.ema(close, lengthMA) : ta.sma(close, lengthMA)
+float atr = ta.atr(lengthATR)
+float upper1 = ma + atr
+float lower1 = ma - atr
+float upper2 = ma + 2 * atr
+float lower2 = ma - 2 * atr
+float upper3 = ma + 3 * atr
+float lower3 = ma - 3 * atr
+plot(showAtrChannels ? ma : na, color = color.white, linewidth = 2, title = "ATR Channel MA", force_overlay = true)
+plot(showAtrChannels ? upper1 : na, color = color.new(color.green, 0), title = "+1 ATR", force_overlay = true)
+plot(showAtrChannels ? lower1 : na, color = color.new(color.green, 0), title = "-1 ATR", force_overlay = true)
+plot(showAtrChannels ? upper2 : na, color = color.new(color.orange, 0), title = "+2 ATR", force_overlay = true)
+plot(showAtrChannels ? lower2 : na, color = color.new(color.orange, 0), title = "-2 ATR", force_overlay = true)
+plot(showAtrChannels ? upper3 : na, color = color.new(color.red, 0), title = "+3 ATR", force_overlay = true)
+plot(showAtrChannels ? lower3 : na, color = color.new(color.red, 0), title = "-3 ATR", force_overlay = true)
+//======================================================
+// SUPPORT AND RESISTANCE SETTINGS
+//======================================================
+string srGroup = "Support and Resistance Settings"
+bool showLevels = input.bool(true, "Show Support and Resistance", group = srGroup)
+bool showBreaks = input.bool(true, "Show Break Labels", group = srGroup)
+int leftBars = input.int(5, "Left Bars", minval = 1, group = srGroup)
+int rightBars = input.int(5, "Right Bars", minval = 1, group = srGroup)
+float volumeThreshold = input.float(15.0, "Volume Oscillator Threshold", minval = 0, step = 1, group = srGroup)
+float breakoutRvolThreshold = input.float(1.40, "Breakout RVOL Minimum", minval = 0.1, step = 0.05, group = srGroup)
+float breakoutAtrBuffer = input.float(0.10, "Breakout ATR Buffer", minval = 0.0, step = 0.05, group = srGroup)
+bool requireBarClose = input.bool(true, "Confirm Signals At Bar Close", group = srGroup)
+//======================================================
+// SUPPORT AND RESISTANCE CALCULATION
+// IMPORTANT: levels begin only after pivot confirmation.
+// No negative visual offset is used, avoiding hindsight illusion.
+//======================================================
+float resistanceLevel = fixnan(ta.pivothigh(high, leftBars, rightBars))
+float supportLevel = fixnan(ta.pivotlow(low, leftBars, rightBars))
+color resistanceColor = ta.change(resistanceLevel) != 0 ? na : color.red
+color supportColor = ta.change(supportLevel) != 0 ? na : #233DEE
+plot(showLevels ? resistanceLevel : na, title = "Resistance", color = resistanceColor, linewidth = 3, force_overlay = true)
+plot(showLevels ? supportLevel : na, title = "Support", color = supportColor, linewidth = 3, force_overlay = true)
+//======================================================
+// VOLUME, RVOL AND CANDLE ANATOMY
+//======================================================
+float volumeShortEMA = ta.ema(volume, 5)
+float volumeLongEMA = ta.ema(volume, 10)
+float volumeOscillator = volumeLongEMA != 0 ? 100 * (volumeShortEMA - volumeLongEMA) / volumeLongEMA : 0
+float avgVol20 = ta.sma(volume, 20)
+float rvol = avgVol20 > 0 ? volume / avgVol20 : na
+float body = math.abs(close - open)
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+bool goodBullCandle = close > open and (body == 0 ? false : upperWick <= body * 0.50)
+bool goodBearCandle = close < open and (body == 0 ? false : lowerWick <= body * 0.50)
+bool signalConfirmed = not requireBarClose or barstate.isconfirmed
+bool crossedBelowSupport = ta.crossunder(close, supportLevel)
+bool crossedAboveResistance = ta.crossover(close, resistanceLevel)
+bool supportBreak =
+     showBreaks and
+     signalConfirmed and
+     crossedBelowSupport and
+     goodBearCandle and
+     volumeOscillator > volumeThreshold and
+     rvol >= breakoutRvolThreshold and
+     close < supportLevel - atr * breakoutAtrBuffer
+bool resistanceBreak =
+     showBreaks and
+     signalConfirmed and
+     crossedAboveResistance and
+     goodBullCandle and
+     volumeOscillator > volumeThreshold and
+     rvol >= breakoutRvolThreshold and
+     close > resistanceLevel + atr * breakoutAtrBuffer
+bool bullWick =
+     showBreaks and
+     signalConfirmed and
+     crossedAboveResistance and
+     upperWick > body
+bool bearWick =
+     showBreaks and
+     signalConfirmed and
+     crossedBelowSupport and
+     lowerWick > body
+plotshape(supportBreak, title = "Support Break", text = "BRK", style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, size = size.tiny, force_overlay = true)
+plotshape(resistanceBreak, title = "Resistance Break", text = "BRK", style = shape.labelup, location = location.belowbar, color = color.green, textcolor = color.white, size = size.tiny, force_overlay = true)
+plotshape(bullWick, title = "Bull Wick", text = "W", style = shape.labelup, location = location.belowbar, color = color.green, textcolor = color.white, size = size.tiny, force_overlay = true)
+plotshape(bearWick, title = "Bear Wick", text = "W", style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, size = size.tiny, force_overlay = true)
+//======================================================
+// OBV SETTINGS
+//======================================================
+string obvGroup = "OBV Settings"
+bool showOBV = input.bool(true, "Show OBV", group = obvGroup)
+int obvSmaLength = input.int(100, "OBV SMA Length", minval = 1, group = obvGroup)
+float volumeDirection = close > close[1] ? volume : close < close[1] ? -volume : 0
+float obvValue = ta.cum(volumeDirection)
+float obvSma = ta.sma(obvValue, obvSmaLength)
+bool obvBullishState = obvValue > obvSma and obvSma > obvSma[5]
+bool obvBearishState = obvValue < obvSma and obvSma < obvSma[5]
+plot(showOBV ? obvValue : na, title = "OBV", color = color.teal, linewidth = 2)
+plot(showOBV ? obvSma : na, title = "OBV SMA", color = color.orange, linewidth = 3)
+//======================================================
+// MINERVINI TABLE DISPLAY SETTINGS
+//======================================================
+string tableDisplayGroup = "Minervini V2.2 Table: Display"
+bool showMinerviniTable = input.bool(true, "Show Minervini V2 Table", group = tableDisplayGroup)
+string tablePositionInput = input.string("Top Right", "Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = tableDisplayGroup)
+string tableSizeInput = input.string("Small", "Table Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = tableDisplayGroup)
+// Summary / safety
+bool showStockQualityScoreRow = input.bool(true, "Show Stock Quality Score", group = tableDisplayGroup)
+bool showSetupQualityScoreRow = input.bool(true, "Show Setup Quality Score", group = tableDisplayGroup)
+bool showEntryQualityScoreRow = input.bool(true, "Show Entry Quality Score", group = tableDisplayGroup)
+bool showTimeframeRow = input.bool(true, "Show Timeframe Row", group = tableDisplayGroup)
+// Stage 1 - Stock qualification / structural strength
+bool showMarketRow = input.bool(true, "Show Market Regime", group = tableDisplayGroup)
+bool showTprRow = input.bool(true, "Show Trend Template", group = tableDisplayGroup)
+bool showRprRow = input.bool(true, "Show Relative Performance", group = tableDisplayGroup)
+bool showRsLineRow = input.bool(true, "Show RS Line State", group = tableDisplayGroup)
+bool showLiquidityRow = input.bool(true, "Show Liquidity", group = tableDisplayGroup)
+bool show52WeekHighDistanceRow = input.bool(true, "Show Distance From 52W High", group = tableDisplayGroup)
+bool show52WeekLowDistanceRow = input.bool(true, "Show Distance From 52W Low", group = tableDisplayGroup)
+bool show5YearMaxDrawdownRow = input.bool(true, "Show 5Y Max Drawdown", group = tableDisplayGroup)
+// Stage 2 - Setup quality / accumulation and contraction
+bool showVcpRow = input.bool(true, "Show VCP Score", group = tableDisplayGroup)
+bool showVolumeRow = input.bool(true, "Show Volume Dry-Up / RVOL", group = tableDisplayGroup)
+bool showPressureRow = input.bool(true, "Show Pressure Row", group = tableDisplayGroup)
+bool showDistributionRow = input.bool(true, "Show Distribution Days", group = tableDisplayGroup)
+bool showObvStateRow = input.bool(true, "Show OBV State", group = tableDisplayGroup)
+// Stage 3 - Entry timing / chase risk
+bool showPivotRow = input.bool(true, "Show Pivot Row", group = tableDisplayGroup)
+bool showRiskRow = input.bool(true, "Show Extension Risk", group = tableDisplayGroup)
+// Price-chart markers
+bool showVcpDots = input.bool(true, "Show VCP Ready Dots", group = tableDisplayGroup)
+bool showMomentumPivot = input.bool(true, "Show 20-Day Momentum Pivot", group = tableDisplayGroup)
+//======================================================
+// MINERVINI MOVING AVERAGE SETTINGS
+//======================================================
+string minerviniMaGroup = "Minervini V2.2: Moving Averages"
+int minerviniMa50Length = input.int(50, "50-Day SMA Length", minval = 1, group = minerviniMaGroup)
+int minerviniMa150Length = input.int(150, "150-Day SMA Length", minval = 1, group = minerviniMaGroup)
+int minerviniMa200Length = input.int(200, "200-Day SMA Length", minval = 1, group = minerviniMaGroup)
+bool showMinerviniMAs = input.bool(false, "Show 50/150/200 SMA Lines", group = minerviniMaGroup)
+color minerviniMa50Color = input.color(color.blue, "50-Day SMA Color", group = minerviniMaGroup)
+color minerviniMa150Color = input.color(color.orange, "150-Day SMA Color", group = minerviniMaGroup)
+color minerviniMa200Color = input.color(color.red, "200-Day SMA Color", group = minerviniMaGroup)
+float minerviniMa50 = ta.sma(close, minerviniMa50Length)
+float minerviniMa150 = ta.sma(close, minerviniMa150Length)
+float minerviniMa200 = ta.sma(close, minerviniMa200Length)
+plot(showMinerviniMAs ? minerviniMa50 : na, title = "Minervini 50 SMA", color = minerviniMa50Color, linewidth = 2, force_overlay = true)
+plot(showMinerviniMAs ? minerviniMa150 : na, title = "Minervini 150 SMA", color = minerviniMa150Color, linewidth = 2, force_overlay = true)
+plot(showMinerviniMAs ? minerviniMa200 : na, title = "Minervini 200 SMA", color = minerviniMa200Color, linewidth = 2, force_overlay = true)
+//======================================================
+// TABLE COLORS
+//======================================================
+string tableColorGroup = "Minervini V2.2 Table: Colors"
+color tableLabelTextColor = input.color(color.white, "Label Text Color", group = tableColorGroup)
+color tableValueTextColor = input.color(color.white, "Value Text Color", group = tableColorGroup)
+color tableLabelBackground = input.color(color.new(color.gray, 20), "Label Background", group = tableColorGroup)
+color tableGoodColor = input.color(color.green, "Status: GOOD", group = tableColorGroup)
+color tableWarningColor = input.color(color.yellow, "Status: WARNING", group = tableColorGroup)
+color tableBadColor = input.color(color.new(color.red, 10), "Status: BAD", group = tableColorGroup)
+color tableNeutralColor = input.color(color.gray, "Status: NEUTRAL", group = tableColorGroup)
+color tableSqueezeColor = input.color(color.aqua, "Status: VCP READY", group = tableColorGroup)
+//======================================================
+// MINERVINI V2 PARAMETERS
+//======================================================
+string minerviniParameterGroup = "Minervini V2.2: Parameters"
+float vcpTightRange5 = input.float(4.0, "Max 5-Day Range %", minval = 0.5, step = 0.25, group = minerviniParameterGroup)
+float vcpAtrCompressionFactor = input.float(0.80, "ATR Compression Factor", minval = 0.20, maxval = 1.20, step = 0.05, group = minerviniParameterGroup)
+float vcpVolumeDryFactor = input.float(0.70, "Volume Dry-Up Factor", minval = 0.10, maxval = 1.20, step = 0.05, group = minerviniParameterGroup)
+float nearHighPercent = input.float(85.0, "VCP Must Be Within % Of 52W High", minval = 50, maxval = 100, step = 1, group = minerviniParameterGroup)
+int momentumPivotLookback = input.int(20, "Momentum Pivot Lookback", minval = 5, group = minerviniParameterGroup)
+float nearPivotPercent = input.float(5.0, "Near Pivot Distance %", minval = 0.5, step = 0.5, group = minerviniParameterGroup)
+float minLiquidityCr = input.float(10.0, "Preferred 20D Avg Turnover (₹ Cr)", minval = 0.1, step = 0.5, group = minerviniParameterGroup)
+string benchmarkSymbol = input.symbol("NSE:CNX500", "Benchmark Symbol", group = minerviniParameterGroup)
+//======================================================
+// TIMEFRAME SAFETY
+//======================================================
+bool isDaily = timeframe.isdaily
+string timeframeText = isDaily ? "DAILY ✓" : "USE DAILY"
+color timeframeColor = isDaily ? tableGoodColor : tableBadColor
+//======================================================
+// TPR: MINERVINI TREND TEMPLATE - 7/7
+//======================================================
+float high52Week = ta.highest(high, 252)
+float low52Week = ta.lowest(low, 252)
+// Distance from current close to 52-week extremes
+float distanceFrom52WeekHigh = high52Week != 0 ? (high52Week - close) / high52Week * 100 : na
+float distanceFrom52WeekLow = low52Week != 0 ? (close - low52Week) / low52Week * 100 : na
+string distanceFrom52WeekHighText = na(distanceFrom52WeekHigh) ? "N/A" : str.tostring(distanceFrom52WeekHigh, "#.1") + "% below high"
+string distanceFrom52WeekLowText = na(distanceFrom52WeekLow) ? "N/A" : str.tostring(distanceFrom52WeekLow, "#.1") + "% above low"
+// Colors mirror the existing Minervini 52W trend-template thresholds.
+color distanceFrom52WeekHighColor = na(distanceFrom52WeekHigh) ? tableNeutralColor : distanceFrom52WeekHigh <= 15 ? tableGoodColor : distanceFrom52WeekHigh <= 25 ? tableWarningColor : tableBadColor
+color distanceFrom52WeekLowColor = na(distanceFrom52WeekLow) ? tableNeutralColor : distanceFrom52WeekLow >= 25 ? tableGoodColor : distanceFrom52WeekLow >= 15 ? tableWarningColor : tableBadColor
+//======================================================
+// 5-YEAR MAXIMUM DRAWDOWN
+// Uses the latest 1,260 daily closes (~5 trading years).
+// Informational only: does not affect any score or signal.
+//======================================================
+var drawdownCloseHistory = array.new_float()
+array.push(drawdownCloseHistory, close)
+float maxDrawdown5Y = na
+if barstate.islast and array.size(drawdownCloseHistory) > 0
+    int drawdownHistorySize = array.size(drawdownCloseHistory)
+    int drawdownStartIndex = drawdownHistorySize > 1260 ? drawdownHistorySize - 1260 : 0
+    float runningPeak5Y = array.get(drawdownCloseHistory, drawdownStartIndex)
+    float worstDrawdown5Y = 0.0
+    if drawdownStartIndex < drawdownHistorySize - 1
+        for i = drawdownStartIndex + 1 to drawdownHistorySize - 1
+            float drawdownPrice = array.get(drawdownCloseHistory, i)
+            runningPeak5Y := math.max(runningPeak5Y, drawdownPrice)
+            float currentDrawdown5Y = runningPeak5Y > 0 ? (drawdownPrice - runningPeak5Y) / runningPeak5Y * 100 : 0.0
+            worstDrawdown5Y := math.min(worstDrawdown5Y, currentDrawdown5Y)
+    maxDrawdown5Y := worstDrawdown5Y
+string maxDrawdown5YText = na(maxDrawdown5Y) ? "N/A" : str.tostring(maxDrawdown5Y, "#.1") + "%"
+bool trendCriterion1 = close > minerviniMa150 and close > minerviniMa200
+bool trendCriterion2 = minerviniMa150 > minerviniMa200
+bool trendCriterion3 = minerviniMa200 > minerviniMa200[20]
+bool trendCriterion4 = minerviniMa50 > minerviniMa150 and minerviniMa50 > minerviniMa200
+bool trendCriterion5 = close > minerviniMa50
+bool trendCriterion6 = close > low52Week * 1.25
+bool trendCriterion7 = close > high52Week * 0.75
+int trendPassCount =
+     (trendCriterion1 ? 1 : 0) +
+     (trendCriterion2 ? 1 : 0) +
+     (trendCriterion3 ? 1 : 0) +
+     (trendCriterion4 ? 1 : 0) +
+     (trendCriterion5 ? 1 : 0) +
+     (trendCriterion6 ? 1 : 0) +
+     (trendCriterion7 ? 1 : 0)
+bool trendTemplatePassed = trendPassCount == 7
+string trendTemplateText = str.tostring(trendPassCount) + "/7 " + (trendTemplatePassed ? "PASS" : trendPassCount >= 6 ? "NEAR" : "WAIT")
+color trendTemplateColor = trendTemplatePassed ? tableGoodColor : trendPassCount >= 6 ? tableWarningColor : tableBadColor
+//======================================================
+// EXTENSION / BUY RISK
+//======================================================
+float distanceFrom50Sma = minerviniMa50 != 0 ? (close - minerviniMa50) / minerviniMa50 * 100 : na
+float atrExtension = atr != 0 ? (close - ma) / atr : na
+string signedDistance50 = na(distanceFrom50Sma) ? "N/A" : (distanceFrom50Sma > 0 ? "+" : "") + str.tostring(distanceFrom50Sma, "#.0")
+string extensionText =
+     na(distanceFrom50Sma) or na(atrExtension)
+     ? "N/A"
+     : signedDistance50 + "% | " + str.tostring(atrExtension, "#.1") + " ATR"
+color extensionColor =
+     na(distanceFrom50Sma) or na(atrExtension)
+     ? tableNeutralColor
+     : distanceFrom50Sma < 0
+     ? tableBadColor
+     : distanceFrom50Sma <= 10 and atrExtension <= 2
+     ? tableGoodColor
+     : distanceFrom50Sma <= 15 and atrExtension <= 3
+     ? tableWarningColor
+     : tableBadColor
+bool notExtended = not na(distanceFrom50Sma) and not na(atrExtension) and distanceFrom50Sma >= 0 and distanceFrom50Sma <= 10 and atrExtension <= 2
+bool moderatelyExtended = not na(distanceFrom50Sma) and not na(atrExtension) and distanceFrom50Sma > 10 and distanceFrom50Sma <= 15 and atrExtension <= 3
+//======================================================
+// PRESSURE: 20-BAR UP/DOWN VOLUME PERCENTAGE
+//======================================================
+float tableBuyVolume = math.sum(close > close[1] ? volume : 0, 20)
+float tableSellVolume = math.sum(close < close[1] ? volume : 0, 20)
+float pressureTotal = tableBuyVolume + tableSellVolume
+float pressurePct = pressureTotal > 0 ? 100 * tableBuyVolume / pressureTotal : 50
+string pressureText =
+     str.tostring(pressurePct, "#.0") + "% " +
+     (pressurePct >= 60 ? "BUY" : pressurePct >= 55 ? "MILD BUY" : pressurePct <= 45 ? "SELL" : "NEUTRAL")
+color pressureColor =
+     pressurePct >= 60
+     ? tableGoodColor
+     : pressurePct >= 55
+     ? tableWarningColor
+     : pressurePct <= 45
+     ? tableBadColor
+     : tableNeutralColor
+//======================================================
+// RELATIVE PERFORMANCE VS BENCHMARK
+// IMPORTANT: this is NOT a percentile RS Rating.
+//======================================================
+rateOfChange(float source, int length) =>
+    not na(source[length]) and source[length] != 0 ? (source - source[length]) / source[length] * 100 : na
+float stockRoc3Month = rateOfChange(close, 63)
+float stockRoc6Month = rateOfChange(close, 126)
+float stockRoc9Month = rateOfChange(close, 189)
+float stockRoc12Month = rateOfChange(close, 252)
+float benchmarkClose = request.security(benchmarkSymbol, timeframe.period, close)
+float benchmarkRoc3Month = rateOfChange(benchmarkClose, 63)
+float benchmarkRoc6Month = rateOfChange(benchmarkClose, 126)
+float benchmarkRoc9Month = rateOfChange(benchmarkClose, 189)
+float benchmarkRoc12Month = rateOfChange(benchmarkClose, 252)
+float stockWeightedPerformance =
+     stockRoc3Month * 0.40 +
+     stockRoc6Month * 0.20 +
+     stockRoc9Month * 0.20 +
+     stockRoc12Month * 0.20
+float benchmarkWeightedPerformance =
+     benchmarkRoc3Month * 0.40 +
+     benchmarkRoc6Month * 0.20 +
+     benchmarkRoc9Month * 0.20 +
+     benchmarkRoc12Month * 0.20
+float relativePerformance = stockWeightedPerformance - benchmarkWeightedPerformance
+string relativePerformanceText = na(relativePerformance) ? "N/A" : (relativePerformance > 0 ? "+" : "") + str.tostring(relativePerformance, "#.1") + "%"
+color relativePerformanceColor = na(relativePerformance) ? tableNeutralColor : relativePerformance >= 15 ? tableGoodColor : relativePerformance > 0 ? tableWarningColor : tableBadColor
+float rsLine = benchmarkClose != 0 ? close / benchmarkClose : na
+float rsLineHigh252 = ta.highest(rsLine, 252)
+bool rsLineNearHigh = not na(rsLine) and not na(rsLineHigh252) and rsLine >= rsLineHigh252 * 0.98
+string rsLineText = rsLineNearHigh ? "NEW/NEAR HIGH" : "BELOW HIGH"
+color rsLineColor = rsLineNearHigh ? tableGoodColor : tableNeutralColor
+//======================================================
+// MARKET REGIME USING BENCHMARK
+//======================================================
+float benchmarkMa50 = ta.sma(benchmarkClose, 50)
+float benchmarkMa200 = ta.sma(benchmarkClose, 200)
+bool marketBullish = benchmarkClose > benchmarkMa50 and benchmarkMa50 > benchmarkMa200
+bool marketCaution = benchmarkClose > benchmarkMa200 and not marketBullish
+string marketText = marketBullish ? "BULLISH" : marketCaution ? "CAUTION" : "WEAK"
+color marketColor = marketBullish ? tableGoodColor : marketCaution ? tableWarningColor : tableBadColor
+//======================================================
+// VCP V2: MULTI-FACTOR VOLATILITY CONTRACTION
+// 1) 5d < 10d < 20d range
+// 2) 5d range is tight enough
+// 3) ATR compression
+// 4) Volume dry-up
+// 5) Near 52-week high
+//======================================================
+float range20 = close != 0 ? (ta.highest(high, 20) - ta.lowest(low, 20)) / close * 100 : na
+float range10 = close != 0 ? (ta.highest(high, 10) - ta.lowest(low, 10)) / close * 100 : na
+float range5 = close != 0 ? (ta.highest(high, 5) - ta.lowest(low, 5)) / close * 100 : na
+bool contractionSequence = not na(range20) and not na(range10) and not na(range5) and range5 < range10 and range10 < range20
+bool tight5DayRange = not na(range5) and range5 <= vcpTightRange5
+float atrPct = close != 0 ? atr / close * 100 : na
+float atrPct5 = ta.sma(atrPct, 5)
+float atrPct20 = ta.sma(atrPct, 20)
+bool atrTight = not na(atrPct5) and not na(atrPct20) and atrPct5 < atrPct20 * vcpAtrCompressionFactor
+float vol5 = ta.sma(volume, 5)
+float vol20 = ta.sma(volume, 20)
+float volumeDryRatio = vol20 > 0 ? vol5 / vol20 : na
+bool volumeDry = not na(volumeDryRatio) and volumeDryRatio < vcpVolumeDryFactor
+bool near52WeekHigh = close >= high52Week * (nearHighPercent / 100.0)
+int vcpScore =
+     (contractionSequence ? 1 : 0) +
+     (tight5DayRange ? 1 : 0) +
+     (atrTight ? 1 : 0) +
+     (volumeDry ? 1 : 0) +
+     (near52WeekHigh ? 1 : 0)
+string vcpState = vcpScore == 5 ? "READY" : vcpScore == 4 ? "DEVELOPING" : vcpScore == 3 ? "WATCH" : "WEAK"
+string vcpText = str.tostring(vcpScore) + "/5 " + vcpState
+color vcpColor = vcpScore == 5 ? tableSqueezeColor : vcpScore == 4 ? tableGoodColor : vcpScore == 3 ? tableWarningColor : tableNeutralColor
+bool newVcpReady = vcpScore >= 4 and nz(vcpScore[1]) < 4
+plotshape(showVcpDots and newVcpReady, title = "VCP Ready Dot", style = shape.circle, location = location.belowbar, color = tableSqueezeColor, size = size.tiny, force_overlay = true)
+//======================================================
+// MOMENTUM PIVOT / DISTANCE TO BREAKOUT
+//======================================================
+float momentumPivot = ta.highest(high, momentumPivotLookback)[1]
+float pivotDistance = not na(momentumPivot) and momentumPivot != 0 ? (close - momentumPivot) / momentumPivot * 100 : na
+bool nearPivot = not na(pivotDistance) and pivotDistance <= 0 and pivotDistance >= -nearPivotPercent
+bool justAbovePivot = not na(pivotDistance) and pivotDistance > 0 and pivotDistance <= 2
+bool chaseRisk = not na(pivotDistance) and pivotDistance > 5
+string pivotText =
+     na(pivotDistance)
+     ? "N/A"
+     : (pivotDistance > 0 ? "+" : "") + str.tostring(pivotDistance, "#.1") + "% " +
+       (nearPivot ? "READY" : justAbovePivot ? "BREAKOUT" : chaseRisk ? "CHASE" : pivotDistance < -nearPivotPercent ? "EARLY" : "WATCH")
+color pivotColor = nearPivot ? tableGoodColor : justAbovePivot ? tableSqueezeColor : chaseRisk ? tableBadColor : tableNeutralColor
+plot(showMomentumPivot ? momentumPivot : na, title = "20-Day Momentum Pivot", color = color.new(color.fuchsia, 20), linewidth = 2, style = plot.style_linebr, force_overlay = true)
+bool pivotBreakoutConfirmed =
+     signalConfirmed and
+     ta.crossover(close, momentumPivot) and
+     goodBullCandle and
+     rvol >= breakoutRvolThreshold and
+     close > momentumPivot + atr * breakoutAtrBuffer
+plotshape(pivotBreakoutConfirmed, title = "Momentum Pivot Breakout", text = "P", style = shape.labelup, location = location.belowbar, color = color.lime, textcolor = color.black, size = size.tiny, force_overlay = true)
+//======================================================
+// VOLUME ROW
+//======================================================
+string volumeStateText =
+     "V5/20 " + (na(volumeDryRatio) ? "N/A" : str.tostring(volumeDryRatio, "#.2") + "x") +
+     " | RVOL " + (na(rvol) ? "N/A" : str.tostring(rvol, "#.2") + "x")
+bool volumeNearlyDry = not na(volumeDryRatio) and volumeDryRatio <= 0.85
+color volumeStateColor =
+     pivotBreakoutConfirmed
+     ? tableGoodColor
+     : volumeDry
+     ? tableSqueezeColor
+     : volumeNearlyDry
+     ? tableWarningColor
+     : rvol >= breakoutRvolThreshold
+     ? tableGoodColor
+     : tableNeutralColor
+//======================================================
+// DISTRIBUTION DAYS
+//======================================================
+bool distributionDay = close < close[1] and volume > volume[1]
+float distributionCount = math.sum(distributionDay ? 1.0 : 0.0, 20)
+string distributionText = str.tostring(distributionCount, "#.0") + "/20"
+color distributionColor = distributionCount <= 3 ? tableGoodColor : distributionCount <= 5 ? tableWarningColor : tableBadColor
+//======================================================
+// LIQUIDITY: 20-DAY AVERAGE TRADED VALUE
+//======================================================
+float turnover = close * volume
+float avgTurnover20 = ta.sma(turnover, 20)
+float avgTurnoverCr = avgTurnover20 / 10000000.0
+string liquidityText = "₹" + str.tostring(avgTurnoverCr, "#.1") + " Cr/day"
+color liquidityColor = avgTurnoverCr >= minLiquidityCr ? tableGoodColor : avgTurnoverCr >= minLiquidityCr * 0.5 ? tableWarningColor : tableBadColor
+//======================================================
+// OBV STATE TEXT
+//======================================================
+string obvStateText = obvBullishState ? "ACCUMULATING" : obvBearishState ? "DISTRIBUTING" : "NEUTRAL"
+color obvStateColor = obvBullishState ? tableGoodColor : obvBearishState ? tableBadColor : tableNeutralColor
+//======================================================
+// THREE SEPARATE SCORES (0-100)
+// 1) STOCK QUALITY: structural leadership / tradability
+// 2) SETUP QUALITY: contraction / accumulation quality
+// 3) ENTRY QUALITY: pivot location / extension / trigger
+//
+// IMPORTANT:
+// These scores are ranking aids, not probabilities of success.
+//======================================================
+//------------------------------------------------------
+// 1) STOCK QUALITY SCORE
+// Trend 40 + Relative Performance 25 + RS Line 20 + Liquidity 15
+//------------------------------------------------------
+float stockTrendPoints = trendPassCount / 7.0 * 40.0
+float stockRelativePoints =
+     na(relativePerformance)
+     ? 0.0
+     : relativePerformance >= 25
+     ? 25.0
+     : relativePerformance >= 15
+     ? 21.0
+     : relativePerformance >= 5
+     ? 14.0
+     : relativePerformance > 0
+     ? 8.0
+     : 0.0
+float rsLineDistancePct =
+     not na(rsLine) and not na(rsLineHigh252) and rsLineHigh252 != 0
+     ? (rsLine - rsLineHigh252) / rsLineHigh252 * 100
+     : na
+bool rsLineWithin5Pct = not na(rsLineDistancePct) and rsLineDistancePct >= -5.0
+float stockRsLinePoints =
+     rsLineNearHigh
+     ? 20.0
+     : rsLineWithin5Pct
+     ? 10.0
+     : 0.0
+float stockLiquidityPoints =
+     avgTurnoverCr >= minLiquidityCr * 2.0
+     ? 15.0
+     : avgTurnoverCr >= minLiquidityCr
+     ? 10.0
+     : avgTurnoverCr >= minLiquidityCr * 0.5
+     ? 5.0
+     : 0.0
+float stockQualityScoreRaw =
+     stockTrendPoints +
+     stockRelativePoints +
+     stockRsLinePoints +
+     stockLiquidityPoints
+float stockQualityScore = math.max(0.0, math.min(100.0, stockQualityScoreRaw))
+string stockQualityGrade =
+     stockQualityScore >= 85
+     ? "LEADER"
+     : stockQualityScore >= 75
+     ? "STRONG"
+     : stockQualityScore >= 65
+     ? "WATCH"
+     : "WEAK"
+string stockQualityText = str.tostring(stockQualityScore, "#.0") + " / " + stockQualityGrade
+color stockQualityColor =
+     stockQualityScore >= 85
+     ? tableSqueezeColor
+     : stockQualityScore >= 75
+     ? tableGoodColor
+     : stockQualityScore >= 65
+     ? tableWarningColor
+     : tableBadColor
+//------------------------------------------------------
+// 2) SETUP QUALITY SCORE
+// VCP 50 + Pressure 15 + Distribution 15 + OBV 15 + Volume Dry-Up 5
+//------------------------------------------------------
+float setupVcpPoints = vcpScore / 5.0 * 50.0
+float setupPressurePoints =
+     pressurePct >= 65
+     ? 15.0
+     : pressurePct >= 60
+     ? 12.0
+     : pressurePct >= 55
+     ? 8.0
+     : pressurePct >= 45
+     ? 4.0
+     : 0.0
+float setupDistributionPoints =
+     distributionCount <= 2
+     ? 15.0
+     : distributionCount <= 3
+     ? 12.0
+     : distributionCount <= 4
+     ? 8.0
+     : distributionCount <= 5
+     ? 4.0
+     : 0.0
+float setupObvPoints =
+     obvBullishState
+     ? 15.0
+     : obvBearishState
+     ? 0.0
+     : 7.0
+float setupVolumePoints =
+     volumeDry
+     ? 5.0
+     : volumeNearlyDry
+     ? 2.0
+     : 0.0
+float setupQualityScoreRaw =
+     setupVcpPoints +
+     setupPressurePoints +
+     setupDistributionPoints +
+     setupObvPoints +
+     setupVolumePoints
+float setupQualityScore = math.max(0.0, math.min(100.0, setupQualityScoreRaw))
+string setupQualityGrade =
+     setupQualityScore >= 85
+     ? "READY"
+     : setupQualityScore >= 70
+     ? "DEVELOPING"
+     : setupQualityScore >= 55
+     ? "WATCH"
+     : "WEAK"
+string setupQualityText = str.tostring(setupQualityScore, "#.0") + " / " + setupQualityGrade
+color setupQualityColor =
+     setupQualityScore >= 85
+     ? tableSqueezeColor
+     : setupQualityScore >= 70
+     ? tableGoodColor
+     : setupQualityScore >= 55
+     ? tableWarningColor
+     : tableBadColor
+//------------------------------------------------------
+// 3) ENTRY QUALITY SCORE
+// Pivot location 50 + Extension 30 + Trigger/confirmation 20
+//------------------------------------------------------
+bool pivotIdealReady =
+     not na(pivotDistance) and
+     pivotDistance <= 0 and
+     pivotDistance >= -3.0
+bool pivotAcceptableReady =
+     not na(pivotDistance) and
+     pivotDistance < -3.0 and
+     pivotDistance >= -nearPivotPercent
+bool pivotSlightlyLate =
+     not na(pivotDistance) and
+     pivotDistance > 2.0 and
+     pivotDistance <= 5.0
+bool pivotEarly =
+     not na(pivotDistance) and
+     pivotDistance < -nearPivotPercent and
+     pivotDistance >= -10.0
+float entryPivotPoints =
+     pivotIdealReady
+     ? 50.0
+     : justAbovePivot
+     ? 45.0
+     : pivotAcceptableReady
+     ? 40.0
+     : pivotSlightlyLate
+     ? 20.0
+     : pivotEarly
+     ? 20.0
+     : 0.0
+bool extensionExcellent =
+     not na(distanceFrom50Sma) and
+     not na(atrExtension) and
+     distanceFrom50Sma >= 0 and
+     distanceFrom50Sma <= 5 and
+     atrExtension <= 1.5
+bool extensionGood =
+     not na(distanceFrom50Sma) and
+     not na(atrExtension) and
+     distanceFrom50Sma > 5 and
+     distanceFrom50Sma <= 10 and
+     atrExtension <= 2.0
+bool extensionAcceptable =
+     not na(distanceFrom50Sma) and
+     not na(atrExtension) and
+     distanceFrom50Sma > 10 and
+     distanceFrom50Sma <= 15 and
+     atrExtension <= 3.0
+float entryExtensionPoints =
+     extensionExcellent
+     ? 30.0
+     : extensionGood
+     ? 25.0
+     : extensionAcceptable
+     ? 10.0
+     : 0.0
+float entryConfirmationPoints =
+     pivotBreakoutConfirmed
+     ? 20.0
+     : justAbovePivot and rvol >= breakoutRvolThreshold and goodBullCandle
+     ? 16.0
+     : nearPivot
+     ? 10.0
+     : rvol >= breakoutRvolThreshold and close > open
+     ? 6.0
+     : 0.0
+float entryQualityScoreRaw =
+     entryPivotPoints +
+     entryExtensionPoints +
+     entryConfirmationPoints
+float entryQualityScore = math.max(0.0, math.min(100.0, entryQualityScoreRaw))
+string entryQualityGrade =
+     entryQualityScore >= 85
+     ? "READY"
+     : entryQualityScore >= 70
+     ? "GOOD"
+     : entryQualityScore >= 55
+     ? "WATCH"
+     : chaseRisk or distanceFrom50Sma > 15 or atrExtension > 3
+     ? "CHASE"
+     : "EARLY"
+string entryQualityText = str.tostring(entryQualityScore, "#.0") + " / " + entryQualityGrade
+color entryQualityColor =
+     entryQualityScore >= 85
+     ? tableSqueezeColor
+     : entryQualityScore >= 70
+     ? tableGoodColor
+     : entryQualityScore >= 55
+     ? tableWarningColor
+     : chaseRisk or distanceFrom50Sma > 15 or atrExtension > 3
+     ? tableBadColor
+     : tableNeutralColor
+//======================================================
+// TABLE POSITION AND SIZE
+//======================================================
+tablePosition =
+     tablePositionInput == "Top Left" ? position.top_left :
+     tablePositionInput == "Top Center" ? position.top_center :
+     tablePositionInput == "Top Right" ? position.top_right :
+     tablePositionInput == "Middle Left" ? position.middle_left :
+     tablePositionInput == "Middle Center" ? position.middle_center :
+     tablePositionInput == "Middle Right" ? position.middle_right :
+     tablePositionInput == "Bottom Left" ? position.bottom_left :
+     tablePositionInput == "Bottom Center" ? position.bottom_center :
+     position.bottom_right
+tableTextSize =
+     tableSizeInput == "Tiny" ? size.tiny :
+     tableSizeInput == "Small" ? size.small :
+     tableSizeInput == "Normal" ? size.normal :
+     tableSizeInput == "Large" ? size.large :
+     size.huge
+//======================================================
+// MINERVINI V2.2 TABLE - THREE SCORES + DECISION STAGES
+// Summary -> Stage 1 -> Stage 2 -> Stage 3
+//======================================================
+var table minerviniTable = table.new(tablePosition, 2, 19, border_width = 1)
+if barstate.islast
+    table.clear(minerviniTable, 0, 0, 1, 18)
+    int tableRow = 0
+    if showMinerviniTable
+        // -------------------------------------------------
+        // SUMMARY / SAFETY
+        // -------------------------------------------------
+        if showStockQualityScoreRow
+            table.cell(minerviniTable, 0, tableRow, "Stock Quality", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, stockQualityText, bgcolor = stockQualityColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showSetupQualityScoreRow
+            table.cell(minerviniTable, 0, tableRow, "Setup Quality", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, setupQualityText, bgcolor = setupQualityColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showEntryQualityScoreRow
+            table.cell(minerviniTable, 0, tableRow, "Entry Quality", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, entryQualityText, bgcolor = entryQualityColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showTimeframeRow
+            table.cell(minerviniTable, 0, tableRow, "Timeframe", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, timeframeText, bgcolor = timeframeColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        // -------------------------------------------------
+        // STAGE 1 - STOCK QUALIFICATION / STRUCTURAL STRENGTH
+        // -------------------------------------------------
+        if showMarketRow
+            table.cell(minerviniTable, 0, tableRow, "Market", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, marketText, bgcolor = marketColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showTprRow
+            table.cell(minerviniTable, 0, tableRow, "Trend", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, trendTemplateText, bgcolor = trendTemplateColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if show52WeekHighDistanceRow
+            table.cell(minerviniTable, 0, tableRow, "52W High Dist", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, distanceFrom52WeekHighText, bgcolor = distanceFrom52WeekHighColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if show52WeekLowDistanceRow
+            table.cell(minerviniTable, 0, tableRow, "52W Low Dist", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, distanceFrom52WeekLowText, bgcolor = distanceFrom52WeekLowColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if show5YearMaxDrawdownRow
+            table.cell(minerviniTable, 0, tableRow, "5Y Max DD", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, maxDrawdown5YText, bgcolor = tableNeutralColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showRprRow
+            table.cell(minerviniTable, 0, tableRow, "Rel Perf", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, relativePerformanceText, bgcolor = relativePerformanceColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showRsLineRow
+            table.cell(minerviniTable, 0, tableRow, "RS Line", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, rsLineText, bgcolor = rsLineColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showLiquidityRow
+            table.cell(minerviniTable, 0, tableRow, "Liquidity", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, liquidityText, bgcolor = liquidityColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        // -------------------------------------------------
+        // STAGE 2 - SETUP QUALITY / ACCUMULATION & CONTRACTION
+        // -------------------------------------------------
+        if showVcpRow
+            table.cell(minerviniTable, 0, tableRow, "VCP", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, vcpText, bgcolor = vcpColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showVolumeRow
+            table.cell(minerviniTable, 0, tableRow, "Volume", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, volumeStateText, bgcolor = volumeStateColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showPressureRow
+            table.cell(minerviniTable, 0, tableRow, "Pressure", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, pressureText, bgcolor = pressureColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showDistributionRow
+            table.cell(minerviniTable, 0, tableRow, "Distribution", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, distributionText, bgcolor = distributionColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showObvStateRow
+            table.cell(minerviniTable, 0, tableRow, "OBV", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, obvStateText, bgcolor = obvStateColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        // -------------------------------------------------
+        // STAGE 3 - ENTRY TIMING / CHASE RISK
+        // -------------------------------------------------
+        if showPivotRow
+            table.cell(minerviniTable, 0, tableRow, "Pivot", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, pivotText, bgcolor = pivotColor, text_color = tableValueTextColor, text_size = tableTextSize)
+            tableRow += 1
+        if showRiskRow
+            table.cell(minerviniTable, 0, tableRow, "Extension", bgcolor = tableLabelBackground, text_color = tableLabelTextColor, text_size = tableTextSize)
+            table.cell(minerviniTable, 1, tableRow, extensionText, bgcolor = extensionColor, text_color = tableValueTextColor, text_size = tableTextSize)
+//======================================================
+// ALERT CONDITIONS
+//======================================================
+bool obvBullishCross = ta.crossover(obvValue, obvSma)
+bool obvBearishCross = ta.crossunder(obvValue, obvSma)
+bool stockLeaderTrigger = stockQualityScore >= 85 and stockQualityScore[1] < 85
+bool setupReadyTrigger = setupQualityScore >= 85 and setupQualityScore[1] < 85
+bool entryReadyTrigger = entryQualityScore >= 85 and entryQualityScore[1] < 85
+bool marketBullishTrigger = marketBullish and not marketBullish[1]
+alertcondition(obvBullishCross, title = "OBV Crossed Above SMA", message = "OBV crossed above its moving average.")
+alertcondition(obvBearishCross, title = "OBV Crossed Below SMA", message = "OBV crossed below its moving average.")
+alertcondition(supportBreak, title = "Support Broken", message = "Confirmed support breakdown with volume.")
+alertcondition(resistanceBreak, title = "Resistance Broken", message = "Confirmed resistance breakout with volume.")
+alertcondition(newVcpReady, title = "VCP Developing/Ready", message = "VCP score reached 4/5 or better.")
+alertcondition(pivotBreakoutConfirmed, title = "Momentum Pivot Breakout", message = "Confirmed momentum pivot breakout with RVOL.")
+alertcondition(stockLeaderTrigger, title = "Stock Quality Leader", message = "Stock Quality crossed 85.")
+alertcondition(setupReadyTrigger, title = "Setup Quality Ready", message = "Setup Quality crossed 85.")
+alertcondition(entryReadyTrigger, title = "Entry Quality Ready", message = "Entry Quality crossed 85.")
+alertcondition(marketBullishTrigger, title = "Benchmark Regime Bullish", message = "Benchmark market regime turned bullish.")

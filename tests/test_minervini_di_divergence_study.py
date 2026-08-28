@@ -18,10 +18,15 @@ from stock_screener.minervini_di_divergence_study import (
     run_minervini_di_divergence_study,
     save_minervini_di_divergence_outputs,
 )
-from stock_screener.web.main import app
+from stock_screener.web.main import _parse_nse_symbol_list, app
 
 
 class MinerviniDiDivergenceStudyTests(unittest.TestCase):
+    def test_target_symbol_parser_accepts_commas_spaces_lines_and_nse_prefix(self) -> None:
+        symbols = _parse_nse_symbol_list("NSE:RELIANCE, infy\nHDFCBANK;INFY")
+
+        self.assertEqual(symbols, ["RELIANCE", "INFY", "HDFCBANK"])
+
     def test_two_day_divergence_requires_plus_up_minus_down_and_plus_above(self) -> None:
         dates = pd.bdate_range("2026-08-03", periods=3)
         passing = pd.DataFrame(
@@ -110,6 +115,36 @@ class MinerviniDiDivergenceStudyTests(unittest.TestCase):
         self.assertFalse(bool(result.stock_stats.iloc[0]["minervini_threshold_pass"]))
         self.assertFalse(bool(result.stock_stats.iloc[0]["combined_pass"]))
 
+    def test_combined_scan_rejects_stock_date_that_trails_benchmark(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            daily = self._daily_frame()
+            storage.save_candles("NSE", "STALE", daily, "1D")
+            storage.save_candles(
+                "NSE_INDEX",
+                "NIFTY 500",
+                pd.DataFrame({"date": daily["date"], "close": 100.0}),
+                "1D",
+            )
+            stale_quality = {**self._quality_metrics(90.0, 90.0, 90.0), "latest_date": "2026-06-26"}
+
+            with (
+                patch(
+                    "stock_screener.minervini_di_divergence_study.calculate_adx_di",
+                    return_value=self._adx_frame(daily["date"]),
+                ),
+                patch(
+                    "stock_screener.minervini_di_divergence_study.evaluate_minervini_quality",
+                    return_value=stale_quality,
+                ),
+            ):
+                result = run_minervini_di_divergence_study(storage, symbols=["STALE"])
+
+        row = result.stock_stats.iloc[0]
+        self.assertFalse(bool(row["is_latest_market_date"]))
+        self.assertFalse(bool(row["combined_pass"]))
+        self.assertEqual(int(result.summary["stale_stock_dates"]), 1)
+
     def test_pre_breakout_watchlist_requires_every_hard_condition(self) -> None:
         divergence = {"di_divergence_pass": True}
         quality = self._quality_metrics(90.0, 85.0, 80.0)
@@ -191,6 +226,19 @@ class MinerviniDiDivergenceStudyTests(unittest.TestCase):
                 ),
             )
             save_minervini_di_divergence_outputs(result, data_root / "minervini_di_divergence")
+            targeted_result = MinerviniDiDivergenceStudyResult(
+                summary={
+                    **result.summary,
+                    "requested_symbols_csv": "PASS,FAIL",
+                    "refresh_requested_count": 2,
+                    "refresh_unavailable_count": 0,
+                },
+                stock_stats=result.stock_stats,
+            )
+            save_minervini_di_divergence_outputs(
+                targeted_result,
+                data_root / "minervini_di_divergence_targeted",
+            )
 
             with (
                 patch.dict(os.environ, {"DATA_ROOT": temp_dir}),
@@ -205,6 +253,33 @@ class MinerviniDiDivergenceStudyTests(unittest.TestCase):
         self.assertIn("Run DI + Minervini Scan", response.text)
         self.assertIn("Pre-Breakout Watchlist", response.text)
         self.assertIn('id="pre-breakout-symbols-csv"', response.text)
+        self.assertIn("Scan Selected Stocks", response.text)
+        self.assertIn('action="/minervini-di-divergence/run-targeted"', response.text)
+        self.assertIn('id="targeted-minervini-symbols"', response.text)
+
+    def test_targeted_run_passes_only_submitted_symbols_to_background_job(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            with (
+                patch("stock_screener.web.main.get_data_root", return_value=Path(temp_dir)),
+                patch("stock_screener.web.main._run_minervini_di_divergence_job") as run_job,
+            ):
+                response = TestClient(app).post(
+                    "/minervini-di-divergence/run-targeted",
+                    data={
+                        "target_symbols": "RELIANCE, INFY\nHDFCBANK",
+                        "adx_length": "14",
+                        "divergence_days": "2",
+                        "min_score": "70",
+                    },
+                    follow_redirects=False,
+                )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("targeted_job=", response.headers["location"])
+        run_job.assert_called_once()
+        args = run_job.call_args.args
+        self.assertEqual(args[6], ["RELIANCE", "INFY", "HDFCBANK"])
+        self.assertTrue(args[7])
 
     @staticmethod
     def _daily_frame() -> pd.DataFrame:
@@ -236,7 +311,7 @@ class MinerviniDiDivergenceStudyTests(unittest.TestCase):
     @staticmethod
     def _quality_metrics(stock: float, setup: float, entry: float) -> dict[str, object]:
         return {
-            "latest_date": "2026-06-30",
+            "latest_date": "2026-06-29",
             "latest_close": 100.0,
             "data_status": "READY",
             "stock_quality_score": stock,

@@ -1,0 +1,232 @@
+{% extends "base.html" %}
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">KNOXVILLE RECOVERY STUDY</p>
+      <h1>Measure the line, the fall, and the recovery</h1>
+      <p class="lede">Finds bullish Knoxville endpoints near the lower Envelope, then measures how often and how quickly price recovers.</p>
+    </div>
+  </section>
+
+  {% if envelope_comparison %}
+    <section class="panel">
+      <h2>Envelope length comparison</h2>
+      <p>Both tests use the same current NSE universe, Knoxville settings, 18% Envelope width, 3% endpoint proximity, next-day-high entry, and endpoint-drop target exit.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Envelope Length</th><th>Qualified Events</th><th>Median Drop %</th><th>20D Target Hit %</th><th>60D Target Hit %</th><th>120D Target Hit %</th><th>60D One-Position Hit %</th><th>Current Candidates</th></tr></thead>
+          <tbody>
+            {% for row in envelope_comparison %}
+              <tr>
+                <td>{{ row.get("envelope_length", "")|int }}</td>
+                <td>{{ row.get("qualifying_events", 0)|int }}</td>
+                <td>{{ row.get("median_drop_pct", "")|number }}</td>
+                <td>{{ row.get("entry_20d_drop_target_hit_rate_pct", "")|number }}</td>
+                <td>{{ row.get("entry_60d_drop_target_hit_rate_pct", "")|number }}</td>
+                <td>{{ row.get("entry_120d_drop_target_hit_rate_pct", "")|number }}</td>
+                <td>{{ row.get("entry_60d_non_overlapping_drop_target_hit_rate_pct", "")|number }}</td>
+                <td>{{ row.get("current_candidates", 0)|int }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="panel">
+    <form action="/knox-recovery/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>Backtest start date<input type="date" name="start_date" value="{{ start_date }}" required></label>
+      <label>Knox bars back<input type="number" name="knox_lookback" min="5" value="{{ knox_lookback }}"></label>
+      <label>RSI period<input type="number" name="rsi_length" min="1" value="{{ rsi_length }}"></label>
+      <label>Momentum period<input type="number" name="momentum_length" min="1" value="{{ momentum_length }}"></label>
+      <label>Envelope length<input type="number" name="envelope_length" min="1" value="{{ envelope_length }}"></label>
+      <label>Envelope percent<input type="number" name="envelope_percent" min="0" step="0.1" value="{{ envelope_percent }}"></label>
+      <label>Envelope average
+        <select name="envelope_ma_type">
+          <option value="SMA" {% if envelope_ma_type == "SMA" %}selected{% endif %}>SMA</option>
+          <option value="EMA" {% if envelope_ma_type == "EMA" %}selected{% endif %}>EMA</option>
+        </select>
+      </label>
+      <label>Maximum endpoint distance %<input type="number" name="envelope_proximity_pct" min="0" step="0.1" value="{{ envelope_proximity_pct }}"></label>
+      <label>Current endpoint age bars<input type="number" name="recent_endpoint_bars" min="0" value="{{ recent_endpoint_bars }}"></label>
+      <label>Round-trip cost %<input type="number" name="round_trip_cost_pct" min="0" step="0.01" value="{{ round_trip_cost_pct }}"></label>
+      <div class="filter-actions"><button class="button" type="submit">Refresh NSE Data And Run Five-Year Study</button></div>
+    </form>
+
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Knoxville recovery study completed.</p>
+    {% endif %}
+    {% if study_job %}
+      <div class="scan-progress" id="knox-recovery-progress" data-job-id="{{ study_job }}">
+        <div class="progress-header">
+          <strong id="knox-recovery-progress-title">Knoxville recovery study is queued</strong>
+          <span id="knox-recovery-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="knox-recovery-progress-fill" style="width: 0%"></div></div>
+        <p id="knox-recovery-progress-detail">Preparing fresh NSE history...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("knox-recovery-progress");
+          if (!box) return;
+          const title = document.getElementById("knox-recovery-progress-title");
+          const percent = document.getElementById("knox-recovery-progress-percent");
+          const fill = document.getElementById("knox-recovery-progress-fill");
+          const detail = document.getElementById("knox-recovery-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`);
+              if (!response.ok) throw new Error("Status unavailable");
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "Knoxville recovery study is queued" : (status.phase || "Knoxville recovery study is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              detail.textContent = status.current_symbol ? `${status.phase}: ${status.current_symbol}` : (status.phase || "Running");
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/knox-recovery";
+                return;
+              }
+              window.setTimeout(poll, 1500);
+            } catch (error) {
+              title.textContent = "Study status unavailable";
+              detail.textContent = "Refresh this page to check the latest result.";
+            }
+          };
+          window.setTimeout(poll, 800);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Current Candidates</span><strong>{{ current_candidates_count }}</strong></article>
+    <article class="stat-card"><span>Qualified Historical Events</span><strong>{{ summary.get("qualifying_events", 0)|int }}</strong></article>
+    <article class="stat-card"><span>Stocks With Events</span><strong>{{ summary.get("stocks_with_qualifying_events", 0)|int }}</strong></article>
+    <article class="stat-card"><span>20-Session Drop-Target Hit Rate</span><strong>{% if summary.get("entry_20d_drop_target_hit_rate_pct") is not none %}{{ "%.1f"|format(summary.get("entry_20d_drop_target_hit_rate_pct")|float) }}%{% else %}-{% endif %}</strong></article>
+    <article class="stat-card"><span>Median Target Exit</span><strong>{% if summary.get("entry_120d_drop_target_median_exit_sessions") is not none %}{{ summary.get("entry_120d_drop_target_median_exit_sessions")|number }} sessions{% else %}-{% endif %}</strong></article>
+    <article class="stat-card"><span>Latest Stock Date</span><strong>{{ summary.get("latest_history_date", "-") }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <h2>Measurement rules</h2>
+    <p>The first endpoint is the earlier Knoxville low and the second endpoint is the newer lower low. The line length is reported in trading bars and calendar days. The price drop is <strong>(first low - second low) / first low</strong>.</p>
+    <p>The trade backtest buys at the next session&apos;s high and sets its sell target the same percentage above entry as the drop between the two Knoxville endpoints. It exits at that target on the first later session whose high reaches it. Positions that never reach the target remain open rather than being counted as wins.</p>
+    <p>The equal-bounce target adds that same percentage to the second low. Full recovery instead returns to the first low; these differ because a fall requires a larger percentage gain to recover completely. Recovery checks start on the next session, never on the signal candle.</p>
+    <p>High recovery means the intraday high touched the target. Close recovery requires the daily close to reach it. Medians use recovered events only, so recovery rates and unrecovered counts remain visible beside them.</p>
+    <p>Likely corporate-action discontinuities are retained in the complete event CSV with a reason, but excluded from qualified rates and current candidates.</p>
+    <p><strong>Important:</strong> this is an event study of today&apos;s Kite-listed NSE universe, so delisted stocks are absent and survivorship bias remains. It is not a portfolio return or a promise of future performance.</p>
+    {% if summary %}<p>Event window: <strong>{{ summary.get("start_date", "-") }}</strong> to <strong>{{ summary.get("end_date", "-") }}</strong>. Fresh coverage: <strong>{{ summary.get("refresh_coverage_pct", 0)|number }}%</strong>. Generated {{ summary.get("generated_at_ist", "") }}.</p>{% endif %}
+    {% if summary.get("qualifying_events", 0)|int > 0 %}
+      <p>
+        <a class="button secondary" href="/knox-recovery/events.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download All Events</a>
+        <a class="button secondary" href="/knox-recovery/stocks.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Stock Results</a>
+        <a class="button secondary" href="/knox-recovery/current.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Current Candidates</a>
+      </p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Endpoint-drop target exits</h2>
+    <p>Target hit rate is the percentage of matured entries that reached entry price plus the endpoint drop percentage within the stated holding window. The one-position rate suppresses overlapping entries in the same stock.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Holding Sessions</th><th>All Signals</th><th>Drop-Target Hit %</th><th>Median Exit Sessions</th><th>One-Position Trades</th><th>One-Position Target Hit %</th><th>Fixed-Close Win %</th><th>Fixed-Close Avg Net %</th><th>Fixed-Close Median Net %</th></tr></thead>
+        <tbody>
+          {% for days in [5, 10, 20, 40, 60, 120] %}
+            <tr>
+              <td>{{ days }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_trades", 0)|int }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_drop_target_hit_rate_pct", "")|number }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_drop_target_median_exit_sessions", "")|number }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_non_overlapping_trades", 0)|int }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_non_overlapping_drop_target_hit_rate_pct", "")|number }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_win_rate_pct", "")|number }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_avg_net_return_pct", "")|number }}</td>
+              <td>{{ summary.get("entry_" ~ days ~ "d_median_net_return_pct", "")|number }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Current candidates</h2>
+    <p>Bullish Knoxville endpoints no older than {{ recent_endpoint_bars }} trading bars and within {{ envelope_proximity_pct }}% of the lower Envelope.</p>
+    {% if current_symbols_csv %}
+      <div class="copy-row">
+        <textarea id="knox-recovery-symbols" readonly>{{ current_symbols_csv }}</textarea>
+        <button class="button secondary" type="button" id="copy-knox-recovery-symbols">Copy Symbols</button>
+      </div>
+      <script>
+        document.getElementById("copy-knox-recovery-symbols")?.addEventListener("click", async () => {
+          const field = document.getElementById("knox-recovery-symbols");
+          await navigator.clipboard.writeText(field.value);
+        });
+      </script>
+    {% endif %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Symbol</th><th>Name</th><th>Latest Close</th><th>First Endpoint</th><th>Second Endpoint</th><th>Line Bars</th><th>Drop %</th><th>Lower Envelope</th><th>Distance %</th><th>Next-Day Entry</th><th>Drop Target</th><th>Target Status</th></tr></thead>
+        <tbody>
+          {% for row in current_candidates %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td><td>{{ row.get("name", "") }}</td><td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("first_endpoint_date", "") }} @ {{ row.get("first_endpoint_low", "")|number }}</td>
+              <td>{{ row.get("second_endpoint_date", "") }} @ {{ row.get("second_endpoint_low", "")|number }}</td>
+              <td>{{ row.get("line_trading_bars", "")|number }}</td>
+              <td>{{ row.get("drop_pct", "")|number }}</td><td>{{ row.get("envelope_lower", "")|number }}</td><td>{{ row.get("envelope_distance_pct", "")|number }}</td>
+              <td>{% if row.get("entry_available") %}{{ row.get("entry_date", "") }} @ {{ row.get("entry_price_next_day_high", "")|number }}{% else %}Pending{% endif %}</td>
+              <td>{{ row.get("drop_target_price_from_entry", "")|number }}</td>
+              <td>{% if row.get("drop_target_hit") %}Exited {{ row.get("drop_target_exit_date", "") }}{% elif row.get("entry_available") %}Open{% else %}Awaiting entry{% endif %}</td>
+            </tr>
+          {% else %}<tr><td colspan="12">No current candidates in the latest completed study.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Stock recovery history</h2>
+    <p>Up to 500 stocks, ordered by full close recovery rate and then event count.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Symbol</th><th>Name</th><th>Events</th><th>Median Line Bars</th><th>Median Drop %</th><th>20D Trades</th><th>20D Drop-Target Hit %</th><th>20D Fixed-Close Win %</th><th>20D Avg Net %</th><th>Full Close Recovery %</th><th>Median Full Sessions</th></tr></thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr><td>{{ row.get("symbol", "") }}</td><td>{{ row.get("name", "") }}</td><td>{{ row.get("events", 0)|int }}</td><td>{{ row.get("median_line_trading_bars", "")|number }}</td><td>{{ row.get("median_drop_pct", "")|number }}</td><td>{{ row.get("entry_20d_trades", 0)|int }}</td><td>{{ row.get("entry_20d_drop_target_hit_rate_pct", "")|number }}</td><td>{{ row.get("entry_20d_win_rate_pct", "")|number }}</td><td>{{ row.get("entry_20d_avg_net_return_pct", "")|number }}</td><td>{{ row.get("full_close_recovery_rate_pct", "")|number }}</td><td>{{ row.get("median_full_close_trading_days", "")|number }}</td></tr>
+          {% else %}<tr><td colspan="11">Run the study to calculate stock recovery histories.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Recent qualifying events</h2>
+    <p>Latest 500 events. The CSV contains the complete history and 5, 10, 20, 40, 60, and 120-session recovery fields.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Second Endpoint</th><th>Symbol</th><th>Line Bars</th><th>Drop %</th><th>Envelope Distance %</th><th>Entry</th><th>Drop Target</th><th>Target Exit</th><th>Sessions To Exit</th><th>Net Target Return %</th><th>Observed Sessions</th></tr></thead>
+        <tbody>
+          {% for row in events %}
+            <tr>
+              <td>{{ row.get("second_endpoint_date", "") }}</td><td>{{ row.get("symbol", "") }}</td><td>{{ row.get("line_trading_bars", "")|number }}</td><td>{{ row.get("drop_pct", "")|number }}</td><td>{{ row.get("envelope_distance_pct", "")|number }}</td>
+              <td>{{ row.get("entry_date", "") }} @ {{ row.get("entry_price_next_day_high", "")|number }}</td>
+              <td>{{ row.get("drop_target_price_from_entry", "")|number }}</td>
+              <td>{% if row.get("drop_target_hit") %}{{ row.get("drop_target_exit_date", "") }}{% else %}Open{% endif %}</td>
+              <td>{{ row.get("drop_target_exit_trading_days", "")|number }}</td>
+              <td>{{ row.get("drop_target_exit_net_return_pct", "")|number }}</td>
+              <td>{{ row.get("observation_sessions", "")|number }}</td>
+            </tr>
+          {% else %}<tr><td colspan="11">No qualifying events yet.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

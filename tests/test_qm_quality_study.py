@@ -64,10 +64,9 @@ class QMQualityStudyTests(unittest.TestCase):
                 client = TestClient(app)
                 response = client.get("/qm-quality")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("April 2026 BUY cohort ranked by momentum quality", response.text)
-        self.assertIn("AAA", response.text)
-        self.assertIn("High / Elite Momentum Quality", response.text)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("QM Quality", response.text)
+        self.assertIn("temporarily removed from the workspace", response.text)
 
 
 if __name__ == "__main__":

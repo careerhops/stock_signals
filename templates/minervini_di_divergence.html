@@ -112,6 +112,34 @@
       <span>Universe Scanned</span>
       <strong>{{ summary.get("symbols_processed", 0) }}</strong>
     </article>
+    <article class="stat-card">
+      <span>Latest Stock Date</span>
+      <strong>{{ summary.get("latest_stock_date", "-") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Benchmark Date</span>
+      <strong>{{ summary.get("benchmark_latest_date", "-") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Result Generated</span>
+      <strong>{{ summary.get("generated_at_ist", "-") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Expected Kite OHLC Date</span>
+      <strong>{{ summary.get("refresh_expected_date", "-") or "-" }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Fresh OHLC Coverage</span>
+      <strong>{{ summary.get("refresh_coverage_pct", 0)|number }}%</strong>
+    </article>
+    <article class="stat-card">
+      <span>Fresh / Universe</span>
+      <strong>{{ summary.get("refresh_current_count", 0) }} / {{ summary.get("refresh_universe_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Stale / Failed</span>
+      <strong>{{ summary.get("refresh_stale_count", 0) }} / {{ summary.get("refresh_failed_count", 0) }}</strong>
+    </article>
   </section>
 
   <section class="panel">
@@ -143,6 +171,8 @@
             <th>Name</th>
             <th>Date</th>
             <th>CMP</th>
+            <th>52W High</th>
+            <th>Below 52W High %</th>
             <th>Stock Quality</th>
             <th>Setup Quality</th>
             <th>Entry Quality</th>
@@ -171,6 +201,8 @@
               <td>{{ row.get("name", "") }}</td>
               <td>{{ row.get("latest_date", "") }}</td>
               <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_52w_high", "")|number }}</td>
+              <td>{{ row.get("distance_below_52w_high_pct", "")|number }}</td>
               <td><span class="badge buy">{{ row.get("stock_quality_score", "")|number }} {{ row.get("stock_quality_grade", "") }}</span></td>
               <td><span class="badge buy">{{ row.get("setup_quality_score", "")|number }} {{ row.get("setup_quality_grade", "") }}</span></td>
               <td><span class="badge buy">{{ row.get("entry_quality_score", "")|number }} {{ row.get("entry_quality_grade", "") }}</span></td>
@@ -245,6 +277,8 @@
             <th>Date</th>
             <th>Current Date</th>
             <th>CMP</th>
+            <th>52W High</th>
+            <th>Below 52W High %</th>
             <th>Combined Pass</th>
             <th>DI Divergence</th>
             <th>DI+ Above DI-</th>
@@ -279,6 +313,8 @@
               <td>{{ row.get("latest_date", "") }}</td>
               <td>{% if row.get("is_latest_market_date") %}Yes{% else %}No{% endif %}</td>
               <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_52w_high", "")|number }}</td>
+              <td>{{ row.get("distance_below_52w_high_pct", "")|number }}</td>
               <td>{% if row.get("combined_pass") %}<span class="badge buy">Yes</span>{% else %}<span class="badge hot">No</span>{% endif %}</td>
               <td>{% if row.get("di_divergence_pass") %}<span class="badge buy">Yes</span>{% else %}<span class="badge hot">No</span>{% endif %}</td>
               <td>{% if row.get("di_plus_above_di_minus") %}Yes{% else %}No{% endif %}</td>
@@ -310,7 +346,143 @@
     </div>
   </section>
 
+  <section class="panel" id="targeted-di-minervini-scan">
+    <div class="panel-heading">
+      <h2>Scan Selected Stocks</h2>
+      <p>Enter NSE symbols separated by commas, spaces, or new lines. Only these symbols are refreshed from Kite and checked against the DI + Minervini settings currently selected above.</p>
+    </div>
+
+    <form action="/minervini-di-divergence/run-targeted" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <input type="hidden" name="adx_length" value="{{ adx_length }}">
+      <input type="hidden" name="divergence_days" value="{{ divergence_days }}">
+      <input type="hidden" name="min_score" value="{{ min_score }}">
+      <label>
+        NSE stock symbols
+        <textarea name="target_symbols" rows="6" placeholder="RELIANCE, HDFCBANK, INFY">{{ targeted_input_symbols }}</textarea>
+        <small>Maximum 500 symbols. Current rules: DI / ADX {{ adx_length }}, divergence {{ divergence_days }} days, and all three quality scores ≥ {{ min_score|number(0) }}.</small>
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Selected Stocks</button>
+      </div>
+    </form>
+
+    {% if targeted_error %}
+      <p class="status error">{{ targeted_error }}</p>
+    {% elif targeted_ran %}
+      <p class="status success">Selected-stock DI + Minervini scan completed.</p>
+    {% endif %}
+
+    {% if targeted_job %}
+      <div class="scan-progress" id="targeted-minervini-di-progress" data-job-id="{{ targeted_job }}">
+        <div class="progress-header">
+          <strong id="targeted-minervini-di-progress-title">Selected-stock scan is running</strong>
+          <span id="targeted-minervini-di-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="targeted-minervini-di-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="targeted-minervini-di-progress-detail">Refreshing selected NSE candles...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("targeted-minervini-di-progress");
+          if (!box) return;
+          const title = document.getElementById("targeted-minervini-di-progress-title");
+          const percent = document.getElementById("targeted-minervini-di-progress-percent");
+          const fill = document.getElementById("targeted-minervini-di-progress-fill");
+          const detail = document.getElementById("targeted-minervini-di-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`, { cache: "no-store" });
+              const status = await response.json();
+              if (!response.ok) throw new Error(status.error || "Status unavailable");
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "Selected-stock scan queued" : (status.phase || "Selected-stock scan is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              const current = status.current_symbol ? `: ${status.current_symbol}` : "";
+              detail.textContent = `${status.phase || "Running"} · ${Number(status.completed || 0)}/${Number(status.total || 0)}${current}`;
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/minervini-di-divergence";
+                return;
+              }
+            } catch (error) {
+              title.textContent = "Selected-stock status unavailable";
+              detail.textContent = String(error.message || error);
+            }
+            window.setTimeout(poll, 1000);
+          };
+          window.setTimeout(poll, 500);
+        })();
+      </script>
+    {% endif %}
+
+    {% if targeted_summary %}
+      <div class="stats-grid">
+        <article class="stat-card"><span>Requested</span><strong>{{ targeted_summary.get("refresh_requested_count", 0) }}</strong></article>
+        <article class="stat-card"><span>Evaluated</span><strong>{{ targeted_summary.get("stocks_evaluated", 0) }}</strong></article>
+        <article class="stat-card"><span>Qualified</span><strong>{{ targeted_summary.get("combined_matches", 0) }}</strong></article>
+        <article class="stat-card"><span>Unavailable</span><strong>{{ targeted_summary.get("refresh_unavailable_count", 0) }}</strong></article>
+        <article class="stat-card"><span>Stale / Failed</span><strong>{{ targeted_summary.get("refresh_stale_count", 0) }} / {{ targeted_summary.get("refresh_failed_count", 0) }}</strong></article>
+        <article class="stat-card"><span>Generated</span><strong>{{ targeted_summary.get("generated_at_ist", "-") }}</strong></article>
+      </div>
+
+      <div class="copy-block">
+        <div class="copy-row">
+          <div>
+            <h3>Qualified selected symbols</h3>
+            <p>These stocks pass DI divergence and all three Minervini quality thresholds.</p>
+          </div>
+          <button class="button secondary" type="button" data-copy-target="targeted-minervini-symbols">Copy Symbols</button>
+        </div>
+        <textarea id="targeted-minervini-symbols" readonly rows="4">{{ targeted_stock_symbols_csv }}</textarea>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Name</th><th>Date</th><th>CMP</th><th>DI+</th><th>DI-</th><th>Spread Change</th><th>Stock Quality</th><th>Setup Quality</th><th>Entry Quality</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in targeted_stock_stats %}
+              <tr>
+                <td>{{ row.get("symbol", "") }}</td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("latest_date", "") }}</td>
+                <td>{{ row.get("latest_close", "")|number }}</td>
+                <td>{{ row.get("latest_di_plus", "")|number }}</td>
+                <td>{{ row.get("latest_di_minus", "")|number }}</td>
+                <td>{{ row.get("spread_change_2d", "")|number }}</td>
+                <td>{{ row.get("stock_quality_score", "")|number }}</td>
+                <td>{{ row.get("setup_quality_score", "")|number }}</td>
+                <td>{{ row.get("entry_quality_score", "")|number }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="10">None of the evaluated symbols pass all DI + Minervini conditions.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+
   <script>
+    const fullMinerviniDiForm = document.querySelector('form[action="/minervini-di-divergence/run"]');
+    const targetedMinerviniDiForm = document.querySelector('form[action="/minervini-di-divergence/run-targeted"]');
+    if (fullMinerviniDiForm && targetedMinerviniDiForm) {
+      targetedMinerviniDiForm.addEventListener("submit", () => {
+        ["adx_length", "divergence_days", "min_score"].forEach((name) => {
+          const source = fullMinerviniDiForm.querySelector(`[name="${name}"]`);
+          const target = targetedMinerviniDiForm.querySelector(`[name="${name}"]`);
+          if (source && target) target.value = source.value;
+        });
+      });
+    }
+
     document.querySelectorAll("[data-copy-target]").forEach((button) => {
       button.addEventListener("click", async () => {
         const target = document.getElementById(button.dataset.copyTarget);

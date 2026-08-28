@@ -171,16 +171,9 @@ class WeeklyBuyTrackerStudyTests(unittest.TestCase):
                 client = TestClient(app)
                 response = client.get("/weekly-buy-gains?minervini_only=1&obv_macd_only=1")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Weekly BUY names and current gain", response.text)
-        self.assertIn("AAA", response.text)
-        self.assertNotIn("BBB", response.text)
-        self.assertIn("Stocks Currently in Gain", response.text)
-        self.assertIn("All Weekly BUY Stocks", response.text)
-        self.assertIn("OBV MACD cross-up only", response.text)
-        self.assertIn("Latest volume >= 3x prev 9D avg", response.text)
-        self.assertIn("AAA", response.text)
-        self.assertIn("weekly-buy-symbols-csv", response.text)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("Buy Gains", response.text)
+        self.assertIn("temporarily removed from the workspace", response.text)
 
     def test_weekly_buy_gains_page_handles_missing_gain_column(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -224,9 +217,9 @@ class WeeklyBuyTrackerStudyTests(unittest.TestCase):
                 client = TestClient(app)
                 response = client.get("/weekly-buy-gains")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Weekly BUY names and current gain", response.text)
-        self.assertIn("AAA", response.text)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("Buy Gains", response.text)
+        self.assertIn("temporarily removed from the workspace", response.text)
 
     def test_minervini_template_passes_for_strong_uptrend_frame(self) -> None:
         dates = pd.date_range("2025-06-01", periods=260, freq="B")

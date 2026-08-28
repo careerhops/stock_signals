@@ -1,0 +1,301 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">KNOXVILLE + ENVELOPE</p>
+      <h1>Daily reversal confluence</h1>
+      <p class="lede">Find a Knoxville endpoint near the lower Envelope, then wait for completed-candle price confirmation.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/knox-envelope/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        Knox Bars Back
+        <input type="number" name="knox_lookback" min="5" value="{{ knox_lookback }}">
+      </label>
+      <label>
+        RSI Period
+        <input type="number" name="rsi_length" min="1" value="{{ rsi_length }}">
+      </label>
+      <label>
+        Momentum Period
+        <input type="number" name="momentum_length" min="1" value="{{ momentum_length }}">
+      </label>
+      <label>
+        Recent Signal Bars
+        <input type="number" name="signal_lookback_bars" min="1" value="{{ signal_lookback_bars }}">
+        <small>Use 1 for only the latest completed candle. Higher values intentionally keep older matches in the list.</small>
+      </label>
+      <label>
+        Knoxville Direction
+        <select name="signal_direction">
+          <option value="bullish" {% if signal_direction == "bullish" %}selected{% endif %}>Bullish</option>
+          <option value="bearish" {% if signal_direction == "bearish" %}selected{% endif %}>Bearish</option>
+          <option value="either" {% if signal_direction == "either" %}selected{% endif %}>Either</option>
+        </select>
+      </label>
+      <label>
+        Envelope Length
+        <input type="number" name="envelope_length" min="1" value="{{ envelope_length }}">
+      </label>
+      <label>
+        Envelope Percent
+        <input type="number" name="envelope_percent" min="0" step="0.1" value="{{ envelope_percent }}">
+      </label>
+      <label>
+        Envelope MA
+        <select name="envelope_ma_type">
+          <option value="SMA" {% if envelope_ma_type == "SMA" %}selected{% endif %}>SMA</option>
+          <option value="EMA" {% if envelope_ma_type == "EMA" %}selected{% endif %}>EMA</option>
+        </select>
+      </label>
+      <label>
+        Envelope Condition
+        <select name="envelope_mode">
+          <option value="lower_support" {% if envelope_mode == "lower_support" %}selected{% endif %}>Knox endpoint low near lower band</option>
+          <option value="close_below_lower" {% if envelope_mode == "close_below_lower" %}selected{% endif %}>Close below lower</option>
+          <option value="upper_resistance" {% if envelope_mode == "upper_resistance" %}selected{% endif %}>Upper resistance</option>
+          <option value="close_above_upper" {% if envelope_mode == "close_above_upper" %}selected{% endif %}>Close above upper</option>
+          <option value="inside_envelope" {% if envelope_mode == "inside_envelope" %}selected{% endif %}>Inside envelope</option>
+        </select>
+      </label>
+      <label>
+        Band Proximity %
+        <input type="number" name="envelope_proximity_pct" min="0" step="0.1" value="{{ envelope_proximity_pct }}">
+      </label>
+      <label>
+        Reversal Confirmation
+        <select name="confirmation_mode">
+          <option value="strong_bullish_close" {% if confirmation_mode == "strong_bullish_close" %}selected{% endif %}>Strong bullish close</option>
+          <option value="disabled" {% if confirmation_mode == "disabled" %}selected{% endif %}>Disabled</option>
+        </select>
+      </label>
+      <label>
+        Confirmation Window
+        <input type="number" name="confirmation_window_bars" min="0" max="10" value="{{ confirmation_window_bars }}">
+        <small>0 checks only the endpoint. 3 checks the endpoint plus the next three sessions.</small>
+      </label>
+      <label>
+        Close Location %
+        <input type="number" name="confirmation_close_location_pct" min="0" max="100" step="1" value="{{ confirmation_close_location_pct }}">
+        <small>80 means the close must be in the top 20% of the day's range.</small>
+      </label>
+      <label>
+        CMF Length
+        <input type="number" name="cmf_length" min="1" value="{{ cmf_length }}">
+      </label>
+      <label>
+        CMF Condition
+        <select name="cmf_condition">
+          <option value="greater_than_zero" {% if cmf_condition == "greater_than_zero" %}selected{% endif %}>Greater than 0</option>
+          <option value="less_than_zero" {% if cmf_condition == "less_than_zero" %}selected{% endif %}>Less than 0</option>
+          <option value="disabled" {% if cmf_condition == "disabled" %}selected{% endif %}>Disabled</option>
+        </select>
+        <small>Optional legacy filter. Keep disabled for the price-confirmation scan.</small>
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="use_sharpe_filter" value="1" data-sharpe-toggle {% if use_sharpe_filter %}checked{% endif %}>
+        Use optional Sharpe filter
+        <small>Disabled by default. Knoxville + Envelope results are unchanged while this is off.</small>
+      </label>
+      <div data-sharpe-settings {% if not use_sharpe_filter %}hidden{% endif %}>
+        <label>
+          Sharpe Lookback Days
+          <input type="number" name="sharpe_lookback_days" min="2" value="{{ sharpe_lookback_days }}">
+          <small>Completed daily returns used for the trailing annualized Sharpe Ratio.</small>
+        </label>
+        <label>
+          Annual Risk-Free Rate %
+          <input type="number" name="annual_risk_free_rate_pct" min="-99.99" step="0.1" value="{{ annual_risk_free_rate_pct }}">
+        </label>
+        <label>
+          Minimum Sharpe Ratio
+          <input type="number" name="min_sharpe_ratio" step="0.1" value="{{ '' if min_sharpe_ratio is none else min_sharpe_ratio }}" placeholder="No minimum">
+          <small>Leave blank to calculate and display Sharpe without applying a minimum.</small>
+        </label>
+      </div>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Fresh NSE Scan</button>
+        <a class="button secondary" href="/knox-envelope/pinescript">Download PineScript</a>
+      </div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Knoxville + Envelope scan completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="knox-envelope-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="knox-envelope-progress-title">Knoxville + Envelope scan is running</strong>
+          <span id="knox-envelope-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="knox-envelope-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="knox-envelope-progress-detail">Refreshing completed NSE daily candles from Kite...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if study_job %}
+    <script>
+      const progressBox = document.getElementById("knox-envelope-progress");
+      const progressTitle = document.getElementById("knox-envelope-progress-title");
+      const progressPercent = document.getElementById("knox-envelope-progress-percent");
+      const progressFill = document.getElementById("knox-envelope-progress-fill");
+      const progressDetail = document.getElementById("knox-envelope-progress-detail");
+
+      async function pollKnoxEnvelope() {
+        if (!progressBox) return;
+        try {
+          const response = await fetch(`/scan-status/${progressBox.dataset.jobId}`, { cache: "no-store" });
+          const status = await response.json();
+          if (!response.ok) throw new Error(status.error || "Status unavailable");
+          const percent = Number(status.percent || 0);
+          progressFill.style.width = `${percent}%`;
+          progressPercent.textContent = `${percent}%`;
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          progressDetail.textContent = `${status.phase || "Running"} · ${Number(status.completed || 0)}/${Number(status.total || 0)} symbols${current}`;
+          if (status.status === "completed") {
+            progressTitle.textContent = "Knoxville + Envelope scan completed";
+            window.location.href = status.redirect_url || "/knox-envelope";
+            return;
+          }
+          if (status.status === "failed") {
+            progressTitle.textContent = "Knoxville + Envelope scan failed";
+            progressDetail.textContent = status.error || "The scan could not complete.";
+            if (status.redirect_url) window.location.href = status.redirect_url;
+            return;
+          }
+        } catch (error) {
+          progressTitle.textContent = "Waiting for scan status";
+          progressDetail.textContent = String(error.message || error);
+        }
+        window.setTimeout(pollKnoxEnvelope, 1000);
+      }
+      pollKnoxEnvelope();
+    </script>
+  {% endif %}
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Matching Stocks</span><strong>{{ stock_stats_count }}</strong></article>
+    <article class="stat-card"><span>Fresh Universe</span><strong>{{ summary.get("refresh_current_count", summary.get("symbols_processed", 0)) }}</strong></article>
+    <article class="stat-card"><span>Latest Stock Date</span><strong>{{ summary.get("latest_date", "-") }}</strong></article>
+    <article class="stat-card"><span>Refresh Coverage</span><strong>{% if summary.get("refresh_coverage_pct") is not none %}{{ summary.get("refresh_coverage_pct", 0)|number }}%{% else %}-{% endif %}</strong></article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/knox-envelope" class="filter-panel compact-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="matches_only" value="0">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="matches_only" value="1" {% if matches_only %}checked{% endif %}>
+        Matches only
+      </label>
+      <div class="filter-actions"><button class="button secondary" type="submit">Apply</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="copy-symbols-panel">
+      <div class="copy-symbols-heading">
+        <div><h2>Filtered Symbols</h2><p>Stocks whose Knoxville/Envelope setup completed within the selected Recent Signal Bars window.</p></div>
+        <button class="button secondary" type="button" data-copy-target="knox-envelope-symbols">Copy Symbols</button>
+      </div>
+      <textarea id="knox-envelope-symbols" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Confluence Results</h2>
+      <p>The endpoint identifies the setup. Confirmation Date identifies the later bullish close used as the entry alert.{% if use_sharpe_filter %} Sharpe is the stock's trailing annualized close-to-close return quality, not the strategy backtest Sharpe.{% endif %}</p>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Name</th><th>CMP</th><th>Latest Date</th>{% if use_sharpe_filter %}<th>Sharpe Ratio</th><th>Sharpe Days</th><th>Technical Pass</th><th>Sharpe Pass</th>{% endif %}<th>Side</th><th>Reference Date</th><th>Reference Low</th><th>Endpoint Date</th><th>Endpoint Low</th><th>Endpoint Age</th>
+            <th>Confirmation Date</th><th>Delay</th><th>Confirmation Close</th><th>Close Location %</th><th>Confirmation Pass</th>
+            <th>RSI</th><th>Momentum</th><th>CMF</th><th>CMF Pass</th><th>Reference Bars</th><th>Basis</th><th>Lower</th><th>Low From Lower %</th><th>Pass</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("latest_date", "") }}</td>
+              {% if use_sharpe_filter %}
+              <td>{{ row.get("sharpe_ratio", "")|number }}</td>
+              <td>{{ row.get("sharpe_observations", "") }}</td>
+              <td>{% if row.get("technical_match") %}Yes{% else %}No{% endif %}</td>
+              <td>{% if row.get("sharpe_pass") %}Yes{% else %}No{% endif %}</td>
+              {% endif %}
+              <td>{{ row.get("match_side", "") }}</td>
+              <td>{{ row.get("reference_date", "") }}</td>
+              <td>{{ row.get("reference_low", "")|number }}</td>
+              <td>{{ row.get("signal_date", "") }}</td>
+              <td>{{ row.get("signal_low", "")|number }}</td>
+              <td>{{ row.get("signal_age_bars", "") }}</td>
+              <td>{{ row.get("confirmation_date", "") }}</td>
+              <td>{{ row.get("confirmation_delay_bars", "") }}</td>
+              <td>{{ row.get("confirmation_close", "")|number }}</td>
+              <td>{{ row.get("confirmation_close_location_pct", "")|number }}</td>
+              <td>{% if row.get("confirmation_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("signal_rsi", "")|number }}</td>
+              <td>{{ row.get("signal_momentum", "")|number }}</td>
+              <td>{{ row.get("signal_cmf", "")|number }}</td>
+              <td>{% if row.get("cmf_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("knox_reference_bars", "")|number }}</td>
+              <td>{{ row.get("envelope_basis", "")|number }}</td>
+              <td>{{ row.get("envelope_lower", "")|number }}</td>
+              <td>{{ row.get("low_distance_from_lower_pct", "")|number }}</td>
+              <td>{% if row.get("combined_match") %}Yes{% else %}No{% endif %}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="{{ 28 if use_sharpe_filter else 24 }}">No matching results have been generated for these settings.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    const sharpeToggle = document.querySelector("[data-sharpe-toggle]");
+    const sharpeSettings = document.querySelector("[data-sharpe-settings]");
+    if (sharpeToggle && sharpeSettings) {
+      const syncSharpeSettings = () => { sharpeSettings.hidden = !sharpeToggle.checked; };
+      sharpeToggle.addEventListener("change", syncSharpeSettings);
+      syncSharpeSettings();
+    }
+
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const target = document.getElementById(button.dataset.copyTarget || "");
+        if (!target || !String(target.value || "").trim()) return;
+        try {
+          await navigator.clipboard.writeText(target.value);
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => { button.textContent = original; }, 1200);
+        } catch (error) {
+          target.focus();
+          target.select();
+        }
+      });
+    });
+  </script>
+{% endblock %}

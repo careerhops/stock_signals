@@ -5,9 +5,10 @@ from datetime import date, timedelta
 import json
 import os
 from pathlib import Path
+import re
 from threading import Lock
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -61,6 +62,45 @@ from stock_screener.google_sheets import (
     save_google_sheet_target,
 )
 from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
+from stock_screener.knox_envelope_study import (
+    CMF_CONDITIONS as KNOX_ENV_CMF_CONDITIONS,
+    CONFIRMATION_MODES as KNOX_ENV_CONFIRMATION_MODES,
+    DEFAULT_CMF_CONDITION as KNOX_ENV_DEFAULT_CMF_CONDITION,
+    DEFAULT_CMF_LENGTH as KNOX_ENV_DEFAULT_CMF_LENGTH,
+    DEFAULT_CONFIRMATION_CLOSE_LOCATION_PCT as KNOX_ENV_DEFAULT_CONFIRMATION_CLOSE_LOCATION,
+    DEFAULT_CONFIRMATION_MODE as KNOX_ENV_DEFAULT_CONFIRMATION_MODE,
+    DEFAULT_CONFIRMATION_WINDOW as KNOX_ENV_DEFAULT_CONFIRMATION_WINDOW,
+    DEFAULT_ANNUAL_RISK_FREE_RATE_PCT as KNOX_ENV_DEFAULT_ANNUAL_RISK_FREE_RATE,
+    DEFAULT_ENVELOPE_LENGTH as KNOX_ENV_DEFAULT_ENVELOPE_LENGTH,
+    DEFAULT_ENVELOPE_MA_TYPE as KNOX_ENV_DEFAULT_MA_TYPE,
+    DEFAULT_ENVELOPE_MODE as KNOX_ENV_DEFAULT_MODE,
+    DEFAULT_ENVELOPE_PERCENT as KNOX_ENV_DEFAULT_PERCENT,
+    DEFAULT_ENVELOPE_PROXIMITY_PCT as KNOX_ENV_DEFAULT_PROXIMITY,
+    DEFAULT_KNOX_LOOKBACK as KNOX_ENV_DEFAULT_KNOX_LOOKBACK,
+    DEFAULT_MIN_SHARPE_RATIO as KNOX_ENV_DEFAULT_MIN_SHARPE_RATIO,
+    DEFAULT_MOMENTUM_LENGTH as KNOX_ENV_DEFAULT_MOMENTUM_LENGTH,
+    DEFAULT_RSI_LENGTH as KNOX_ENV_DEFAULT_RSI_LENGTH,
+    DEFAULT_SHARPE_LOOKBACK_DAYS as KNOX_ENV_DEFAULT_SHARPE_LOOKBACK,
+    DEFAULT_SIGNAL_DIRECTION as KNOX_ENV_DEFAULT_DIRECTION,
+    DEFAULT_SIGNAL_LOOKBACK as KNOX_ENV_DEFAULT_SIGNAL_LOOKBACK,
+    DEFAULT_USE_SHARPE_FILTER as KNOX_ENV_DEFAULT_USE_SHARPE_FILTER,
+    ENVELOPE_MA_TYPES as KNOX_ENV_MA_TYPES,
+    ENVELOPE_MODES as KNOX_ENV_MODES,
+    KNOX_ENVELOPE_LOGIC_VERSION,
+    SIGNAL_DIRECTIONS as KNOX_ENV_DIRECTIONS,
+    load_knox_envelope_outputs,
+    run_knox_envelope_study,
+    save_knox_envelope_outputs,
+)
+from stock_screener.knox_recovery_study import (
+    DEFAULT_PROXIMITY_PCT as KNOX_RECOVERY_DEFAULT_PROXIMITY,
+    DEFAULT_RECENT_ENDPOINT_BARS as KNOX_RECOVERY_DEFAULT_RECENT_BARS,
+    DEFAULT_ROUND_TRIP_COST_PCT as KNOX_RECOVERY_DEFAULT_COST,
+    KNOX_RECOVERY_LOGIC_VERSION,
+    load_knox_recovery_outputs,
+    run_knox_recovery_study,
+    save_knox_recovery_outputs,
+)
 from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram, send_gtt_stock_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
 from stock_screener.rotation_study import load_rotation_study_outputs, run_rotation_study, save_rotation_study_outputs
@@ -107,6 +147,20 @@ from stock_screener.resistance_breaks_study import (
     load_resistance_breaks_outputs,
     run_resistance_breaks_study,
     save_resistance_breaks_outputs,
+)
+from stock_screener.trader_setup_backtest_study import (
+    DEFAULT_ATR_BUFFER as TRADER_SETUP_DEFAULT_ATR_BUFFER,
+    DEFAULT_HOLDING_DAYS as TRADER_SETUP_DEFAULT_HOLDING_DAYS,
+    DEFAULT_LEFT_BARS as TRADER_SETUP_DEFAULT_LEFT_BARS,
+    DEFAULT_PROFIT_TARGET_PCT as TRADER_SETUP_DEFAULT_PROFIT_TARGET_PCT,
+    DEFAULT_RIGHT_BARS as TRADER_SETUP_DEFAULT_RIGHT_BARS,
+    DEFAULT_ROUND_TRIP_COST_PCT as TRADER_SETUP_DEFAULT_ROUND_TRIP_COST_PCT,
+    DEFAULT_RVOL_THRESHOLD as TRADER_SETUP_DEFAULT_RVOL_THRESHOLD,
+    DEFAULT_STOP_LOSS_PCT as TRADER_SETUP_DEFAULT_STOP_LOSS_PCT,
+    DEFAULT_VOLUME_OSC_THRESHOLD as TRADER_SETUP_DEFAULT_VOLUME_OSC_THRESHOLD,
+    load_trader_setup_backtest_outputs,
+    run_trader_setup_backtest_study,
+    save_trader_setup_backtest_outputs,
 )
 from stock_screener.symbols import normalize_nse_symbol
 from stock_screener.minervini_sheet_sync import (
@@ -747,6 +801,24 @@ def _truthy_param(values: Any, default: bool = False) -> bool:
     if not candidates:
         return default
     return any(str(value).strip().lower() in {"1", "true", "yes", "y", "on"} for value in candidates)
+
+
+def _parse_nse_symbol_list(raw_symbols: Any, maximum: int = 500) -> list[str]:
+    """Parse comma, whitespace, semicolon, or line-separated symbols in input order."""
+    tokens = re.split(r"[\s,;]+", str(raw_symbols or "").strip())
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        symbol = token.strip().strip("'\"").upper()
+        if symbol.startswith("NSE:"):
+            symbol = symbol[4:]
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+        if len(symbols) > int(maximum):
+            raise ValueError(f"Enter no more than {int(maximum)} symbols per targeted scan.")
+    return symbols
 
 
 def _apply_signal_quality_filters(
@@ -2474,8 +2546,6 @@ def _swing_trade_error_url(error: Exception, query_suffix: str) -> str:
 
 
 def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: str) -> None:
-    data_root = get_data_root(scan_config)
-    storage = Storage(data_root)
     _set_scan_job(
         job_id,
         status="running",
@@ -2504,34 +2574,6 @@ def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: st
 
     try:
         summary = run_daily_scan(scan_config, progress_callback=progress_callback)
-        _set_scan_job(
-            job_id,
-            status="running",
-            phase="Preparing weekday profiles",
-            completed=int(summary.get("symbols_scanned", 0)),
-            total=int(summary.get("symbols_scanned", 0)),
-            percent=100,
-            current_symbol="",
-            current_exchange="",
-        )
-        _build_latest_weekday_pressure_cache(scan_config, storage, data_root)
-        try:
-            _set_scan_job(
-                job_id,
-                status="running",
-                phase="Updating Minervini Google Sheet",
-                completed=int(summary.get("symbols_scanned", 0)),
-                total=int(summary.get("symbols_scanned", 0)),
-                percent=100,
-                current_symbol="",
-                current_exchange="",
-            )
-            summary["minervini_sheet_sync"] = _maybe_run_minervini_sheet_sync_after_screener(storage, data_root)
-        except Exception as minervini_exc:
-            summary["minervini_sheet_sync"] = {
-                "status": "failed",
-                "error": str(minervini_exc),
-            }
         _set_scan_job(
             job_id,
             status="completed",
@@ -3069,12 +3111,325 @@ def _run_resistance_breaks_job(
         )
 
 
-def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str) -> None:
+def _fetch_kite_daily_chunks(
+    provider: KiteDataProvider,
+    instrument_token: int,
+    from_date: date,
+    to_date: date,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    cursor = from_date
+    while cursor <= to_date:
+        chunk_end = min(cursor + timedelta(days=1500), to_date)
+        chunk = pd.DataFrame()
+        last_error: Exception | None = None
+        for attempt, delay in enumerate((0.0, 0.8, 2.0), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                chunk = provider.daily_candles(instrument_token, cursor, chunk_end)
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt == 3:
+                    raise
+        if last_error is not None:
+            raise last_error
+        if not chunk.empty:
+            frames.append(chunk)
+        cursor = chunk_end + timedelta(days=1)
+        time.sleep(0.35)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _refresh_trader_setup_history(
+    storage: Storage,
+    *,
+    required_date: date,
+    start_date: date,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    config = load_config()
     access_token = load_access_token(storage.data_root)
     if not access_token:
-        if not storage.load_candles("NSE_INDEX", benchmark_symbol, "1D").empty:
-            return
-        raise RuntimeError("Kite access token not found. Refresh the Kite login before the first quality scan.")
+        raise RuntimeError("Kite access token not found. Refresh Kite login before the 10-year backtest.")
+    provider = KiteDataProvider(access_token=access_token)
+    provider.validate_session()
+    instruments = provider.instruments()
+    storage.save_instruments(instruments)
+    universe = build_universe(instruments, config)
+    candidates = universe[
+        universe["exchange"].astype(str).str.upper().eq("NSE")
+    ].copy()
+    candidates["tradingsymbol"] = candidates["tradingsymbol"].astype(str).str.upper().str.strip()
+    candidate_names = candidates.get("name", pd.Series("", index=candidates.index)).fillna("").astype(str).str.upper()
+    non_stock_symbol = (
+        candidates["tradingsymbol"].str.endswith("INAV")
+        | candidates["tradingsymbol"].str.endswith(("-IV", "-RR", "-E1", "-P1"))
+        | candidates["tradingsymbol"].str.contains("ETF", regex=False)
+    )
+    fund_unit_name = (
+        candidate_names.str.contains(r"\bETF\b", regex=True)
+        | candidate_names.str.contains(r"AMC\s*-", regex=True)
+        | candidate_names.str.contains("EXCHANGE TRADED FUND", regex=False)
+        | candidate_names.str.endswith(" GOLD FUND")
+    )
+    candidates = candidates[
+        ~fund_unit_name & ~non_stock_symbol
+    ].copy()
+    candidates = candidates.drop_duplicates(subset=["tradingsymbol"]).sort_values("tradingsymbol").reset_index(drop=True)
+
+    current_symbols: list[str] = []
+    stale_symbols: list[str] = []
+    failed_symbols: list[str] = []
+    if progress_callback:
+        progress_callback(
+            {
+                "phase": "Refreshing 10-year Kite OHLC",
+                "completed": 0,
+                "total": len(candidates),
+                "current_symbol": "",
+                "current_exchange": "NSE",
+            }
+        )
+    for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
+        symbol = str(instrument["tradingsymbol"])
+        token = int(instrument["instrument_token"])
+        try:
+            existing = storage.load_candles("NSE", symbol, "1D")
+            earliest = pd.to_datetime(existing.get("date"), errors="coerce").min() if not existing.empty else pd.NaT
+            latest = pd.to_datetime(existing.get("date"), errors="coerce").max() if not existing.empty else pd.NaT
+            fetch_ranges: list[tuple[date, date]] = []
+            if existing.empty or pd.isna(earliest) or pd.isna(latest):
+                fetch_ranges.append((start_date, required_date))
+            else:
+                earliest_date = pd.Timestamp(earliest).date()
+                latest_date = pd.Timestamp(latest).date()
+                if earliest_date > start_date:
+                    fetch_ranges.append((start_date, min(earliest_date, required_date)))
+                if latest_date < required_date:
+                    fetch_ranges.append((max(latest_date, start_date), required_date))
+            fetched_frames = [
+                _fetch_kite_daily_chunks(provider, token, range_start, range_end)
+                for range_start, range_end in fetch_ranges
+                if range_start <= range_end
+            ]
+            fetched = (
+                pd.concat([frame for frame in fetched_frames if not frame.empty], ignore_index=True)
+                if any(not frame.empty for frame in fetched_frames)
+                else pd.DataFrame()
+            )
+            daily = storage.merge_and_save_candles("NSE", symbol, fetched, "1D")
+        except Exception:
+            failed_symbols.append(symbol)
+            daily = pd.DataFrame()
+        if _latest_candle_date(daily) == required_date:
+            current_symbols.append(symbol)
+        elif symbol not in failed_symbols:
+            stale_symbols.append(symbol)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "Refreshing 10-year Kite OHLC",
+                    "completed": completed,
+                    "total": len(candidates),
+                    "current_symbol": symbol,
+                    "current_exchange": "NSE",
+                }
+            )
+
+    total = len(candidates)
+    coverage_pct = len(current_symbols) / total * 100.0 if total else 0.0
+    audit = {
+        "refresh_expected_date": required_date.isoformat(),
+        "refresh_requested_start_date": start_date.isoformat(),
+        "refresh_universe_count": total,
+        "refresh_current_count": len(current_symbols),
+        "refresh_stale_count": len(stale_symbols),
+        "refresh_failed_count": len(failed_symbols),
+        "refresh_coverage_pct": coverage_pct,
+    }
+    _validate_refresh_coverage(audit, config)
+    return current_symbols, audit
+
+
+def _run_trader_setup_backtest_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    start_date: str,
+    holding_days: int,
+    profit_target_pct: float,
+    stop_loss_pct: float,
+    round_trip_cost_pct: float,
+    left_bars: int,
+    right_bars: int,
+    volume_osc_threshold: float,
+    rvol_threshold: float,
+    atr_buffer: float,
+) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Refreshing NIFTY 500 benchmark",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def refresh_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 75) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Refreshing 10-year Kite OHLC"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 75)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange="NSE",
+        )
+
+    def backtest_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 75 + (int((completed / total) * 25) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Backtesting TraderSetup signals"),
+            completed=completed,
+            total=total,
+            percent=max(75, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange="NSE",
+        )
+
+    try:
+        expected_date = _refresh_minervini_quality_benchmark(
+            storage,
+            MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+        )
+        requested_start = pd.Timestamp(start_date).date()
+        symbols, refresh_audit = _refresh_trader_setup_history(
+            storage,
+            required_date=expected_date,
+            start_date=requested_start,
+            progress_callback=refresh_progress,
+        )
+        result = run_trader_setup_backtest_study(
+            storage,
+            exchange="NSE",
+            symbols=symbols,
+            start_date=requested_start,
+            end_date=expected_date,
+            left_bars=left_bars,
+            right_bars=right_bars,
+            volume_osc_threshold=volume_osc_threshold,
+            rvol_threshold=rvol_threshold,
+            atr_buffer=atr_buffer,
+            holding_days=holding_days,
+            profit_target_pct=profit_target_pct,
+            stop_loss_pct=stop_loss_pct,
+            round_trip_cost_pct=round_trip_cost_pct,
+            progress_callback=backtest_progress,
+        )
+        result.summary.update(refresh_audit)
+        save_trader_setup_backtest_outputs(result, _trader_setup_backtest_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=len(symbols),
+            total=len(symbols),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/trader-setup-backtest?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/trader-setup-backtest?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _latest_candle_date(frame: pd.DataFrame) -> date | None:
+    if frame.empty or "date" not in frame.columns:
+        return None
+    latest = pd.to_datetime(frame["date"], errors="coerce").max()
+    return None if pd.isna(latest) else pd.Timestamp(latest).date()
+
+
+def _latest_completed_nse_calendar_date(now_ist: pd.Timestamp | None = None) -> date:
+    """Return the latest calendar date that can contain a finalized NSE daily bar."""
+    current = pd.Timestamp.now(tz="Asia/Kolkata") if now_ist is None else pd.Timestamp(now_ist)
+    if current.tzinfo is None:
+        current = current.tz_localize("Asia/Kolkata")
+    else:
+        current = current.tz_convert("Asia/Kolkata")
+    cutoff = current.date()
+    if current.weekday() >= 5 or (current.hour, current.minute) < (15, 45):
+        cutoff -= timedelta(days=1)
+    while cutoff.weekday() >= 5:
+        cutoff -= timedelta(days=1)
+    return cutoff
+
+
+def _clip_daily_candles(
+    storage: Storage,
+    exchange: str,
+    symbol: str,
+    frame: pd.DataFrame,
+    cutoff: date,
+) -> pd.DataFrame:
+    """Remove incomplete/future daily bars and persist the clean candle history."""
+    if frame.empty:
+        return frame
+    dates = pd.to_datetime(frame.get("date"), errors="coerce")
+    clipped = frame[dates.dt.date <= cutoff].copy()
+    if len(clipped) != len(frame) and not clipped.empty:
+        storage.save_candles(exchange, symbol, clipped, "1D")
+    return clipped
+
+
+def _required_refresh_coverage(config: dict[str, Any]) -> float:
+    configured = config.get("data", {}).get("readiness", {}).get(
+        "minimum_symbols_updated_percent",
+        80,
+    )
+    try:
+        return max(0.0, min(float(configured), 100.0))
+    except (TypeError, ValueError):
+        return 80.0
+
+
+def _validate_refresh_coverage(audit: dict[str, Any], config: dict[str, Any]) -> None:
+    required = _required_refresh_coverage(config)
+    actual = float(audit.get("refresh_coverage_pct") or 0.0)
+    if actual < required:
+        raise RuntimeError(
+            "Kite OHLC freshness check failed: "
+            f"{actual:.1f}% of {int(audit.get('refresh_universe_count') or 0)} symbols reached "
+            f"{audit.get('refresh_expected_date') or 'the expected session'}; at least {required:.1f}% is required. "
+            "The previous screener result was preserved."
+        )
+
+
+def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str) -> date:
+    access_token = load_access_token(storage.data_root)
+    if not access_token:
+        raise RuntimeError("Kite access token not found. Refresh the Kite login before running the screener.")
 
     provider = KiteDataProvider(access_token=access_token)
     provider.validate_session()
@@ -3098,19 +3453,45 @@ def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str
         raise RuntimeError(f"Kite instrument {benchmark_symbol} was not found.")
 
     history_years = int(load_config().get("data", {}).get("history_years", 10))
-    existing = storage.load_candles("NSE_INDEX", benchmark_symbol, "1D")
+    completed_cutoff = _latest_completed_nse_calendar_date()
+    existing = _clip_daily_candles(
+        storage,
+        "NSE_INDEX",
+        benchmark_symbol,
+        storage.load_candles("NSE_INDEX", benchmark_symbol, "1D"),
+        completed_cutoff,
+    )
     from_date = _fetch_incremental_start_date(existing, history_years)
-    today = date.today()
-    if from_date <= today:
-        new_daily = provider.daily_candles(int(rows.iloc[0]["instrument_token"]), from_date, today)
-        storage.merge_and_save_candles("NSE_INDEX", benchmark_symbol, new_daily, "1D")
+    if from_date <= completed_cutoff:
+        new_daily = provider.daily_candles(
+            int(rows.iloc[0]["instrument_token"]),
+            from_date,
+            completed_cutoff,
+        )
+        if new_daily.empty:
+            raise RuntimeError(f"Kite returned no daily OHLC for {benchmark_symbol}.")
+        merged = storage.merge_and_save_candles("NSE_INDEX", benchmark_symbol, new_daily, "1D")
+    else:
+        merged = existing
+    merged = _clip_daily_candles(
+        storage,
+        "NSE_INDEX",
+        benchmark_symbol,
+        merged,
+        completed_cutoff,
+    )
+    latest_date = _latest_candle_date(merged)
+    if latest_date is None:
+        raise RuntimeError(f"Latest Kite daily candle date for {benchmark_symbol} is unavailable.")
+    return latest_date
 
 
 def _refresh_minervini_quality_candles(
     storage: Storage,
     *,
+    required_date: date,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any]]:
     config = load_config()
     history_years = int(config.get("data", {}).get("history_years", 10))
     access_token = load_access_token(storage.data_root)
@@ -3125,8 +3506,9 @@ def _refresh_minervini_quality_candles(
     candidates = universe[
         universe["exchange"].astype(str).str.upper().eq("NSE")
     ].drop_duplicates(subset=["tradingsymbol"]).sort_values("tradingsymbol").reset_index(drop=True)
-    today = date.today()
     refreshed_symbols: list[str] = []
+    stale_symbols: list[str] = []
+    failed_symbols: list[str] = []
 
     if progress_callback:
         progress_callback(
@@ -3141,19 +3523,25 @@ def _refresh_minervini_quality_candles(
 
     for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
         symbol = str(instrument["tradingsymbol"]).strip().upper()
-        existing = storage.load_candles("NSE", symbol, "1D")
-        from_date = _fetch_incremental_start_date(existing, history_years)
-        if from_date <= today:
-            new_daily = provider.daily_candles(
-                int(instrument["instrument_token"]),
-                from_date,
-                today,
-            )
-            daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
-        else:
-            daily = existing
-        if not daily.empty:
+        try:
+            existing = storage.load_candles("NSE", symbol, "1D")
+            from_date = _fetch_incremental_start_date(existing, history_years)
+            if from_date <= today:
+                new_daily = provider.daily_candles(
+                    int(instrument["instrument_token"]),
+                    from_date,
+                    today,
+                )
+                daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
+            else:
+                daily = existing
+        except Exception:
+            failed_symbols.append(symbol)
+            daily = pd.DataFrame()
+        if _latest_candle_date(daily) == required_date:
             refreshed_symbols.append(symbol)
+        elif symbol not in failed_symbols:
+            stale_symbols.append(symbol)
         if progress_callback:
             progress_callback(
                 {
@@ -3165,7 +3553,18 @@ def _refresh_minervini_quality_candles(
                 }
             )
 
-    return refreshed_symbols
+    total = len(candidates)
+    coverage_pct = len(refreshed_symbols) / total * 100.0 if total else 0.0
+    audit = {
+        "refresh_expected_date": required_date.isoformat(),
+        "refresh_universe_count": total,
+        "refresh_current_count": len(refreshed_symbols),
+        "refresh_stale_count": len(stale_symbols),
+        "refresh_failed_count": len(failed_symbols),
+        "refresh_coverage_pct": coverage_pct,
+    }
+    _validate_refresh_coverage(audit, config)
+    return refreshed_symbols, audit
 
 
 def _run_minervini_quality_job(
@@ -3218,8 +3617,13 @@ def _run_minervini_quality_job(
         )
 
     try:
-        refreshed_symbols = _refresh_minervini_quality_candles(
+        expected_date = _refresh_minervini_quality_benchmark(
             storage,
+            MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+        )
+        refreshed_symbols, refresh_audit = _refresh_minervini_quality_candles(
+            storage,
+            required_date=expected_date,
             progress_callback=refresh_progress_callback,
         )
         if not refreshed_symbols:
@@ -3234,7 +3638,6 @@ def _run_minervini_quality_job(
             current_symbol="",
             current_exchange="NSE",
         )
-        _refresh_minervini_quality_benchmark(storage, MINERVINI_QUALITY_DEFAULT_BENCHMARK)
         result = run_minervini_quality_study(
             storage,
             exchange="NSE",
@@ -3243,6 +3646,7 @@ def _run_minervini_quality_job(
             score_threshold=score_threshold,
             progress_callback=scan_progress_callback,
         )
+        result.summary.update(refresh_audit)
         save_minervini_quality_outputs(result, _minervini_quality_dir(data_root))
         _set_scan_job(
             job_id,
@@ -3279,13 +3683,18 @@ def _fetch_incremental_start_date(existing: pd.DataFrame, history_years: int) ->
 def _refresh_adx_di_candles(
     storage: Storage,
     *,
+    required_date: date,
+    symbols: list[str] | None = None,
+    validate_coverage: bool = True,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> list[str]:
+    scan_label: str = "ADX screener",
+    progress_phase: str = "Refreshing ADX / DI candles",
+) -> tuple[list[str], dict[str, Any]]:
     config = load_config()
     history_years = int(config.get("data", {}).get("history_years", 10))
     access_token = load_access_token(storage.data_root)
     if not access_token:
-        raise RuntimeError("Kite access token not found. Refresh the Kite login before running the ADX screener.")
+        raise RuntimeError(f"Kite access token not found. Refresh the Kite login before running the {scan_label}.")
 
     provider = KiteDataProvider(access_token=access_token)
     provider.validate_session()
@@ -3300,14 +3709,24 @@ def _refresh_adx_di_candles(
         nse = nse[nse["instrument_type"].astype(str).str.upper().isin({"EQ"})].copy()
     nse["tradingsymbol"] = nse["tradingsymbol"].astype(str).str.upper().str.strip()
     nse = nse[~nse["tradingsymbol"].apply(_is_excluded_adx_symbol)].drop_duplicates(subset=["tradingsymbol"])
+    requested_symbols = None
+    if symbols is not None:
+        requested_symbols = {
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        }
+        nse = nse[nse["tradingsymbol"].isin(requested_symbols)].copy()
     candidates = nse.sort_values("tradingsymbol").reset_index(drop=True)
     today = date.today()
     refreshed_symbols: list[str] = []
+    stale_symbols: list[str] = []
+    failed_symbols: list[str] = []
 
     if progress_callback:
         progress_callback(
             {
-                "phase": "Refreshing ADX / DI candles",
+                "phase": progress_phase,
                 "completed": 0,
                 "total": len(candidates),
                 "current_symbol": "",
@@ -3318,30 +3737,32 @@ def _refresh_adx_di_candles(
     for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
         symbol = str(instrument["tradingsymbol"]).upper()
         token = int(instrument["instrument_token"])
-        existing_daily = storage.load_candles("NSE", symbol, "1D")
-        from_date = _fetch_incremental_start_date(existing_daily, history_years)
-        if from_date <= today:
-            new_daily = provider.daily_candles(token, from_date, today)
-            daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
-        else:
-            daily = existing_daily
-        if daily.empty:
-            if progress_callback:
-                progress_callback(
-                    {
-                        "phase": "Refreshing ADX / DI candles",
-                        "completed": completed,
-                        "total": len(candidates),
-                        "current_symbol": symbol,
-                        "current_exchange": "NSE",
-                    }
-                )
-            continue
-        refreshed_symbols.append(symbol)
+        try:
+            existing_daily = _clip_daily_candles(
+                storage,
+                "NSE",
+                symbol,
+                storage.load_candles("NSE", symbol, "1D"),
+                required_date,
+            )
+            from_date = _fetch_incremental_start_date(existing_daily, history_years)
+            if from_date <= required_date:
+                new_daily = provider.daily_candles(token, from_date, required_date)
+                daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
+            else:
+                daily = existing_daily
+            daily = _clip_daily_candles(storage, "NSE", symbol, daily, required_date)
+        except Exception:
+            failed_symbols.append(symbol)
+            daily = pd.DataFrame()
+        if _latest_candle_date(daily) == required_date:
+            refreshed_symbols.append(symbol)
+        elif symbol not in failed_symbols:
+            stale_symbols.append(symbol)
         if progress_callback:
             progress_callback(
                 {
-                    "phase": "Refreshing ADX / DI candles",
+                    "phase": progress_phase,
                     "completed": completed,
                     "total": len(candidates),
                     "current_symbol": symbol,
@@ -3349,19 +3770,25 @@ def _refresh_adx_di_candles(
                 }
             )
 
-    benchmark_rows = instruments[
-        (instruments["exchange"].astype(str).str.upper() == "NSE")
-        & (instruments["tradingsymbol"].astype(str).str.upper() == "NIFTY 50")
-    ].drop_duplicates(subset=["tradingsymbol"])
-    if not benchmark_rows.empty:
-        benchmark = benchmark_rows.iloc[0]
-        existing_benchmark = storage.load_candles("NSE_INDEX", "NIFTY 50", "1D")
-        from_date = _fetch_incremental_start_date(existing_benchmark, history_years)
-        if from_date <= today:
-            new_benchmark = provider.daily_candles(int(benchmark["instrument_token"]), from_date, today)
-            storage.merge_and_save_candles("NSE_INDEX", "NIFTY 50", new_benchmark, "1D")
-
-    return refreshed_symbols
+    total = len(candidates)
+    coverage_pct = len(refreshed_symbols) / total * 100.0 if total else 0.0
+    audit = {
+        "refresh_expected_date": required_date.isoformat(),
+        "refresh_requested_count": len(requested_symbols) if requested_symbols is not None else total,
+        "refresh_unavailable_count": (
+            len(requested_symbols - set(candidates["tradingsymbol"]))
+            if requested_symbols is not None
+            else 0
+        ),
+        "refresh_universe_count": total,
+        "refresh_current_count": len(refreshed_symbols),
+        "refresh_stale_count": len(stale_symbols),
+        "refresh_failed_count": len(failed_symbols),
+        "refresh_coverage_pct": coverage_pct,
+    }
+    if validate_coverage:
+        _validate_refresh_coverage(audit, config)
+    return refreshed_symbols, audit
 
 
 def _run_adx_di_job(
@@ -3411,7 +3838,12 @@ def _run_adx_di_job(
         )
 
     try:
-        refreshed_symbols = _refresh_adx_di_candles(storage, progress_callback=progress_callback)
+        expected_date = _refresh_minervini_quality_benchmark(storage, "NIFTY 50")
+        refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
+            storage,
+            required_date=expected_date,
+            progress_callback=progress_callback,
+        )
         if not refreshed_symbols:
             raise RuntimeError("No fresh NSE daily candles were available for the ADX screener run.")
         result = run_adx_di_study(
@@ -3434,6 +3866,7 @@ def _run_adx_di_job(
             atr_lower1_proximity_pct=atr_lower1_proximity_pct,
             progress_callback=progress_callback,
         )
+        result.summary.update(refresh_audit)
         save_adx_di_outputs(result, _adx_di_dir(data_root))
         _set_scan_job(
             job_id,
@@ -3457,6 +3890,242 @@ def _run_adx_di_job(
         )
 
 
+def _run_knox_envelope_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    knox_lookback: int,
+    rsi_length: int,
+    momentum_length: int,
+    signal_lookback_bars: int,
+    signal_direction: str,
+    envelope_length: int,
+    envelope_percent: float,
+    envelope_ma_type: str,
+    envelope_mode: str,
+    envelope_proximity_pct: float,
+    cmf_length: int,
+    cmf_condition: str,
+    confirmation_mode: str,
+    confirmation_window_bars: int,
+    confirmation_close_location_pct: float,
+    use_sharpe_filter: bool,
+    sharpe_lookback_days: int,
+    annual_risk_free_rate_pct: float,
+    min_sharpe_ratio: float | None,
+) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Refreshing Knoxville / Envelope candles",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def refresh_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 50) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Refreshing daily candles"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 50)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", "NSE"),
+        )
+
+    def scan_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 50 + (int((completed / total) * 50) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Scanning confluence"),
+            completed=completed,
+            total=total,
+            percent=max(50, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", "NSE"),
+        )
+
+    try:
+        expected_date = _refresh_minervini_quality_benchmark(storage, "NIFTY 50")
+        refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
+            storage,
+            required_date=expected_date,
+            progress_callback=refresh_progress,
+            scan_label="Knoxville / Envelope screener",
+            progress_phase="Refreshing Knoxville / Envelope candles",
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh NSE daily candles were available for the Knoxville / Envelope scan.")
+        result = run_knox_envelope_study(
+            storage,
+            exchange="NSE",
+            symbols=refreshed_symbols,
+            knox_lookback=knox_lookback,
+            rsi_length=rsi_length,
+            momentum_length=momentum_length,
+            signal_lookback_bars=signal_lookback_bars,
+            signal_direction=signal_direction,
+            envelope_length=envelope_length,
+            envelope_percent=envelope_percent,
+            envelope_ma_type=envelope_ma_type,
+            envelope_mode=envelope_mode,
+            envelope_proximity_pct=envelope_proximity_pct,
+            cmf_length=cmf_length,
+            cmf_condition=cmf_condition,
+            confirmation_mode=confirmation_mode,
+            confirmation_window_bars=confirmation_window_bars,
+            confirmation_close_location_pct=confirmation_close_location_pct,
+            use_sharpe_filter=use_sharpe_filter,
+            sharpe_lookback_days=sharpe_lookback_days,
+            annual_risk_free_rate_pct=annual_risk_free_rate_pct,
+            min_sharpe_ratio=min_sharpe_ratio,
+            as_of_date=expected_date,
+            progress_callback=scan_progress,
+        )
+        result.summary.update(refresh_audit)
+        save_knox_envelope_outputs(result, _knox_envelope_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/knox-envelope?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/knox-envelope?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _run_knox_recovery_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    start_date: str,
+    knox_lookback: int,
+    rsi_length: int,
+    momentum_length: int,
+    envelope_length: int,
+    envelope_percent: float,
+    envelope_ma_type: str,
+    envelope_proximity_pct: float,
+    recent_endpoint_bars: int,
+    round_trip_cost_pct: float,
+) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Refreshing five-year NSE history",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def refresh_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 75) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Refreshing five-year NSE history"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 75)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange="NSE",
+        )
+
+    def backtest_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 75 + (int((completed / total) * 25) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Backtesting Knoxville recoveries"),
+            completed=completed,
+            total=total,
+            percent=max(75, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange="NSE",
+        )
+
+    try:
+        expected_date = _refresh_minervini_quality_benchmark(storage, "NIFTY 50")
+        requested_start = pd.Timestamp(start_date).date()
+        warmup_start = (pd.Timestamp(requested_start) - pd.DateOffset(years=1)).date()
+        symbols, refresh_audit = _refresh_trader_setup_history(
+            storage,
+            required_date=expected_date,
+            start_date=warmup_start,
+            progress_callback=refresh_progress,
+        )
+        result = run_knox_recovery_study(
+            storage,
+            exchange="NSE",
+            symbols=symbols,
+            start_date=requested_start,
+            end_date=expected_date,
+            knox_lookback=knox_lookback,
+            rsi_length=rsi_length,
+            momentum_length=momentum_length,
+            envelope_length=envelope_length,
+            envelope_percent=envelope_percent,
+            envelope_ma_type=envelope_ma_type,
+            envelope_proximity_pct=envelope_proximity_pct,
+            recent_endpoint_bars=recent_endpoint_bars,
+            round_trip_cost_pct=round_trip_cost_pct,
+            progress_callback=backtest_progress,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["indicator_warmup_start_date"] = warmup_start.isoformat()
+        save_knox_recovery_outputs(result, _knox_recovery_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=len(symbols),
+            total=len(symbols),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/knox-recovery?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/knox-recovery?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
 def _run_minervini_di_divergence_job(
     job_id: str,
     data_root: Path,
@@ -3464,6 +4133,8 @@ def _run_minervini_di_divergence_job(
     adx_length: int,
     divergence_days: int,
     min_score: float,
+    symbols: list[str] | None = None,
+    targeted: bool = False,
 ) -> None:
     storage = Storage(data_root)
     _set_scan_job(
@@ -3508,7 +4179,23 @@ def _run_minervini_di_divergence_job(
         )
 
     try:
-        refreshed_symbols = _refresh_adx_di_candles(storage, progress_callback=refresh_progress_callback)
+        expected_date = _refresh_minervini_quality_benchmark(
+            storage,
+            MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+        )
+        refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
+            storage,
+            required_date=expected_date,
+            symbols=symbols,
+            validate_coverage=not targeted,
+            progress_callback=refresh_progress_callback,
+            scan_label="targeted DI + Minervini scan" if targeted else "DI + Minervini scan",
+            progress_phase=(
+                "Refreshing selected NSE candles"
+                if targeted
+                else "Refreshing ADX / DI candles"
+            ),
+        )
         if not refreshed_symbols:
             raise RuntimeError("No fresh NSE daily candles were available for the combined screener run.")
         _set_scan_job(
@@ -3521,7 +4208,6 @@ def _run_minervini_di_divergence_job(
             current_symbol="",
             current_exchange="NSE",
         )
-        _refresh_minervini_quality_benchmark(storage, MINERVINI_QUALITY_DEFAULT_BENCHMARK)
         result = run_minervini_di_divergence_study(
             storage,
             exchange="NSE",
@@ -3532,7 +4218,23 @@ def _run_minervini_di_divergence_job(
             benchmark_symbol=MINERVINI_QUALITY_DEFAULT_BENCHMARK,
             progress_callback=scan_progress_callback,
         )
-        save_minervini_di_divergence_outputs(result, _minervini_di_divergence_dir(data_root))
+        result.summary.update(refresh_audit)
+        if targeted:
+            result.summary["targeted_scan"] = True
+            result.summary["requested_symbols_csv"] = ",".join(symbols or [])
+        if result.summary.get("latest_stock_date") != result.summary.get("benchmark_latest_date"):
+            raise RuntimeError(
+                "Freshness check failed: latest NSE stock candle is "
+                f"{result.summary.get('latest_stock_date') or 'unavailable'}, but NIFTY 500 is "
+                f"{result.summary.get('benchmark_latest_date') or 'unavailable'}. Run again after Kite publishes both completed daily candles."
+            )
+        output_dir = (
+            _minervini_di_divergence_targeted_dir(data_root)
+            if targeted
+            else _minervini_di_divergence_dir(data_root)
+        )
+        save_minervini_di_divergence_outputs(result, output_dir)
+        completion_flag = "targeted_ran=1" if targeted else "study_ran=1"
         _set_scan_job(
             job_id,
             status="completed",
@@ -3543,7 +4245,7 @@ def _run_minervini_di_divergence_job(
             current_symbol="",
             current_exchange="",
             summary=result.summary,
-            redirect_url=f"/minervini-di-divergence?study_ran=1{query_suffix}",
+            redirect_url=f"/minervini-di-divergence?{completion_flag}{query_suffix}",
         )
     except Exception as exc:
         _set_scan_job(
@@ -3551,7 +4253,11 @@ def _run_minervini_di_divergence_job(
             status="failed",
             phase="Failed",
             error=str(exc),
-            redirect_url=f"/minervini-di-divergence?study_error={quote(str(exc)[:500])}{query_suffix}",
+            redirect_url=(
+                f"/minervini-di-divergence?targeted_error={quote(str(exc)[:500])}{query_suffix}"
+                if targeted
+                else f"/minervini-di-divergence?study_error={quote(str(exc)[:500])}{query_suffix}"
+            ),
         )
 
 
@@ -4170,8 +4876,26 @@ def _resistance_breaks_dir(data_root: Path) -> Path:
     return path
 
 
+def _trader_setup_backtest_dir(data_root: Path) -> Path:
+    path = data_root / "trader_setup_backtest"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _adx_di_dir(data_root: Path) -> Path:
     path = data_root / "adx_di"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _knox_envelope_dir(data_root: Path) -> Path:
+    path = data_root / "knox_envelope"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _knox_recovery_dir(data_root: Path) -> Path:
+    path = data_root / "knox_recovery"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -4190,6 +4914,12 @@ def _minervini_quality_dir(data_root: Path) -> Path:
 
 def _minervini_di_divergence_dir(data_root: Path) -> Path:
     path = data_root / "minervini_di_divergence"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _minervini_di_divergence_targeted_dir(data_root: Path) -> Path:
+    path = data_root / "minervini_di_divergence_targeted"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -4714,6 +5444,9 @@ def download_gtt_gain_study_report() -> FileResponse:
 
 @app.get("/weekday-study", response_class=HTMLResponse)
 def weekday_study_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Weekday Study")
+
+    # Retained for now because active Telegram workflows reuse the saved weekday fields.
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -4851,6 +5584,8 @@ def weekday_study_page(request: Request) -> HTMLResponse:
 
 @app.post("/weekday-study/run")
 async def run_weekday_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Weekday Study is temporarily removed from the workspace for now.")
+
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
@@ -4895,6 +5630,8 @@ async def run_strategy_lab_from_dashboard(request: Request, background_tasks: Ba
 
 @app.get("/weekly-buy-gains", response_class=HTMLResponse)
 def weekly_buy_gains_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Buy Gains")
+
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -5008,6 +5745,8 @@ def weekly_buy_gains_page(request: Request) -> HTMLResponse:
 
 @app.post("/weekly-buy-gains/run")
 async def run_weekly_buy_gains_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Buy Gains is temporarily removed from the workspace for now.")
+
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
@@ -5040,6 +5779,8 @@ async def run_weekly_buy_gains_from_dashboard(request: Request, background_tasks
 
 @app.get("/volume-burst", response_class=HTMLResponse)
 def volume_burst_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Volume Burst")
+
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -5099,6 +5840,8 @@ def volume_burst_page(request: Request) -> HTMLResponse:
 
 @app.post("/volume-burst/run")
 async def run_volume_burst_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Volume Burst is temporarily removed from the workspace for now.")
+
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
@@ -5124,6 +5867,8 @@ async def run_volume_burst_from_dashboard(request: Request, background_tasks: Ba
 
 @app.get("/resistance-breaks", response_class=HTMLResponse)
 def resistance_breaks_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Resistance Breaks")
+
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -5204,6 +5949,8 @@ def resistance_breaks_page(request: Request) -> HTMLResponse:
 
 @app.post("/resistance-breaks/run")
 async def run_resistance_breaks_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Resistance Breaks is temporarily removed from the workspace for now.")
+
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
@@ -5249,6 +5996,166 @@ async def run_resistance_breaks_from_dashboard(request: Request, background_task
     except Exception as exc:
         redirect_url = f"/resistance-breaks?study_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/trader-setup-backtest", response_class=HTMLResponse)
+def trader_setup_backtest_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = load_trader_setup_backtest_outputs(_trader_setup_backtest_dir(data_root))
+    default_start = (pd.Timestamp.today().normalize() - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
+
+    def query_value(name: str, summary_name: str, fallback: Any, cast: Callable[[Any], Any]) -> Any:
+        raw = request.query_params.get(name, latest.summary.get(summary_name, fallback))
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+    start_date = str(request.query_params.get("start_date", latest.summary.get("requested_start_date", default_start)))
+    holding_days = max(query_value("holding_days", "holding_days", TRADER_SETUP_DEFAULT_HOLDING_DAYS, int), 1)
+    profit_target_pct = max(query_value("profit_target_pct", "profit_target_pct", TRADER_SETUP_DEFAULT_PROFIT_TARGET_PCT, float), 0.0)
+    stop_loss_pct = max(query_value("stop_loss_pct", "stop_loss_pct", TRADER_SETUP_DEFAULT_STOP_LOSS_PCT, float), 0.0)
+    round_trip_cost_pct = max(query_value("round_trip_cost_pct", "round_trip_cost_pct", TRADER_SETUP_DEFAULT_ROUND_TRIP_COST_PCT, float), 0.0)
+    left_bars = max(query_value("left_bars", "left_bars", TRADER_SETUP_DEFAULT_LEFT_BARS, int), 1)
+    right_bars = max(query_value("right_bars", "right_bars", TRADER_SETUP_DEFAULT_RIGHT_BARS, int), 1)
+    volume_osc_threshold = query_value("volume_osc_threshold", "volume_osc_threshold", TRADER_SETUP_DEFAULT_VOLUME_OSC_THRESHOLD, float)
+    rvol_threshold = max(query_value("rvol_threshold", "rvol_threshold", TRADER_SETUP_DEFAULT_RVOL_THRESHOLD, float), 0.0)
+    atr_buffer = max(query_value("atr_buffer", "atr_buffer", TRADER_SETUP_DEFAULT_ATR_BUFFER, float), 0.0)
+
+    strategy_stats = latest.strategy_stats.copy()
+    yearly_stats = latest.yearly_stats.copy()
+    stock_stats = latest.stock_stats.copy()
+    trades = latest.trades.copy()
+    if not yearly_stats.empty and "year" in yearly_stats.columns:
+        yearly_stats = yearly_stats.sort_values(["year", "strategy"], ascending=[False, True])
+    if not stock_stats.empty:
+        stock_stats = stock_stats.sort_values(
+            [column for column in ("win_rate_pct", "avg_return_pct", "trades") if column in stock_stats.columns],
+            ascending=False,
+        ).head(500)
+    if not trades.empty:
+        trades = trades.head(500)
+
+    return templates.TemplateResponse(
+        "trader_setup_backtest.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": latest.summary,
+            "strategy_stats": _records(strategy_stats),
+            "yearly_stats": _records(yearly_stats),
+            "stock_stats": _records(stock_stats),
+            "trades": _records(trades),
+            "start_date": start_date,
+            "holding_days": holding_days,
+            "profit_target_pct": profit_target_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "round_trip_cost_pct": round_trip_cost_pct,
+            "left_bars": left_bars,
+            "right_bars": right_bars,
+            "volume_osc_threshold": volume_osc_threshold,
+            "rvol_threshold": rvol_threshold,
+            "atr_buffer": atr_buffer,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/trader-setup-backtest/run")
+async def run_trader_setup_backtest_from_dashboard(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    default_start = (pd.Timestamp.today().normalize() - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    start_date = str(form.get("start_date", default_start)).strip() or default_start
+    try:
+        pd.Timestamp(start_date)
+    except (TypeError, ValueError):
+        start_date = default_start
+    holding_days = max(int(str(form.get("holding_days", TRADER_SETUP_DEFAULT_HOLDING_DAYS)).strip()), 1)
+    profit_target_pct = max(float(str(form.get("profit_target_pct", TRADER_SETUP_DEFAULT_PROFIT_TARGET_PCT)).strip()), 0.0)
+    stop_loss_pct = max(float(str(form.get("stop_loss_pct", TRADER_SETUP_DEFAULT_STOP_LOSS_PCT)).strip()), 0.0)
+    round_trip_cost_pct = max(float(str(form.get("round_trip_cost_pct", TRADER_SETUP_DEFAULT_ROUND_TRIP_COST_PCT)).strip()), 0.0)
+    left_bars = max(int(str(form.get("left_bars", TRADER_SETUP_DEFAULT_LEFT_BARS)).strip()), 1)
+    right_bars = max(int(str(form.get("right_bars", TRADER_SETUP_DEFAULT_RIGHT_BARS)).strip()), 1)
+    volume_osc_threshold = float(str(form.get("volume_osc_threshold", TRADER_SETUP_DEFAULT_VOLUME_OSC_THRESHOLD)).strip())
+    rvol_threshold = max(float(str(form.get("rvol_threshold", TRADER_SETUP_DEFAULT_RVOL_THRESHOLD)).strip()), 0.0)
+    atr_buffer = max(float(str(form.get("atr_buffer", TRADER_SETUP_DEFAULT_ATR_BUFFER)).strip()), 0.0)
+    params = [
+        f"start_date={quote(start_date)}",
+        f"holding_days={holding_days}",
+        f"profit_target_pct={quote(str(profit_target_pct))}",
+        f"stop_loss_pct={quote(str(stop_loss_pct))}",
+        f"round_trip_cost_pct={quote(str(round_trip_cost_pct))}",
+        f"left_bars={left_bars}",
+        f"right_bars={right_bars}",
+        f"volume_osc_threshold={quote(str(volume_osc_threshold))}",
+        f"rvol_threshold={quote(str(rvol_threshold))}",
+        f"atr_buffer={quote(str(atr_buffer))}",
+    ]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+        background_tasks.add_task(
+            _run_trader_setup_backtest_job,
+            job_id,
+            data_root,
+            query_suffix,
+            start_date,
+            holding_days,
+            profit_target_pct,
+            stop_loss_pct,
+            round_trip_cost_pct,
+            left_bars,
+            right_bars,
+            volume_osc_threshold,
+            rvol_threshold,
+            atr_buffer,
+        )
+        redirect_url = f"/trader-setup-backtest?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/trader-setup-backtest?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/trader-setup-backtest/trades.csv")
+def download_trader_setup_backtest_trades(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    path = _trader_setup_backtest_dir(get_data_root(load_config())) / "latest_trades.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the TraderSetup backtest first")
+    return FileResponse(path, media_type="text/csv", filename="trader_setup_backtest_trades.csv")
 
 
 @app.get("/minervini-quality", response_class=HTMLResponse)
@@ -5402,6 +6309,9 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
     data_root = get_data_root(config)
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_minervini_di_divergence_outputs(_minervini_di_divergence_dir(data_root))
+    targeted_latest = load_minervini_di_divergence_outputs(
+        _minervini_di_divergence_targeted_dir(data_root)
+    )
     stock_search = request.query_params.get("stock_search", "").strip()
     matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
 
@@ -5427,6 +6337,42 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
     except (TypeError, ValueError):
         min_score = MINERVINI_DI_DEFAULT_MIN_SCORE
     min_score = max(0.0, min(min_score, 100.0))
+
+    targeted_stock_stats = targeted_latest.stock_stats.copy()
+    targeted_qualified = pd.DataFrame()
+    if not targeted_stock_stats.empty:
+        for column in (
+            "combined_pass",
+            "di_divergence_pass",
+            "minervini_threshold_pass",
+            "is_latest_market_date",
+        ):
+            if column in targeted_stock_stats.columns:
+                targeted_stock_stats[column] = _truthy_series(targeted_stock_stats[column])
+        combined_targeted_mask = targeted_stock_stats.get(
+            "combined_pass",
+            pd.Series(False, index=targeted_stock_stats.index),
+        ).fillna(False).astype(bool)
+        targeted_qualified = targeted_stock_stats[combined_targeted_mask].copy()
+        targeted_sort_columns = [
+            column
+            for column in (
+                "spread_change_2d",
+                "entry_quality_score",
+                "setup_quality_score",
+                "stock_quality_score",
+                "symbol",
+            )
+            if column in targeted_qualified.columns
+        ]
+        if targeted_sort_columns:
+            targeted_qualified = targeted_qualified.sort_values(
+                targeted_sort_columns,
+                ascending=[column == "symbol" for column in targeted_sort_columns],
+                na_position="last",
+            )
+    targeted_summary = dict(targeted_latest.summary)
+    targeted_input_symbols = str(targeted_summary.get("requested_symbols_csv", "") or "")
 
     stock_stats = latest.stock_stats.copy()
     combined_stock_stats = pd.DataFrame()
@@ -5498,6 +6444,13 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
             "adx_length": adx_length,
             "divergence_days": divergence_days,
             "min_score": min_score,
+            "targeted_summary": targeted_summary,
+            "targeted_stock_stats": _records(targeted_qualified),
+            "targeted_stock_symbols_csv": _comma_separated_symbols(targeted_qualified),
+            "targeted_input_symbols": targeted_input_symbols,
+            "targeted_job": request.query_params.get("targeted_job", ""),
+            "targeted_ran": request.query_params.get("targeted_ran", ""),
+            "targeted_error": request.query_params.get("targeted_error", ""),
             "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
             "study_error": request.query_params.get("study_error", ""),
@@ -5560,6 +6513,638 @@ async def run_minervini_di_divergence_from_dashboard(
     except Exception as exc:
         redirect_url = f"/minervini-di-divergence?study_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.post("/minervini-di-divergence/run-targeted")
+async def run_targeted_minervini_di_divergence(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    try:
+        symbols = _parse_nse_symbol_list(form.get("target_symbols", ""))
+        if not symbols:
+            raise ValueError("Enter at least one NSE stock symbol.")
+    except ValueError as exc:
+        return RedirectResponse(
+            f"/minervini-di-divergence?targeted_error={quote(str(exc))}",
+            status_code=303,
+        )
+
+    try:
+        adx_length = max(
+            int(str(form.get("adx_length", MINERVINI_DI_DEFAULT_ADX_LENGTH)).strip()),
+            2,
+        )
+    except ValueError:
+        adx_length = MINERVINI_DI_DEFAULT_ADX_LENGTH
+    try:
+        divergence_days = max(
+            int(str(form.get("divergence_days", MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS)).strip()),
+            1,
+        )
+    except ValueError:
+        divergence_days = MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS
+    try:
+        min_score = float(str(form.get("min_score", MINERVINI_DI_DEFAULT_MIN_SCORE)).strip())
+    except ValueError:
+        min_score = MINERVINI_DI_DEFAULT_MIN_SCORE
+    min_score = max(0.0, min(min_score, 100.0))
+
+    params = [
+        f"adx_length={adx_length}",
+        f"divergence_days={divergence_days}",
+        f"min_score={quote(str(min_score))}",
+        "matches_only=1",
+    ]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    job_id = uuid4().hex
+    _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=len(symbols), percent=0)
+    background_tasks.add_task(
+        _run_minervini_di_divergence_job,
+        job_id,
+        data_root,
+        query_suffix,
+        adx_length,
+        divergence_days,
+        min_score,
+        symbols,
+        True,
+    )
+    return RedirectResponse(
+        f"/minervini-di-divergence?targeted_job={job_id}{query_suffix}",
+        status_code=303,
+    )
+
+
+@app.get("/knox-envelope", response_class=HTMLResponse)
+def knox_envelope_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    latest = load_knox_envelope_outputs(_knox_envelope_dir(data_root))
+    saved_logic_is_current = latest.summary.get("logic_version") == KNOX_ENVELOPE_LOGIC_VERSION
+    summary = latest.summary if saved_logic_is_current else {}
+
+    def int_param(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            return max(int(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def float_param(name: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(float(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def optional_float_param(name: str, default: float | None = None) -> float | None:
+        value = request.query_params.get(name, summary.get(name, default))
+        if value is None or (isinstance(value, float) and pd.isna(value)) or not str(value).strip():
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    knox_lookback = int_param("knox_lookback", KNOX_ENV_DEFAULT_KNOX_LOOKBACK, 5)
+    rsi_length = int_param("rsi_length", KNOX_ENV_DEFAULT_RSI_LENGTH)
+    momentum_length = int_param("momentum_length", KNOX_ENV_DEFAULT_MOMENTUM_LENGTH)
+    signal_lookback_bars = int_param("signal_lookback_bars", KNOX_ENV_DEFAULT_SIGNAL_LOOKBACK)
+    envelope_length = int_param("envelope_length", KNOX_ENV_DEFAULT_ENVELOPE_LENGTH)
+    envelope_percent = float_param("envelope_percent", KNOX_ENV_DEFAULT_PERCENT)
+    envelope_proximity_pct = float_param("envelope_proximity_pct", KNOX_ENV_DEFAULT_PROXIMITY)
+    cmf_length = int_param("cmf_length", KNOX_ENV_DEFAULT_CMF_LENGTH)
+    confirmation_window_bars = int_param(
+        "confirmation_window_bars",
+        KNOX_ENV_DEFAULT_CONFIRMATION_WINDOW,
+        0,
+    )
+    confirmation_close_location_pct = min(
+        float_param(
+            "confirmation_close_location_pct",
+            KNOX_ENV_DEFAULT_CONFIRMATION_CLOSE_LOCATION,
+        ),
+        100.0,
+    )
+    sharpe_lookback_days = int_param(
+        "sharpe_lookback_days",
+        KNOX_ENV_DEFAULT_SHARPE_LOOKBACK,
+        2,
+    )
+    annual_risk_free_rate_pct = max(
+        optional_float_param(
+            "annual_risk_free_rate_pct",
+            KNOX_ENV_DEFAULT_ANNUAL_RISK_FREE_RATE,
+        ) or 0.0,
+        -99.99,
+    )
+    min_sharpe_ratio = optional_float_param(
+        "min_sharpe_ratio",
+        KNOX_ENV_DEFAULT_MIN_SHARPE_RATIO,
+    )
+    use_sharpe_filter = _truthy_param(
+        request.query_params.getlist("use_sharpe_filter"),
+        default=_truthy_param(
+            summary.get("use_sharpe_filter"),
+            default=KNOX_ENV_DEFAULT_USE_SHARPE_FILTER,
+        ),
+    )
+    signal_direction = str(
+        request.query_params.get("signal_direction", summary.get("signal_direction", KNOX_ENV_DEFAULT_DIRECTION))
+        or KNOX_ENV_DEFAULT_DIRECTION
+    ).lower()
+    if signal_direction not in KNOX_ENV_DIRECTIONS:
+        signal_direction = KNOX_ENV_DEFAULT_DIRECTION
+    envelope_ma_type = str(
+        request.query_params.get("envelope_ma_type", summary.get("envelope_ma_type", KNOX_ENV_DEFAULT_MA_TYPE))
+        or KNOX_ENV_DEFAULT_MA_TYPE
+    ).upper()
+    if envelope_ma_type not in KNOX_ENV_MA_TYPES:
+        envelope_ma_type = KNOX_ENV_DEFAULT_MA_TYPE
+    envelope_mode = str(
+        request.query_params.get("envelope_mode", summary.get("envelope_mode", KNOX_ENV_DEFAULT_MODE))
+        or KNOX_ENV_DEFAULT_MODE
+    ).lower()
+    if envelope_mode not in KNOX_ENV_MODES:
+        envelope_mode = KNOX_ENV_DEFAULT_MODE
+    cmf_condition = str(
+        request.query_params.get(
+            "cmf_condition",
+            summary.get("cmf_condition", KNOX_ENV_DEFAULT_CMF_CONDITION),
+        )
+        or KNOX_ENV_DEFAULT_CMF_CONDITION
+    ).lower()
+    if cmf_condition not in KNOX_ENV_CMF_CONDITIONS:
+        cmf_condition = KNOX_ENV_DEFAULT_CMF_CONDITION
+    confirmation_mode = str(
+        request.query_params.get(
+            "confirmation_mode",
+            summary.get("confirmation_mode", KNOX_ENV_DEFAULT_CONFIRMATION_MODE),
+        )
+        or KNOX_ENV_DEFAULT_CONFIRMATION_MODE
+    ).lower()
+    if confirmation_mode not in KNOX_ENV_CONFIRMATION_MODES:
+        confirmation_mode = KNOX_ENV_DEFAULT_CONFIRMATION_MODE
+
+    stock_search = request.query_params.get("stock_search", "").strip()
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+    stock_stats = latest.stock_stats.copy() if saved_logic_is_current else pd.DataFrame()
+    if not stock_stats.empty:
+        if "combined_match" in stock_stats.columns:
+            stock_stats["combined_match"] = _truthy_series(stock_stats["combined_match"])
+        for column in ("latest_date", "signal_date", "confirmation_date", "reference_date"):
+            if column in stock_stats.columns:
+                stock_stats[column] = pd.to_datetime(stock_stats[column], errors="coerce").dt.strftime("%Y-%m-%d")
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        if matches_only:
+            if "combined_match" in stock_stats.columns:
+                stock_stats = stock_stats[stock_stats["combined_match"]].copy()
+            else:
+                stock_stats = stock_stats.iloc[0:0].copy()
+        if "signal_date" in stock_stats.columns:
+            stock_stats = stock_stats.sort_values(["signal_date", "symbol"], ascending=[False, True], na_position="last")
+
+    return templates.TemplateResponse(
+        "knox_envelope.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "stock_symbols_csv": _comma_separated_symbols(stock_stats),
+            "stock_search": stock_search,
+            "matches_only": matches_only,
+            "knox_lookback": knox_lookback,
+            "rsi_length": rsi_length,
+            "momentum_length": momentum_length,
+            "signal_lookback_bars": signal_lookback_bars,
+            "signal_direction": signal_direction,
+            "envelope_length": envelope_length,
+            "envelope_percent": envelope_percent,
+            "envelope_ma_type": envelope_ma_type,
+            "envelope_mode": envelope_mode,
+            "envelope_proximity_pct": envelope_proximity_pct,
+            "cmf_length": cmf_length,
+            "cmf_condition": cmf_condition,
+            "confirmation_mode": confirmation_mode,
+            "confirmation_window_bars": confirmation_window_bars,
+            "confirmation_close_location_pct": confirmation_close_location_pct,
+            "use_sharpe_filter": use_sharpe_filter,
+            "sharpe_lookback_days": sharpe_lookback_days,
+            "annual_risk_free_rate_pct": annual_risk_free_rate_pct,
+            "min_sharpe_ratio": min_sharpe_ratio,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.get("/knox-envelope/pinescript")
+def download_knox_envelope_pinescript() -> FileResponse:
+    path = BASE_DIR / "tradingview_custom_indicators" / "Knox_Envelope_Confluence.pine"
+    return FileResponse(path, media_type="text/plain", filename="Knox_Envelope_Confluence.pine")
+
+
+@app.post("/knox-envelope/run")
+async def run_knox_envelope_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    def form_int(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            return max(int(str(form.get(name, default)).strip() or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def form_float(name: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(float(str(form.get(name, default)).strip() or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def form_optional_float(name: str, default: float | None = None) -> float | None:
+        value = str(form.get(name, "") if form.get(name) is not None else "").strip()
+        if not value:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    knox_lookback = form_int("knox_lookback", KNOX_ENV_DEFAULT_KNOX_LOOKBACK, 5)
+    rsi_length = form_int("rsi_length", KNOX_ENV_DEFAULT_RSI_LENGTH)
+    momentum_length = form_int("momentum_length", KNOX_ENV_DEFAULT_MOMENTUM_LENGTH)
+    signal_lookback_bars = form_int("signal_lookback_bars", KNOX_ENV_DEFAULT_SIGNAL_LOOKBACK)
+    envelope_length = form_int("envelope_length", KNOX_ENV_DEFAULT_ENVELOPE_LENGTH)
+    envelope_percent = form_float("envelope_percent", KNOX_ENV_DEFAULT_PERCENT)
+    envelope_proximity_pct = form_float("envelope_proximity_pct", KNOX_ENV_DEFAULT_PROXIMITY)
+    cmf_length = form_int("cmf_length", KNOX_ENV_DEFAULT_CMF_LENGTH)
+    confirmation_window_bars = form_int(
+        "confirmation_window_bars",
+        KNOX_ENV_DEFAULT_CONFIRMATION_WINDOW,
+        0,
+    )
+    confirmation_close_location_pct = min(
+        form_float(
+            "confirmation_close_location_pct",
+            KNOX_ENV_DEFAULT_CONFIRMATION_CLOSE_LOCATION,
+        ),
+        100.0,
+    )
+    sharpe_lookback_days = form_int(
+        "sharpe_lookback_days",
+        KNOX_ENV_DEFAULT_SHARPE_LOOKBACK,
+        2,
+    )
+    annual_risk_free_rate_pct = max(
+        form_optional_float(
+            "annual_risk_free_rate_pct",
+            KNOX_ENV_DEFAULT_ANNUAL_RISK_FREE_RATE,
+        ) or 0.0,
+        -99.99,
+    )
+    min_sharpe_ratio = form_optional_float(
+        "min_sharpe_ratio",
+        KNOX_ENV_DEFAULT_MIN_SHARPE_RATIO,
+    )
+    use_sharpe_filter = _truthy_param(form.get("use_sharpe_filter"), default=False)
+    signal_direction = str(form.get("signal_direction", KNOX_ENV_DEFAULT_DIRECTION)).strip().lower()
+    if signal_direction not in KNOX_ENV_DIRECTIONS:
+        signal_direction = KNOX_ENV_DEFAULT_DIRECTION
+    envelope_ma_type = str(form.get("envelope_ma_type", KNOX_ENV_DEFAULT_MA_TYPE)).strip().upper()
+    if envelope_ma_type not in KNOX_ENV_MA_TYPES:
+        envelope_ma_type = KNOX_ENV_DEFAULT_MA_TYPE
+    envelope_mode = str(form.get("envelope_mode", KNOX_ENV_DEFAULT_MODE)).strip().lower()
+    if envelope_mode not in KNOX_ENV_MODES:
+        envelope_mode = KNOX_ENV_DEFAULT_MODE
+    cmf_condition = str(form.get("cmf_condition", KNOX_ENV_DEFAULT_CMF_CONDITION)).strip().lower()
+    if cmf_condition not in KNOX_ENV_CMF_CONDITIONS:
+        cmf_condition = KNOX_ENV_DEFAULT_CMF_CONDITION
+    confirmation_mode = str(
+        form.get("confirmation_mode", KNOX_ENV_DEFAULT_CONFIRMATION_MODE)
+    ).strip().lower()
+    if confirmation_mode not in KNOX_ENV_CONFIRMATION_MODES:
+        confirmation_mode = KNOX_ENV_DEFAULT_CONFIRMATION_MODE
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    params = [
+        f"knox_lookback={knox_lookback}",
+        f"rsi_length={rsi_length}",
+        f"momentum_length={momentum_length}",
+        f"signal_lookback_bars={signal_lookback_bars}",
+        f"signal_direction={quote(signal_direction)}",
+        f"envelope_length={envelope_length}",
+        f"envelope_percent={quote(str(envelope_percent))}",
+        f"envelope_ma_type={quote(envelope_ma_type)}",
+        f"envelope_mode={quote(envelope_mode)}",
+        f"envelope_proximity_pct={quote(str(envelope_proximity_pct))}",
+        f"cmf_length={cmf_length}",
+        f"cmf_condition={quote(cmf_condition)}",
+        f"confirmation_mode={quote(confirmation_mode)}",
+        f"confirmation_window_bars={confirmation_window_bars}",
+        f"confirmation_close_location_pct={quote(str(confirmation_close_location_pct))}",
+        f"use_sharpe_filter={1 if use_sharpe_filter else 0}",
+        f"sharpe_lookback_days={sharpe_lookback_days}",
+        f"annual_risk_free_rate_pct={quote(str(annual_risk_free_rate_pct))}",
+        f"min_sharpe_ratio={quote('' if min_sharpe_ratio is None else str(min_sharpe_ratio))}",
+        "matches_only=1",
+    ]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    job_id = uuid4().hex
+    _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+    background_tasks.add_task(
+        _run_knox_envelope_job,
+        job_id,
+        data_root,
+        query_suffix,
+        knox_lookback,
+        rsi_length,
+        momentum_length,
+        signal_lookback_bars,
+        signal_direction,
+        envelope_length,
+        envelope_percent,
+        envelope_ma_type,
+        envelope_mode,
+        envelope_proximity_pct,
+        cmf_length,
+        cmf_condition,
+        confirmation_mode,
+        confirmation_window_bars,
+        confirmation_close_location_pct,
+        use_sharpe_filter,
+        sharpe_lookback_days,
+        annual_risk_free_rate_pct,
+        min_sharpe_ratio,
+    )
+    return RedirectResponse(f"/knox-envelope?study_job={job_id}{query_suffix}", status_code=303)
+
+
+@app.get("/knox-recovery", response_class=HTMLResponse)
+def knox_recovery_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    latest = load_knox_recovery_outputs(_knox_recovery_dir(data_root))
+    saved_logic_is_current = latest.summary.get("logic_version") == KNOX_RECOVERY_LOGIC_VERSION
+    summary = latest.summary if saved_logic_is_current else {}
+    default_start = (pd.Timestamp.today().normalize() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+
+    def int_param(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            return max(int(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def float_param(name: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(float(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    start_date = str(request.query_params.get("start_date", summary.get("start_date", default_start)))
+    knox_lookback = int_param("knox_lookback", KNOX_ENV_DEFAULT_KNOX_LOOKBACK, 5)
+    rsi_length = int_param("rsi_length", KNOX_ENV_DEFAULT_RSI_LENGTH)
+    momentum_length = int_param("momentum_length", KNOX_ENV_DEFAULT_MOMENTUM_LENGTH)
+    envelope_length = int_param("envelope_length", KNOX_ENV_DEFAULT_ENVELOPE_LENGTH)
+    envelope_percent = float_param("envelope_percent", KNOX_ENV_DEFAULT_PERCENT)
+    envelope_proximity_pct = float_param(
+        "envelope_proximity_pct", KNOX_RECOVERY_DEFAULT_PROXIMITY
+    )
+    recent_endpoint_bars = int_param(
+        "recent_endpoint_bars", KNOX_RECOVERY_DEFAULT_RECENT_BARS, 0
+    )
+    round_trip_cost_pct = float_param(
+        "round_trip_cost_pct", KNOX_RECOVERY_DEFAULT_COST
+    )
+    envelope_ma_type = str(
+        request.query_params.get(
+            "envelope_ma_type",
+            summary.get("envelope_ma_type", KNOX_ENV_DEFAULT_MA_TYPE),
+        )
+        or KNOX_ENV_DEFAULT_MA_TYPE
+    ).upper()
+    if envelope_ma_type not in KNOX_ENV_MA_TYPES:
+        envelope_ma_type = KNOX_ENV_DEFAULT_MA_TYPE
+
+    current_candidates = latest.current_candidates.copy() if saved_logic_is_current else pd.DataFrame()
+    stock_stats = latest.stock_stats.copy() if saved_logic_is_current else pd.DataFrame()
+    events = latest.events.copy() if saved_logic_is_current else pd.DataFrame()
+    envelope_comparison: list[dict[str, Any]] = []
+    for comparison_length in (20, 50):
+        comparison = load_knox_recovery_outputs(
+            data_root
+            / "knox_recovery_comparison"
+            / f"envelope_{comparison_length}"
+        )
+        if comparison.summary.get("logic_version") == KNOX_RECOVERY_LOGIC_VERSION:
+            envelope_comparison.append(comparison.summary)
+    for frame in (current_candidates, events):
+        for column in (
+            "first_endpoint_date",
+            "second_endpoint_date",
+            "latest_observation_date",
+            "equal_high_date",
+            "equal_close_date",
+            "full_high_date",
+            "full_close_date",
+        ):
+            if column in frame.columns:
+                frame[column] = pd.to_datetime(frame[column], errors="coerce").dt.strftime("%Y-%m-%d")
+    if not events.empty and "proximity_pass" in events.columns:
+        events["proximity_pass"] = _truthy_series(events["proximity_pass"])
+        if "data_quality_pass" in events.columns:
+            events["data_quality_pass"] = _truthy_series(events["data_quality_pass"])
+            events = events.loc[events["proximity_pass"] & events["data_quality_pass"]].copy()
+        else:
+            events = events.loc[events["proximity_pass"]].copy()
+    if not events.empty:
+        events = events.sort_values(["second_endpoint_date", "symbol"], ascending=[False, True])
+
+    return templates.TemplateResponse(
+        "knox_recovery.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "current_candidates": _records(current_candidates),
+            "current_candidates_count": len(current_candidates),
+            "current_symbols_csv": _comma_separated_symbols(current_candidates),
+            "stock_stats": _records(stock_stats.head(500)),
+            "events": _records(events.head(500)),
+            "envelope_comparison": envelope_comparison,
+            "start_date": start_date,
+            "knox_lookback": knox_lookback,
+            "rsi_length": rsi_length,
+            "momentum_length": momentum_length,
+            "envelope_length": envelope_length,
+            "envelope_percent": envelope_percent,
+            "envelope_ma_type": envelope_ma_type,
+            "envelope_proximity_pct": envelope_proximity_pct,
+            "recent_endpoint_bars": recent_endpoint_bars,
+            "round_trip_cost_pct": round_trip_cost_pct,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/knox-recovery/run")
+async def run_knox_recovery_from_dashboard(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    default_start = (pd.Timestamp.today().normalize() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+
+    def form_int(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            return max(int(str(form.get(name, default)).strip() or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def form_float(name: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(float(str(form.get(name, default)).strip() or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    start_date = str(form.get("start_date", default_start)).strip() or default_start
+    try:
+        pd.Timestamp(start_date)
+    except (TypeError, ValueError):
+        start_date = default_start
+    knox_lookback = form_int("knox_lookback", KNOX_ENV_DEFAULT_KNOX_LOOKBACK, 5)
+    rsi_length = form_int("rsi_length", KNOX_ENV_DEFAULT_RSI_LENGTH)
+    momentum_length = form_int("momentum_length", KNOX_ENV_DEFAULT_MOMENTUM_LENGTH)
+    envelope_length = form_int("envelope_length", KNOX_ENV_DEFAULT_ENVELOPE_LENGTH)
+    envelope_percent = form_float("envelope_percent", KNOX_ENV_DEFAULT_PERCENT)
+    envelope_proximity_pct = form_float(
+        "envelope_proximity_pct", KNOX_RECOVERY_DEFAULT_PROXIMITY
+    )
+    recent_endpoint_bars = form_int(
+        "recent_endpoint_bars", KNOX_RECOVERY_DEFAULT_RECENT_BARS, 0
+    )
+    round_trip_cost_pct = form_float(
+        "round_trip_cost_pct", KNOX_RECOVERY_DEFAULT_COST
+    )
+    envelope_ma_type = str(form.get("envelope_ma_type", KNOX_ENV_DEFAULT_MA_TYPE)).strip().upper()
+    if envelope_ma_type not in KNOX_ENV_MA_TYPES:
+        envelope_ma_type = KNOX_ENV_DEFAULT_MA_TYPE
+
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    params = [
+        f"start_date={quote(start_date)}",
+        f"knox_lookback={knox_lookback}",
+        f"rsi_length={rsi_length}",
+        f"momentum_length={momentum_length}",
+        f"envelope_length={envelope_length}",
+        f"envelope_percent={quote(str(envelope_percent))}",
+        f"envelope_ma_type={quote(envelope_ma_type)}",
+        f"envelope_proximity_pct={quote(str(envelope_proximity_pct))}",
+        f"recent_endpoint_bars={recent_endpoint_bars}",
+        f"round_trip_cost_pct={quote(str(round_trip_cost_pct))}",
+    ]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    job_id = uuid4().hex
+    _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
+    background_tasks.add_task(
+        _run_knox_recovery_job,
+        job_id,
+        data_root,
+        query_suffix,
+        start_date,
+        knox_lookback,
+        rsi_length,
+        momentum_length,
+        envelope_length,
+        envelope_percent,
+        envelope_ma_type,
+        envelope_proximity_pct,
+        recent_endpoint_bars,
+        round_trip_cost_pct,
+    )
+    return RedirectResponse(f"/knox-recovery?study_job={job_id}{query_suffix}", status_code=303)
+
+
+def _knox_recovery_download(request: Request, source_name: str, filename: str) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    path = _knox_recovery_dir(get_data_root(load_config())) / source_name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the Knoxville Recovery study first")
+    return FileResponse(path, media_type="text/csv", filename=filename)
+
+
+@app.get("/knox-recovery/events.csv")
+def download_knox_recovery_events(request: Request) -> FileResponse:
+    return _knox_recovery_download(request, "latest_events.csv", "knox_recovery_events.csv")
+
+
+@app.get("/knox-recovery/stocks.csv")
+def download_knox_recovery_stocks(request: Request) -> FileResponse:
+    return _knox_recovery_download(request, "latest_stock_stats.csv", "knox_recovery_stock_stats.csv")
+
+
+@app.get("/knox-recovery/current.csv")
+def download_knox_recovery_current(request: Request) -> FileResponse:
+    return _knox_recovery_download(
+        request,
+        "latest_current_candidates.csv",
+        "knox_recovery_current_candidates.csv",
+    )
 
 
 @app.get("/adx-di", response_class=HTMLResponse)
@@ -5996,6 +7581,8 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
 
 @app.get("/qm-quality", response_class=HTMLResponse)
 def qm_quality_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "QM Quality")
+
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -6057,6 +7644,8 @@ def qm_quality_page(request: Request) -> HTMLResponse:
 
 @app.post("/qm-quality/run")
 async def run_qm_quality_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="QM Quality is temporarily removed from the workspace for now.")
+
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
@@ -6088,6 +7677,8 @@ async def run_qm_quality_from_dashboard(request: Request, background_tasks: Back
 
 @app.get("/minervini-sheet", response_class=HTMLResponse)
 def minervini_sheet_page(request: Request) -> HTMLResponse:
+    return _temporarily_removed_response(request, "Minervini Sheet")
+
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -6161,6 +7752,8 @@ def minervini_sheet_page(request: Request) -> HTMLResponse:
 
 @app.post("/minervini-sheet/google/save")
 async def save_minervini_sheet_settings(request: Request) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Minervini Sheet is temporarily removed from the workspace for now.")
+
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
@@ -6190,6 +7783,8 @@ async def save_minervini_sheet_settings(request: Request) -> RedirectResponse:
 
 @app.post("/minervini-sheet/run")
 async def run_minervini_sheet_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    raise HTTPException(status_code=404, detail="Minervini Sheet is temporarily removed from the workspace for now.")
+
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()

@@ -162,11 +162,9 @@ class WeekdayPressureStudyTests(unittest.TestCase):
                 client = TestClient(app)
                 response = client.get("/weekday-study")
 
-            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.status_code, 404)
             self.assertIn("Weekday Study", response.text)
-            self.assertIn("AAA", response.text)
-            self.assertIn("BBB", response.text)
-            self.assertIn("Latest weekly BUY signals", response.text)
+            self.assertIn("temporarily removed from the workspace", response.text)
 
 
 if __name__ == "__main__":

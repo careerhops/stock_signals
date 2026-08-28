@@ -105,6 +105,8 @@ def run_minervini_quality_study(
             "entry_quality_score",
             "trend_pass_count",
             "relative_performance_pct",
+            "latest_52w_high",
+            "distance_below_52w_high_pct",
             "avg_turnover_cr",
             "vcp_score",
             "pressure_pct",
@@ -288,6 +290,15 @@ def evaluate_minervini_quality(
 
     i = len(frame) - 1
     latest_relative = _to_float(relative_performance.iloc[i])
+    latest_52w_high = _to_float(high52.iloc[i])
+    latest_close = _to_float(close.iloc[i])
+    distance_below_52w_high_pct = (
+        _to_float((latest_52w_high - latest_close) / latest_52w_high * 100.0)
+        if latest_52w_high is not None
+        and latest_52w_high > 0
+        and latest_close is not None
+        else None
+    )
     latest_turnover = _to_float(avg_turnover_cr.iloc[i])
     latest_rs_distance = _to_float(rs_line_distance_pct.iloc[i])
     latest_vcp_score = int(vcp_score.iloc[i])
@@ -335,6 +346,8 @@ def evaluate_minervini_quality(
 
     required_values = (
         latest_relative,
+        latest_52w_high,
+        distance_below_52w_high_pct,
         latest_turnover,
         latest_rs_distance,
         latest_distribution,
@@ -360,7 +373,9 @@ def evaluate_minervini_quality(
     obv_state = "ACCUMULATING" if latest_obv_bullish else "DISTRIBUTING" if latest_obv_bearish else "NEUTRAL"
     return {
         "latest_date": frame.iloc[i]["date"].strftime("%Y-%m-%d"),
-        "latest_close": _to_float(close.iloc[i]),
+        "latest_close": latest_close,
+        "latest_52w_high": latest_52w_high,
+        "distance_below_52w_high_pct": distance_below_52w_high_pct,
         "data_status": data_status,
         "market_regime": market_regime,
         "stock_quality_score": stock_score,
@@ -597,6 +612,8 @@ def _empty_metrics(score_threshold: float, status: str) -> dict[str, Any]:
     return {
         "latest_date": "",
         "latest_close": None,
+        "latest_52w_high": None,
+        "distance_below_52w_high_pct": None,
         "data_status": status,
         "stock_quality_score": None,
         "setup_quality_score": None,

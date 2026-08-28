@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">TRADERSETUP 10-YEAR STUDY</p>
+      <h1>Backtest the indicator's actionable signals</h1>
+      <p class="lede">Measures confirmed momentum-pivot, resistance-break, and support-break signals across the current NSE equity universe. Entries occur at the next session's open.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/trader-setup-backtest/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>Start date<input type="date" name="start_date" value="{{ start_date }}" required></label>
+      <label>Holding sessions<input type="number" name="holding_days" min="1" value="{{ holding_days }}"></label>
+      <label>Profit target %<input type="number" name="profit_target_pct" min="0" step="0.1" value="{{ profit_target_pct }}"></label>
+      <label>Stop loss %<input type="number" name="stop_loss_pct" min="0" step="0.1" value="{{ stop_loss_pct }}"></label>
+      <label>Round-trip cost %<input type="number" name="round_trip_cost_pct" min="0" step="0.01" value="{{ round_trip_cost_pct }}"></label>
+      <label>Pivot left bars<input type="number" name="left_bars" min="1" value="{{ left_bars }}"></label>
+      <label>Pivot right bars<input type="number" name="right_bars" min="1" value="{{ right_bars }}"></label>
+      <label>Volume oscillator threshold<input type="number" name="volume_osc_threshold" step="0.1" value="{{ volume_osc_threshold }}"></label>
+      <label>Minimum RVOL<input type="number" name="rvol_threshold" min="0" step="0.05" value="{{ rvol_threshold }}"></label>
+      <label>ATR breakout buffer<input type="number" name="atr_buffer" min="0" step="0.01" value="{{ atr_buffer }}"></label>
+      <div class="filter-actions"><button class="button" type="submit">Refresh NSE Data And Run</button></div>
+    </form>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">TraderSetup backtest completed.</p>
+    {% endif %}
+    {% if study_job %}
+      <div class="scan-progress" id="trader-backtest-progress" data-job-id="{{ study_job }}">
+        <div class="progress-header">
+          <strong id="trader-backtest-progress-title">TraderSetup backtest is queued</strong>
+          <span id="trader-backtest-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="trader-backtest-progress-fill" style="width: 0%"></div></div>
+        <p id="trader-backtest-progress-detail">Preparing the fresh ten-year NSE history...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("trader-backtest-progress");
+          if (!box) return;
+          const title = document.getElementById("trader-backtest-progress-title");
+          const percent = document.getElementById("trader-backtest-progress-percent");
+          const fill = document.getElementById("trader-backtest-progress-fill");
+          const detail = document.getElementById("trader-backtest-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`);
+              if (!response.ok) throw new Error("Status unavailable");
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "TraderSetup backtest is queued" : (status.phase || "TraderSetup backtest is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              detail.textContent = status.current_symbol ? `${status.phase}: ${status.current_symbol}` : (status.phase || "Running");
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/trader-setup-backtest";
+                return;
+              }
+              window.setTimeout(poll, 1500);
+            } catch (error) {
+              title.textContent = "Backtest status unavailable";
+              detail.textContent = "Refresh this page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 800);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid trader-backtest-stats">
+    <article class="stat-card"><span>NSE Symbols Tested</span><strong>{{ summary.get("symbols_processed", 0)|int }}</strong></article>
+    <article class="stat-card"><span>Full 9+ Year History</span><strong>{{ summary.get("symbols_with_9y_history", 0)|int }}</strong></article>
+    <article class="stat-card"><span>Fresh Data Coverage</span><strong>{% if summary.get("refresh_coverage_pct") is not none %}{{ "%.1f"|format(summary.get("refresh_coverage_pct")|float) }}%{% else %}-{% endif %}</strong></article>
+    <article class="stat-card"><span>Expected Market Date</span><strong>{{ summary.get("refresh_expected_date", summary.get("latest_history_date", "-")) }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <h2>How trades are scored</h2>
+    <p>A signal is confirmed at the daily close and entered at the next trading session's open. The target and stop are checked from entry onward; when both occur in one candle, the stop wins the tie. Only completed {{ summary.get("holding_days", holding_days) }}-session opportunities are counted, and returns include {{ summary.get("round_trip_cost_pct", round_trip_cost_pct) }}% round-trip costs.</p>
+    <p>The indicator's Minervini and quality scores are informational rankings, not entry alerts in the supplied Pine script, so they are not silently added as trade rules here.</p>
+    <p><strong>Important:</strong> this uses today's Kite-listed NSE universe. Delisted stocks are unavailable, creating survivorship bias. Results are an event study without portfolio capital or simultaneous-position limits, not a tradable equity curve.</p>
+    {% if summary %}<p>Study window: <strong>{{ summary.get("requested_start_date", "-") }}</strong> to <strong>{{ summary.get("requested_end_date", "-") }}</strong>. Generated {{ summary.get("generated_at_ist", "") }}.</p>{% endif %}
+    {% if summary.get("total_trades", 0)|int > 0 %}<p><a class="button secondary" href="/trader-setup-backtest/trades.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download All Trades CSV</a></p>{% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Win rate by signal</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Signal</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate %</th><th>Avg Return %</th><th>Median %</th><th>Payoff Ratio</th><th>Profit Factor</th><th>Avg MFE %</th><th>Avg MAE %</th></tr></thead>
+        <tbody>
+          {% for row in strategy_stats %}
+            <tr><td>{{ row.get("strategy", "") }}</td><td>{{ row.get("trades", 0)|int }}</td><td>{{ row.get("wins", 0)|int }}</td><td>{{ row.get("losses", 0)|int }}</td><td>{{ "%.2f"|format(row.get("win_rate_pct", 0)|float) }}</td><td>{{ "%.2f"|format(row.get("avg_return_pct", 0)|float) }}</td><td>{{ "%.2f"|format(row.get("median_return_pct", 0)|float) }}</td><td>{{ row.get("payoff_ratio", "")|number }}</td><td>{{ row.get("profit_factor", "")|number }}</td><td>{{ "%.2f"|format(row.get("avg_mfe_pct", 0)|float) }}</td><td>{{ "%.2f"|format(row.get("avg_mae_pct", 0)|float) }}</td></tr>
+          {% else %}<tr><td colspan="11">Run the backtest to calculate win rates.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Yearly consistency</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Year</th><th>Signal</th><th>Trades</th><th>Win Rate %</th><th>Avg Return %</th><th>Profit Factor</th></tr></thead>
+        <tbody>
+          {% for row in yearly_stats %}<tr><td>{{ row.get("year", "")|int }}</td><td>{{ row.get("strategy", "") }}</td><td>{{ row.get("trades", 0)|int }}</td><td>{{ "%.2f"|format(row.get("win_rate_pct", 0)|float) }}</td><td>{{ "%.2f"|format(row.get("avg_return_pct", 0)|float) }}</td><td>{{ row.get("profit_factor", "")|number }}</td></tr>
+          {% else %}<tr><td colspan="6">No yearly results yet.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Stock-level results</h2>
+    <p>Top 500 strategy and stock combinations, ordered by win rate and average return.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Symbol</th><th>Name</th><th>Signal</th><th>Trades</th><th>Win Rate %</th><th>Avg Return %</th><th>Profit Factor</th></tr></thead>
+        <tbody>
+          {% for row in stock_stats %}<tr><td>{{ row.get("symbol", "") }}</td><td>{{ row.get("name", "") }}</td><td>{{ row.get("strategy", "") }}</td><td>{{ row.get("trades", 0)|int }}</td><td>{{ "%.2f"|format(row.get("win_rate_pct", 0)|float) }}</td><td>{{ "%.2f"|format(row.get("avg_return_pct", 0)|float) }}</td><td>{{ row.get("profit_factor", "")|number }}</td></tr>
+          {% else %}<tr><td colspan="7">No stock-level results yet.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Recent trades</h2>
+    <p>Latest 500 completed trades. Download the CSV for the full result.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Signal Date</th><th>Symbol</th><th>Signal</th><th>Side</th><th>Entry</th><th>Exit</th><th>Exit Reason</th><th>Net Return %</th><th>Win</th></tr></thead>
+        <tbody>
+          {% for row in trades %}<tr><td>{{ row.get("signal_date", "") }}</td><td>{{ row.get("symbol", "") }}</td><td>{{ row.get("strategy", "") }}</td><td>{{ row.get("side", "") }}</td><td>{{ row.get("entry_date", "") }} @ {{ row.get("entry_price", "")|number }}</td><td>{{ row.get("exit_date", "") }} @ {{ row.get("exit_price", "")|number }}</td><td>{{ row.get("exit_reason", "") }}</td><td>{{ "%.2f"|format(row.get("net_return_pct", 0)|float) }}</td><td>{% if row.get("win_flag") %}Yes{% else %}No{% endif %}</td></tr>
+          {% else %}<tr><td colspan="9">No completed trades yet.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

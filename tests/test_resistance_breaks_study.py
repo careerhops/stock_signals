@@ -123,10 +123,9 @@ class ResistanceBreaksStudyTests(unittest.TestCase):
                 client = TestClient(app)
                 response = client.get("/resistance-breaks")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Resistance Break Scan", response.text)
-        self.assertIn("PASS", response.text)
-        self.assertIn("Run Resistance Break Scan", response.text)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("Resistance Breaks", response.text)
+        self.assertIn("temporarily removed from the workspace", response.text)
 
     def test_highest_resistance_zone_is_selected_and_only_post_zone_breaks_count(self) -> None:
         with TemporaryDirectory() as temp_dir:

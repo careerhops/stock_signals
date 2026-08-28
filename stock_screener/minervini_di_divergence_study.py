@@ -110,6 +110,8 @@ def run_minervini_di_divergence_study(
                 "name": name_map.get(symbol, symbol),
                 "latest_date": quality.get("latest_date", ""),
                 "latest_close": quality.get("latest_close"),
+                "latest_52w_high": quality.get("latest_52w_high"),
+                "distance_below_52w_high_pct": quality.get("distance_below_52w_high_pct"),
                 **divergence,
                 "stock_quality_score": quality.get("stock_quality_score"),
                 "stock_quality_grade": quality.get("stock_quality_grade", ""),
@@ -140,8 +142,10 @@ def run_minervini_di_divergence_study(
     stock_stats = pd.DataFrame(rows)
     if not stock_stats.empty:
         latest_date_series = pd.to_datetime(stock_stats["latest_date"], errors="coerce")
-        latest_market_date = latest_date_series.max()
-        stock_stats["is_latest_market_date"] = latest_date_series.eq(latest_market_date)
+        benchmark_latest_date = pd.Timestamp(benchmark.iloc[-1]["date"]).normalize()
+        stock_stats["is_latest_market_date"] = latest_date_series.dt.normalize().eq(
+            benchmark_latest_date
+        )
         stock_stats["combined_pass"] = (
             stock_stats["combined_pass"].fillna(False).astype(bool)
             & stock_stats["is_latest_market_date"]
@@ -152,6 +156,8 @@ def run_minervini_di_divergence_study(
         )
         numeric_columns = (
             "latest_close",
+            "latest_52w_high",
+            "distance_below_52w_high_pct",
             "latest_di_plus",
             "di_plus_1d_ago",
             "di_plus_2d_ago",
@@ -217,6 +223,7 @@ def run_minervini_di_divergence_study(
         "benchmark_symbol": benchmark_symbol,
         "benchmark_latest_date": benchmark.iloc[-1]["date"].strftime("%Y-%m-%d"),
         "latest_stock_date": latest_dates.max().strftime("%Y-%m-%d") if not latest_dates.empty else "",
+        "generated_at_ist": pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S IST"),
     }
     return MinerviniDiDivergenceStudyResult(summary=summary, stock_stats=stock_stats)
 

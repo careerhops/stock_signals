@@ -111,11 +111,9 @@ class MinerviniSheetSyncTests(unittest.TestCase):
                 client = TestClient(app)
                 response = client.get("/minervini-sheet")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("Update Sheet1 with Minervini pass or fail", response.text)
-        self.assertIn("Logged in as user@example.com", response.text)
-        self.assertIn("PASS", response.text)
-        self.assertIn("Run Minervini Sheet Update", response.text)
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("Minervini Sheet", response.text)
+        self.assertIn("temporarily removed from the workspace", response.text)
 
     @staticmethod
     def _strong_uptrend_frame() -> pd.DataFrame:
