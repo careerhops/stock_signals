@@ -89,6 +89,24 @@ class AdxDiStudyTests(unittest.TestCase):
         self.assertFalse(bool(adx_high_row["di_plus_cross_above_di_minus_recent"]))
         self.assertFalse(bool(wrong_slope_row["di_plus_cross_above_di_minus_recent"]))
 
+    def test_adx_di_study_clips_candles_to_as_of_date(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            daily = self._pass_frame()
+            cutoff = pd.Timestamp(daily.iloc[-4]["date"])
+            storage.save_candles("NSE", "PASS", daily, "1D")
+
+            result = run_adx_di_study(
+                storage,
+                symbols=["PASS"],
+                as_of_date=cutoff,
+                max_staleness_days=60,
+            )
+
+        self.assertEqual(result.summary["analysis_as_of_date"], cutoff.strftime("%Y-%m-%d"))
+        self.assertEqual(result.summary["latest_close_date"], cutoff.strftime("%Y-%m-%d"))
+        self.assertEqual(pd.Timestamp(result.stock_stats.iloc[0]["latest_close_date"]), cutoff)
+
     def test_adx_di_page_renders_saved_outputs(self) -> None:
         with TemporaryDirectory() as temp_dir:
             data_root = Path(temp_dir)
@@ -290,6 +308,7 @@ class AdxDiStudyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Daily DI+ signal scan", response.text)
+        self.assertIn('name="as_of_date"', response.text)
         self.assertIn("PASS", response.text)
         self.assertNotIn("PRE", response.text)
         self.assertNotIn("FAIL", response.text)

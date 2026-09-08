@@ -217,10 +217,17 @@ def run_adx_di_study(
     atr_channel_ma_type: str = "EMA",
     atr_lower1_proximity_pct: float = 2.0,
     max_staleness_days: int = 10,
+    as_of_date: Any | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AdxDiStudyResult:
     data_root = storage.data_root
     benchmark_daily, quality_benchmark_symbol = _load_quality_benchmark(storage)
+    cutoff = pd.to_datetime(as_of_date, errors="coerce") if as_of_date is not None else pd.NaT
+    if pd.notna(cutoff) and not benchmark_daily.empty:
+        benchmark_dates = pd.to_datetime(benchmark_daily.get("date"), errors="coerce")
+        benchmark_daily = benchmark_daily[
+            benchmark_dates.dt.normalize() <= pd.Timestamp(cutoff).normalize()
+        ].copy()
     if symbols is None:
         all_symbols = sorted(
             p.stem
@@ -251,6 +258,11 @@ def run_adx_di_study(
     latest_dates_seen: list[pd.Timestamp] = []
     for index, symbol in enumerate(all_symbols, start=1):
         daily = storage.load_candles(exchange, symbol, "1D")
+        if pd.notna(cutoff) and not daily.empty:
+            daily_dates = pd.to_datetime(daily.get("date"), errors="coerce")
+            daily = daily[
+                daily_dates.dt.normalize() <= pd.Timestamp(cutoff).normalize()
+            ].copy()
         _emit_progress(
             progress_callback,
             phase="Scanning ADX/DI crossover",
@@ -548,6 +560,11 @@ def run_adx_di_study(
         atr_lower1_proximity_pct=atr_lower1_proximity_pct,
         max_staleness_days=max_staleness_days,
         quality_benchmark_symbol=quality_benchmark_symbol,
+        analysis_as_of_date=(
+            pd.Timestamp(cutoff).strftime("%Y-%m-%d")
+            if pd.notna(cutoff)
+            else ""
+        ),
     )
     return AdxDiStudyResult(summary=summary, stock_stats=stock_stats)
 
@@ -1129,6 +1146,7 @@ def _build_summary(
     atr_lower1_proximity_pct: float,
     max_staleness_days: int,
     quality_benchmark_symbol: str,
+    analysis_as_of_date: str,
 ) -> dict[str, Any]:
     latest_date = ""
     if not stock_stats.empty and "latest_close_date" in stock_stats.columns:
@@ -1171,4 +1189,5 @@ def _build_summary(
         "atr_lower1_proximity_pct": float(atr_lower1_proximity_pct),
         "max_staleness_days": int(max_staleness_days),
         "quality_benchmark_symbol": str(quality_benchmark_symbol or ""),
+        "analysis_as_of_date": str(analysis_as_of_date or ""),
     }

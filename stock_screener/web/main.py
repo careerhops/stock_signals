@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, timedelta
 import json
@@ -8,14 +9,14 @@ from pathlib import Path
 import re
 from threading import Lock
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from kiteconnect import KiteConnect
@@ -24,7 +25,7 @@ from stock_screener.auth.kite_token import load_access_token, save_access_token,
 from stock_screener.backtest import run_buy_sell_backtest, run_buy_sell_backtest_for_symbols, save_backtest_outputs
 from stock_screener.backtest_report import write_backtest_workbook
 from stock_screener.config import get_data_root, load_config, require_env
-from stock_screener.data.kite import KiteDataProvider
+from stock_screener.data.kite import KiteDataProvider, serialized_daily_candle_refresh
 from stock_screener.data.nse_market_cap import (
     DEFAULT_NSE_MARKET_CAP_URL,
     fetch_market_caps_from_nse_excel,
@@ -38,6 +39,20 @@ from stock_screener.adx_di_study import (
 )
 from stock_screener.data.storage import Storage
 from stock_screener.data.supabase_store import SupabaseStore
+from stock_screener.drawdown_recovery_study import (
+    DEFAULT_DMA_WINDOW as DRAWDOWN_RECOVERY_DEFAULT_DMA_WINDOW,
+    DEFAULT_HISTORY_MONTHS as DRAWDOWN_RECOVERY_DEFAULT_HISTORY_MONTHS,
+    DEFAULT_MAX_CURRENT_AGE_SESSIONS as DRAWDOWN_RECOVERY_DEFAULT_MAX_CURRENT_AGE,
+    DEFAULT_MIN_DMA_IMPROVEMENT_PCT_POINTS as DRAWDOWN_RECOVERY_DEFAULT_DMA_IMPROVEMENT,
+    DEFAULT_MIN_DRAWDOWN_FLOOR_PCT as DRAWDOWN_RECOVERY_DEFAULT_MIN_DRAWDOWN,
+    DEFAULT_MIN_VOLUME_MULTIPLE as DRAWDOWN_RECOVERY_DEFAULT_VOLUME_MULTIPLE,
+    DEFAULT_PRIOR_HIGH_LOOKBACK_SESSIONS as DRAWDOWN_RECOVERY_DEFAULT_PRIOR_HIGH_LOOKBACK,
+    DEFAULT_TARGET_RECOVERY_PCT as DRAWDOWN_RECOVERY_DEFAULT_TARGET_RECOVERY,
+    DEFAULT_TROUGH_ORDER as DRAWDOWN_RECOVERY_DEFAULT_TROUGH_ORDER,
+    load_drawdown_recovery_outputs,
+    run_drawdown_recovery_study,
+    save_drawdown_recovery_outputs,
+)
 from stock_screener.gtt_gain_report import write_gtt_gain_workbook
 from stock_screener.gtt_gain_study import (
     _latest_signal_context,
@@ -62,6 +77,7 @@ from stock_screener.google_sheets import (
     save_google_sheet_target,
 )
 from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
+from stock_screener.symbols import is_excluded_weekly_screener_instrument
 from stock_screener.knox_envelope_study import (
     CMF_CONDITIONS as KNOX_ENV_CMF_CONDITIONS,
     CONFIRMATION_MODES as KNOX_ENV_CONFIRMATION_MODES,
@@ -116,6 +132,15 @@ from stock_screener.swing_trade_study import (
     save_swing_trade_outputs,
 )
 from stock_screener.signal_qa import build_signal_quality_report, strategy_rows_for_display
+from stock_screener.stock_signature_study import (
+    DEFAULT_DMA_TOUCH_TOLERANCE_PCT as STOCK_SIGNATURE_DEFAULT_DMA_TOUCH_TOLERANCE,
+    DEFAULT_LOOKBACK_MONTHS as STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS,
+    DEFAULT_PIVOT_ORDER as STOCK_SIGNATURE_DEFAULT_PIVOT_ORDER,
+    load_stock_signature_scan_outputs,
+    run_stock_signature_scan,
+    run_stock_signature_study,
+    save_stock_signature_scan_outputs,
+)
 from stock_screener.strategy.technical_ratings import latest_technical_rating
 from stock_screener.strategy.weekly_shortlist import (
     DEFAULT_BENCHMARK_SYMBOL as SHORTLIST_DEFAULT_BENCHMARK_SYMBOL,
@@ -179,10 +204,23 @@ from stock_screener.minervini_quality_study import (
 from stock_screener.minervini_di_divergence_study import (
     DEFAULT_ADX_LENGTH as MINERVINI_DI_DEFAULT_ADX_LENGTH,
     DEFAULT_DIVERGENCE_DAYS as MINERVINI_DI_DEFAULT_DIVERGENCE_DAYS,
+    DEFAULT_FVG_LOOKBACK as MINERVINI_DI_DEFAULT_FVG_LOOKBACK,
     DEFAULT_MIN_SCORE as MINERVINI_DI_DEFAULT_MIN_SCORE,
+    DEFAULT_STRUCTURE_SENSITIVITY as MINERVINI_DI_DEFAULT_STRUCTURE_SENSITIVITY,
     load_minervini_di_divergence_outputs,
     run_minervini_di_divergence_study,
     save_minervini_di_divergence_outputs,
+)
+from stock_screener.dma_pullback_study import (
+    DEFAULT_ADX_LENGTH as DMA_PULLBACK_DEFAULT_ADX_LENGTH,
+    DEFAULT_DIVERGENCE_DAYS as DMA_PULLBACK_DEFAULT_DIVERGENCE_DAYS,
+    DEFAULT_MAX_DISTANCE_ABOVE_DMA_PCT as DMA_PULLBACK_DEFAULT_MAX_DISTANCE,
+    DEFAULT_MIN_QUALITY_SCORE as DMA_PULLBACK_DEFAULT_MIN_QUALITY_SCORE,
+    DEFAULT_PROXIMITY_PCT as DMA_PULLBACK_DEFAULT_PROXIMITY,
+    DEFAULT_TOUCH_LOOKBACK_BARS as DMA_PULLBACK_DEFAULT_LOOKBACK,
+    load_dma_pullback_outputs,
+    run_dma_pullback_study,
+    save_dma_pullback_outputs,
 )
 from stock_screener.universe import build_universe
 from stock_screener.weekday_pressure_study import (
@@ -216,6 +254,7 @@ from stock_screener.web.charts import (
     build_gtt_opportunity_chart,
     build_rotation_group_chart,
     build_signal_chart,
+    build_stock_signature_chart_pack,
     latest_signal_summary,
 )
 
@@ -225,6 +264,24 @@ app = FastAPI(title="NSE/BSE Investment Signal Screener")
 BASE_DIR = Path(__file__).resolve().parents[2]
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+NIFTY100_CONSTITUENTS_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv"
+NIFTY500_CONSTITUENTS_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+STOCK_SIGNATURE_UNIVERSE_DEFINITIONS = {
+    "nifty100": {
+        "label": "Nifty 100",
+        "summary": "NIFTY100",
+        "url": NIFTY100_CONSTITUENTS_URL,
+        "filename": "nifty100_constituents.csv",
+    },
+    "nifty500": {
+        "label": "Nifty 500",
+        "summary": "NIFTY500",
+        "url": NIFTY500_CONSTITUENTS_URL,
+        "filename": "nifty500_constituents.csv",
+    },
+}
+STOCK_SIGNATURE_DEFAULT_UNIVERSES = ("nifty100",)
 
 
 def _template_number(value: Any, digits: int = 2) -> str:
@@ -281,6 +338,23 @@ SCAN_JOBS: dict[str, dict[str, Any]] = {}
 SCAN_JOBS_LOCK = Lock()
 SCAN_JOBS_DIR = BASE_DIR / "data" / "scan_jobs"
 SCAN_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+SCREENER_WORKER_COUNT = max(
+    1,
+    min(
+        int(os.getenv("SCREENER_MAX_PARALLEL_JOBS", "2")),
+        max((os.cpu_count() or 2) - 1, 1),
+    ),
+)
+SCREENER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=SCREENER_WORKER_COUNT,
+    thread_name_prefix="screener",
+)
+SCREENER_FUTURES: dict[str, Future[Any]] = {}
+SCREENER_FUTURES_LOCK = Lock()
+SCREENER_KIND_LOCKS: dict[str, Lock] = {}
+SCREENER_KIND_LOCKS_LOCK = Lock()
+LATEST_WEEKLY_JOB_ID = ""
+LATEST_WEEKLY_JOB_LOCK = Lock()
 BIG_BULL_DEALS_CACHE: dict[str, Any] = {
     "fetched_at": 0.0,
     "rows": pd.DataFrame(),
@@ -335,18 +409,107 @@ def _json_safe(value: Any) -> Any:
 
 
 def _set_scan_job(job_id: str, **updates: Any) -> None:
+    now = time.time()
     with SCAN_JOBS_LOCK:
         current = SCAN_JOBS.setdefault(job_id, {})
+
+        status = str(updates.get("status") or "").strip().lower()
+        if status == "queued" and not current.get("queued_at"):
+            updates.setdefault("queued_at", now)
+        if status in {"starting", "running"} and not current.get("started_at"):
+            updates.setdefault("started_at", now)
+        if status in {"queued", "starting", "running"}:
+            updates.setdefault("owner_pid", os.getpid())
+        if status in {"completed", "failed"} and not current.get("finished_at"):
+            queued_at = _timestamp_or_default(current.get("queued_at"), now)
+            started_at = _timestamp_or_default(current.get("started_at"), queued_at)
+            updates.setdefault("finished_at", now)
+            updates.setdefault("elapsed_seconds", max(0.0, now - queued_at))
+            updates.setdefault("queue_seconds", max(0.0, started_at - queued_at))
+            updates.setdefault("execution_seconds", max(0.0, now - started_at))
+
+            redirect_url = str(updates.get("redirect_url") or current.get("redirect_url") or "")
+            if redirect_url and "run_seconds=" not in redirect_url:
+                updates["redirect_url"] = _append_query_param(
+                    redirect_url,
+                    f"run_seconds={float(updates['elapsed_seconds']):.3f}",
+                )
+
         current.update(updates)
         safe_payload = _json_safe(current)
-    _scan_job_path(job_id).write_text(json.dumps(safe_payload), encoding="utf-8")
+    path = _scan_job_path(job_id)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(safe_payload), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _timestamp_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fail_orphaned_scan_jobs() -> None:
+    for path in SCAN_JOBS_DIR.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(payload.get("status") or "").lower() not in {"queued", "starting", "running"}:
+            continue
+        if _process_is_running(payload.get("owner_pid")):
+            continue
+        job_id = path.stem
+        with SCAN_JOBS_LOCK:
+            SCAN_JOBS[job_id] = dict(payload)
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Interrupted by app restart",
+            error="This run stopped when the application restarted. Start the screener again.",
+        )
+
+
+def _process_is_running(value: Any) -> bool:
+    try:
+        process_id = int(value)
+    except (TypeError, ValueError):
+        return False
+    if process_id <= 0:
+        return False
+    try:
+        os.kill(process_id, 0)
+    except (OSError, PermissionError):
+        return False
+    return True
+
+
+_fail_orphaned_scan_jobs()
+
+
+def _fail_scan_job_if_orphaned(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("status") or "").lower() not in {"queued", "starting", "running"}:
+        return payload
+    if _process_is_running(payload.get("owner_pid")):
+        return payload
+
+    _set_scan_job(
+        job_id,
+        status="failed",
+        phase="Interrupted by app restart",
+        error="This run stopped when the application restarted. Start the screener again.",
+    )
+    with SCAN_JOBS_LOCK:
+        return dict(SCAN_JOBS.get(job_id, payload))
 
 
 def _get_scan_job(job_id: str) -> dict[str, Any]:
     with SCAN_JOBS_LOCK:
         current = SCAN_JOBS.get(job_id, {})
-        if current:
-            return dict(current)
+        current_payload = dict(current)
+    if current_payload:
+        return _fail_scan_job_if_orphaned(job_id, current_payload)
     path = _scan_job_path(job_id)
     if not path.exists():
         return {}
@@ -356,7 +519,133 @@ def _get_scan_job(job_id: str) -> dict[str, Any]:
         return {}
     with SCAN_JOBS_LOCK:
         SCAN_JOBS[job_id] = dict(payload)
-    return dict(payload)
+    return _fail_scan_job_if_orphaned(job_id, dict(payload))
+
+
+def _screener_kind_lock(job_kind: str) -> Lock:
+    with SCREENER_KIND_LOCKS_LOCK:
+        return SCREENER_KIND_LOCKS.setdefault(job_kind, Lock())
+
+
+def _run_submitted_scan_job(
+    job_id: str,
+    job_kind: str,
+    runner: Callable[..., None],
+    args: tuple[Any, ...],
+) -> None:
+    kind_lock = _screener_kind_lock(job_kind)
+    if not kind_lock.acquire(blocking=False):
+        _set_scan_job(
+            job_id,
+            status="queued",
+            phase=f"Waiting for another {job_kind} run",
+            worker_count=SCREENER_WORKER_COUNT,
+        )
+        kind_lock.acquire()
+    try:
+        _set_scan_job(
+            job_id,
+            status="starting",
+            phase="Worker assigned",
+            worker_count=SCREENER_WORKER_COUNT,
+        )
+        runner(job_id, *args)
+    except Exception as exc:
+        _set_scan_job(job_id, status="failed", phase="Failed", error=str(exc))
+    finally:
+        kind_lock.release()
+
+
+def _submit_scan_job(
+    job_id: str,
+    job_kind: str,
+    runner: Callable[..., None],
+    *args: Any,
+    depends_on: str = "",
+) -> Future[Any] | None:
+    """Queue a long-running scan without tying it to the HTTP response lifecycle."""
+
+    _set_scan_job(
+        job_id,
+        status="queued",
+        phase=("Waiting for Weekly BUY / SELL" if depends_on else "Queued"),
+        completed=0,
+        total=0,
+        percent=0,
+        job_kind=job_kind,
+        depends_on=depends_on,
+        worker_count=SCREENER_WORKER_COUNT,
+        queued_at=time.time(),
+    )
+
+    def enqueue() -> Future[Any]:
+        future = SCREENER_EXECUTOR.submit(
+            _run_submitted_scan_job,
+            job_id,
+            job_kind,
+            runner,
+            tuple(args),
+        )
+        with SCREENER_FUTURES_LOCK:
+            SCREENER_FUTURES[job_id] = future
+        future.add_done_callback(
+            lambda completed_future: _forget_scan_future(job_id, completed_future)
+        )
+        return future
+
+    if not depends_on:
+        return enqueue()
+
+    with SCREENER_FUTURES_LOCK:
+        dependency_future = SCREENER_FUTURES.get(depends_on)
+    dependency_state = _get_scan_job(depends_on)
+    if dependency_state.get("status") == "completed":
+        return enqueue()
+    if dependency_state.get("status") == "failed":
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Weekly BUY / SELL failed",
+            error="GTT was not started because the Weekly BUY / SELL dependency failed.",
+        )
+        return None
+    if dependency_future is None:
+        return enqueue()
+
+    def enqueue_after_weekly(_future: Future[Any]) -> None:
+        state = _get_scan_job(depends_on)
+        if state.get("status") == "completed":
+            enqueue()
+            return
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Weekly BUY / SELL failed",
+            error="GTT was not started because the Weekly BUY / SELL dependency did not complete.",
+        )
+
+    dependency_future.add_done_callback(enqueue_after_weekly)
+    return None
+
+
+def _forget_scan_future(job_id: str, completed_future: Future[Any]) -> None:
+    with SCREENER_FUTURES_LOCK:
+        if SCREENER_FUTURES.get(job_id) is completed_future:
+            SCREENER_FUTURES.pop(job_id, None)
+
+
+def _register_weekly_job(job_id: str) -> None:
+    global LATEST_WEEKLY_JOB_ID
+    with LATEST_WEEKLY_JOB_LOCK:
+        LATEST_WEEKLY_JOB_ID = job_id
+
+
+def _active_weekly_job_id() -> str:
+    with LATEST_WEEKLY_JOB_LOCK:
+        job_id = LATEST_WEEKLY_JOB_ID
+    if not job_id:
+        return ""
+    return job_id if _get_scan_job(job_id).get("status") in {"queued", "starting", "running"} else ""
 
 
 def _has_meaningful_text(series: pd.Series) -> pd.Series:
@@ -417,6 +706,298 @@ def _combined_symbol_metadata(config: dict, storage: Storage) -> pd.DataFrame:
             errors="coerce",
         )
     return metadata.drop_duplicates(subset=["symbol"], keep="last")
+
+
+def _stock_signature_index_path(data_root: Path, universe_key: str) -> Path:
+    definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.get(str(universe_key).strip().lower())
+    filename = definition["filename"] if definition else f"{str(universe_key).strip().lower()}_constituents.csv"
+    return data_root / "indices" / filename
+
+
+def _nifty100_constituents_path(data_root: Path) -> Path:
+    return _stock_signature_index_path(data_root, "nifty100")
+
+
+def _load_stock_signature_index_constituents(
+    data_root: Path,
+    universe_key: str,
+    *,
+    allow_remote_fetch: bool = False,
+) -> pd.DataFrame:
+    key = str(universe_key or "").strip().lower()
+    definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.get(key)
+    if not definition:
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "Series", "ISIN Code", "source_universe"])
+
+    path = _stock_signature_index_path(data_root, key)
+    if path.exists():
+        try:
+            frame = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            frame = pd.DataFrame()
+    else:
+        frame = pd.DataFrame()
+
+    if frame.empty and allow_remote_fetch:
+        frame = pd.read_csv(str(definition["url"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(path, index=False)
+
+    if frame.empty or "Symbol" not in frame.columns:
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "Series", "ISIN Code", "source_universe"])
+
+    frame = frame.copy()
+    frame["Symbol"] = frame["Symbol"].astype(str).str.upper().str.strip()
+    if "Company Name" not in frame.columns:
+        frame["Company Name"] = frame["Symbol"]
+    if "Industry" not in frame.columns:
+        frame["Industry"] = ""
+    frame["source_universe"] = str(definition["label"])
+    return (
+        frame[frame["Symbol"].ne("")]
+        .drop_duplicates(subset=["Symbol"], keep="last")
+        .sort_values("Symbol")
+        .reset_index(drop=True)
+    )
+
+
+def _load_nifty100_constituents(data_root: Path, *, allow_remote_fetch: bool = False) -> pd.DataFrame:
+    return _load_stock_signature_index_constituents(
+        data_root,
+        "nifty100",
+        allow_remote_fetch=allow_remote_fetch,
+    )
+
+
+def _stock_signature_selected_universes(values: Iterable[Any], *, custom_symbols: str = "") -> list[str]:
+    selected: list[str] = []
+    for value in values:
+        key = str(value or "").strip().lower()
+        if key in STOCK_SIGNATURE_UNIVERSE_DEFINITIONS and key not in selected:
+            selected.append(key)
+    if not selected and not str(custom_symbols or "").strip():
+        selected = list(STOCK_SIGNATURE_DEFAULT_UNIVERSES)
+    return selected
+
+
+def _stock_signature_universe_options(selected_universes: Iterable[str]) -> list[dict[str, Any]]:
+    selected = {str(value).strip().lower() for value in selected_universes}
+    return [
+        {
+            "value": key,
+            "label": str(definition["label"]),
+            "selected": key in selected,
+        }
+        for key, definition in STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.items()
+    ]
+
+
+def _parse_stock_signature_custom_symbols(raw_symbols: Any, maximum: int | None = None) -> list[str]:
+    tokens = re.split(r"[\s,;]+", str(raw_symbols or "").strip())
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        symbol = token.strip().strip("'\"").upper()
+        if symbol.startswith(("NSE:", "BSE:")):
+            symbol = symbol[4:]
+        if symbol.endswith((".NS", ".BO")):
+            symbol = symbol[:-3]
+        if not symbol or symbol in seen:
+            continue
+        if ".." in symbol or not re.fullmatch(r"[A-Z0-9&._-]+", symbol):
+            raise ValueError(f"Invalid stock symbol: {symbol}")
+        seen.add(symbol)
+        symbols.append(symbol)
+        if maximum is not None and len(symbols) > int(maximum):
+            raise ValueError(f"Enter no more than {int(maximum)} symbols per Stock Signature scan.")
+    return symbols
+
+
+def _stock_signature_custom_symbols_frame(raw_symbols: str) -> pd.DataFrame:
+    symbols = _parse_stock_signature_custom_symbols(raw_symbols)
+    if not symbols:
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
+    return pd.DataFrame(
+        [
+            {
+                "Company Name": symbol,
+                "Industry": "Custom",
+                "Symbol": symbol,
+                "source_universe": "Custom list",
+            }
+            for symbol in symbols
+        ]
+    )
+
+
+def _first_nonempty(values: pd.Series) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text and text.lower() not in {"nan", "none"}:
+            return text
+    return ""
+
+
+def _combine_stock_signature_universe(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    frames = [frame for frame in frames if not frame.empty]
+    if not frames:
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
+    combined = pd.concat(frames, ignore_index=True)
+    combined["Symbol"] = combined["Symbol"].astype(str).str.upper().str.strip()
+    combined = combined[combined["Symbol"].ne("")].copy()
+    if combined.empty:
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
+    for column in ("Company Name", "Industry", "source_universe"):
+        if column not in combined.columns:
+            combined[column] = ""
+    grouped = (
+        combined.groupby("Symbol", as_index=False)
+        .agg(
+            {
+                "Company Name": _first_nonempty,
+                "Industry": _first_nonempty,
+                "source_universe": lambda values: ", ".join(
+                    dict.fromkeys(
+                        str(value).strip()
+                        for value in values
+                        if str(value or "").strip()
+                    )
+                ),
+            }
+        )
+        .sort_values("Symbol")
+        .reset_index(drop=True)
+    )
+    return grouped[["Company Name", "Industry", "Symbol", "source_universe"]]
+
+
+def _stock_signature_universe_label(selected_universes: Iterable[str], custom_symbols: str) -> str:
+    labels = [
+        str(STOCK_SIGNATURE_UNIVERSE_DEFINITIONS[key]["label"])
+        for key in selected_universes
+        if key in STOCK_SIGNATURE_UNIVERSE_DEFINITIONS
+    ]
+    if str(custom_symbols or "").strip():
+        labels.append("Custom list")
+    return " + ".join(labels) if labels else "Custom list"
+
+
+def _stock_signature_universe_summary(selected_universes: Iterable[str], custom_symbols: str) -> str:
+    parts = [
+        str(STOCK_SIGNATURE_UNIVERSE_DEFINITIONS[key]["summary"])
+        for key in selected_universes
+        if key in STOCK_SIGNATURE_UNIVERSE_DEFINITIONS
+    ]
+    if str(custom_symbols or "").strip():
+        parts.append("CUSTOM")
+    return "+".join(parts) if parts else "CUSTOM"
+
+
+def _stock_signature_saved_scope_matches(summary: dict[str, Any], universe_meta: dict[str, Any]) -> bool:
+    if not summary:
+        return False
+    saved_summary = str(summary.get("universe", "") or "").strip().upper()
+    selected_summary = str(universe_meta.get("universe_summary", "") or "").strip().upper()
+    if saved_summary and selected_summary and saved_summary != selected_summary:
+        return False
+
+    selected_custom = str(universe_meta.get("custom_symbols", "") or "").strip().upper()
+    saved_custom = str(summary.get("custom_symbols", "") or "").strip().upper()
+    if selected_custom != saved_custom:
+        return False
+
+    saved_universes = summary.get("selected_universes", [])
+    if isinstance(saved_universes, list):
+        saved_values = saved_universes
+    else:
+        saved_values = re.split(r"[\s,;]+", str(saved_universes or ""))
+    saved_keys = _stock_signature_selected_universes(
+        saved_values,
+        custom_symbols=saved_custom,
+    )
+    selected_keys = list(universe_meta.get("selected_universes", []))
+    return saved_keys == selected_keys
+
+
+def _drawdown_recovery_saved_scope_matches(
+    summary: dict[str, Any],
+    universe_meta: dict[str, Any],
+    params: dict[str, Any],
+) -> bool:
+    if not _stock_signature_saved_scope_matches(summary, universe_meta):
+        return False
+    comparisons = {
+        "history_months": int,
+        "prior_high_lookback_sessions": int,
+        "min_drawdown_floor_pct": float,
+        "target_recovery_pct": float,
+        "dma_window": int,
+        "min_volume_multiple": float,
+        "min_dma_improvement_pct_points": float,
+        "max_current_age_sessions": int,
+        "trough_order": int,
+    }
+    for key, caster in comparisons.items():
+        saved = summary.get(key)
+        current = params.get(key)
+        try:
+            if caster(saved) != caster(current):
+                return False
+        except (TypeError, ValueError):
+            return False
+    saved_as_of = str(summary.get("requested_as_of_date", "") or "").strip()
+    current_as_of = str(params.get("requested_as_of_date", "") or "").strip()
+    if saved_as_of and current_as_of and saved_as_of != current_as_of:
+        return False
+    return True
+
+
+def _build_stock_signature_universe(
+    data_root: Path,
+    selected_universes: Iterable[str],
+    custom_symbols: str,
+    *,
+    allow_remote_fetch: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    keys = _stock_signature_selected_universes(selected_universes, custom_symbols=custom_symbols)
+    frames: list[pd.DataFrame] = []
+    missing: list[str] = []
+    source_urls: list[str] = []
+    source_files: list[str] = []
+    for key in keys:
+        frame = _load_stock_signature_index_constituents(
+            data_root,
+            key,
+            allow_remote_fetch=allow_remote_fetch,
+        )
+        definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS[key]
+        source_urls.append(str(definition["url"]))
+        source_files.append(str(_stock_signature_index_path(data_root, key)))
+        if frame.empty:
+            missing.append(str(definition["label"]))
+        else:
+            frames.append(frame)
+    custom_frame = _stock_signature_custom_symbols_frame(custom_symbols)
+    if not custom_frame.empty:
+        frames.append(custom_frame)
+    universe = _combine_stock_signature_universe(frames)
+    return universe, {
+        "selected_universes": keys,
+        "custom_symbols": ",".join(_parse_stock_signature_custom_symbols(custom_symbols)),
+        "universe_label": _stock_signature_universe_label(keys, custom_symbols),
+        "universe_summary": _stock_signature_universe_summary(keys, custom_symbols),
+        "missing_universes": missing,
+        "source_urls": source_urls,
+        "source_files": source_files,
+    }
+
+
+def _stock_signature_dir(data_root: Path) -> Path:
+    return data_root / "stock_signature"
+
+
+def _drawdown_recovery_dir(data_root: Path) -> Path:
+    return data_root / "drawdown_recovery"
 
 
 def _enrich_with_symbol_metadata(frame: pd.DataFrame, metadata: pd.DataFrame, symbol_column: str) -> pd.DataFrame:
@@ -812,13 +1393,153 @@ def _parse_nse_symbol_list(raw_symbols: Any, maximum: int = 500) -> list[str]:
         symbol = token.strip().strip("'\"").upper()
         if symbol.startswith("NSE:"):
             symbol = symbol[4:]
-        if not symbol or symbol in seen:
+        if (
+            not symbol
+            or symbol in seen
+            or is_excluded_weekly_screener_instrument(symbol)
+        ):
             continue
         seen.add(symbol)
         symbols.append(symbol)
         if len(symbols) > int(maximum):
             raise ValueError(f"Enter no more than {int(maximum)} symbols per targeted scan.")
     return symbols
+
+
+OHLCV_EXPORT_COLUMNS = ["exchange", "symbol", "date", "open", "high", "low", "close", "volume"]
+OHLCV_EXCHANGE_SCOPES = {"combined", "nse", "bse"}
+
+
+def _parse_ohlcv_symbols(raw_symbols: Any, maximum: int | None = None) -> list[str]:
+    """Parse optional stock symbols without applying screener-specific exclusions."""
+    tokens = re.split(r"[\s,;]+", str(raw_symbols or "").strip())
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        symbol = token.strip().strip("'\"").upper()
+        if symbol.startswith(("NSE:", "BSE:")):
+            symbol = symbol[4:]
+        if not symbol or symbol in seen:
+            continue
+        if ".." in symbol or not re.fullmatch(r"[A-Z0-9&._-]+", symbol):
+            raise ValueError(f"Invalid stock symbol: {symbol}")
+        seen.add(symbol)
+        symbols.append(symbol)
+        if maximum is not None and len(symbols) > int(maximum):
+            raise ValueError(f"Enter no more than {int(maximum)} symbols per download.")
+    return symbols
+
+
+def _parse_ohlcv_date(value: Any, label: str) -> pd.Timestamp | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"Enter a valid {label} date.")
+    return pd.Timestamp(parsed).normalize()
+
+
+def _ohlcv_export_universe(
+    storage: Storage,
+    exchange_scope: str,
+    requested_symbols: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    scope = str(exchange_scope or "combined").strip().lower()
+    if scope not in OHLCV_EXCHANGE_SCOPES:
+        raise ValueError("Choose NSE, BSE, or NSE + BSE-only.")
+
+    nse_symbols = {
+        path.stem.upper()
+        for path in (storage.candles_dir / "NSE" / "1D").glob("*.csv")
+    }
+    bse_symbols = {
+        path.stem.upper()
+        for path in (storage.candles_dir / "BSE" / "1D").glob("*.csv")
+    }
+    instruments = storage.load_instruments()
+    nse_listed_symbols = set(nse_symbols)
+    if not instruments.empty and {"exchange", "tradingsymbol"}.issubset(instruments.columns):
+        nse_rows = instruments[instruments["exchange"].astype(str).str.upper().eq("NSE")]
+        if "instrument_type" in nse_rows.columns:
+            nse_rows = nse_rows[nse_rows["instrument_type"].astype(str).str.upper().eq("EQ")]
+        nse_listed_symbols = set(
+            nse_rows["tradingsymbol"].dropna().astype(str).str.strip().str.upper()
+        )
+    requested = set(requested_symbols or [])
+    if requested:
+        nse_symbols &= requested
+        bse_symbols &= requested
+
+    if scope == "nse":
+        return [("NSE", symbol) for symbol in sorted(nse_symbols)]
+    if scope == "bse":
+        return [("BSE", symbol) for symbol in sorted(bse_symbols)]
+
+    bse_only = bse_symbols - nse_listed_symbols
+    return [
+        *[("NSE", symbol) for symbol in sorted(nse_symbols)],
+        *[("BSE", symbol) for symbol in sorted(bse_only)],
+    ]
+
+
+def _filter_ohlcv_frame(
+    daily: pd.DataFrame,
+    exchange: str,
+    symbol: str,
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+) -> pd.DataFrame:
+    if daily.empty:
+        return pd.DataFrame(columns=OHLCV_EXPORT_COLUMNS)
+    frame = daily.copy()
+    frame["date"] = pd.to_datetime(frame.get("date"), errors="coerce")
+    frame = frame.dropna(subset=["date"])
+    if start_date is not None:
+        frame = frame[frame["date"].dt.normalize() >= start_date]
+    if end_date is not None:
+        frame = frame[frame["date"].dt.normalize() <= end_date]
+    if frame.empty:
+        return pd.DataFrame(columns=OHLCV_EXPORT_COLUMNS)
+    for column in ("open", "high", "low", "close", "volume"):
+        frame[column] = pd.to_numeric(frame.get(column), errors="coerce")
+    frame.insert(0, "symbol", symbol)
+    frame.insert(0, "exchange", exchange)
+    return frame[OHLCV_EXPORT_COLUMNS].sort_values("date").reset_index(drop=True)
+
+
+def _load_ohlcv_preview(
+    storage: Storage,
+    universe: list[tuple[str, str]],
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+    limit: int = 500,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    remaining = max(int(limit), 1)
+    for exchange, symbol in universe:
+        frame = _filter_ohlcv_frame(
+            storage.load_candles(exchange, symbol, "1D"),
+            exchange,
+            symbol,
+            start_date,
+            end_date,
+        )
+        if frame.empty:
+            continue
+        latest = frame.sort_values("date", ascending=False).head(remaining)
+        frames.append(latest)
+        remaining -= len(latest)
+        if remaining <= 0:
+            break
+    if not frames:
+        return pd.DataFrame(columns=OHLCV_EXPORT_COLUMNS)
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["date", "exchange", "symbol"], ascending=[False, True, True])
+        .head(limit)
+        .reset_index(drop=True)
+    )
 
 
 def _apply_signal_quality_filters(
@@ -1119,8 +1840,28 @@ def _symbols_from_frame(frame: pd.DataFrame) -> set[str]:
     return set(frame[symbol_column].dropna().astype(str).str.upper())
 
 
+def _filter_weekly_screener_stock_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    symbol_column = _symbol_column(frame)
+    if not symbol_column:
+        return frame
+    names = frame.get("name", pd.Series("", index=frame.index))
+    excluded = pd.Series(
+        [
+            is_excluded_weekly_screener_instrument(symbol, name)
+            for symbol, name in zip(frame[symbol_column], names)
+        ],
+        index=frame.index,
+        dtype=bool,
+    )
+    return frame[~excluded].copy()
+
+
 def _dashboard_buy_symbols(data_root: Path) -> set[str]:
-    filtered = Storage(data_root).load_signals("latest_filtered.csv")
+    filtered = _filter_weekly_screener_stock_rows(
+        Storage(data_root).load_signals("latest_filtered.csv")
+    )
     if filtered.empty:
         return set()
     if "signal" in filtered.columns:
@@ -1138,7 +1879,9 @@ def _daily_buy_symbols(data_root: Path) -> set[str]:
 
 
 def _latest_weekly_buy_sell_frame(data_root: Path) -> pd.DataFrame:
-    raw = Storage(data_root).load_signals("latest_raw_signals.csv")
+    raw = _filter_weekly_screener_stock_rows(
+        Storage(data_root).load_signals("latest_raw_signals.csv")
+    )
     if raw.empty or "date" not in raw.columns:
         return pd.DataFrame()
     frame = raw.copy()
@@ -1790,6 +2533,7 @@ def _dashboard_link_suffix(request: Request) -> str:
         "token",
         "stock_search",
         "sensitivity",
+        "as_of_date",
         "market_cap_bucket",
         "min_market_cap_cr",
         "max_market_cap_cr",
@@ -1817,6 +2561,7 @@ def _dashboard_filter_query(
     token: str = "",
     stock_search: str = "",
     sensitivity: str = "",
+    as_of_date: str = "",
     market_cap_bucket: str = "",
     min_market_cap_cr: str = "",
     max_market_cap_cr: str = "",
@@ -1841,6 +2586,8 @@ def _dashboard_filter_query(
         params.append(f"stock_search={quote(stock_search)}")
     if sensitivity:
         params.append(f"sensitivity={quote(sensitivity)}")
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
     if market_cap_bucket:
         params.append(f"market_cap_bucket={quote(market_cap_bucket)}")
     if min_market_cap_cr:
@@ -1885,6 +2632,7 @@ def _common_filter_context(
     token = request.query_params.get("token", "").strip()
     stock_search = request.query_params.get("stock_search", "").strip()
     sensitivity_text = str(selected_sensitivity or request.query_params.get("sensitivity", "").strip() or "")
+    as_of_date = request.query_params.get("as_of_date", "").strip()
     market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
     min_market_cap_cr = request.query_params.get("min_market_cap_cr", "").strip()
     max_market_cap_cr = request.query_params.get("max_market_cap_cr", "").strip()
@@ -1897,6 +2645,7 @@ def _common_filter_context(
         token=token,
         stock_search=stock_search,
         sensitivity=sensitivity_text,
+        as_of_date=as_of_date,
         market_cap_bucket=market_cap_bucket,
         min_market_cap_cr=min_market_cap_cr,
         max_market_cap_cr=max_market_cap_cr,
@@ -1940,6 +2689,7 @@ def _common_filter_context(
         "shared_token": token,
         "shared_stock_search": stock_search,
         "shared_sensitivity": sensitivity_text,
+        "shared_as_of_date": as_of_date,
         "shared_market_cap_bucket": market_cap_bucket,
         "shared_min_market_cap_cr": min_market_cap_cr,
         "shared_max_market_cap_cr": max_market_cap_cr,
@@ -2146,7 +2896,9 @@ def _load_visible_buy_signals(
     min_risk_reward_ratio: float | None = None,
 ) -> pd.DataFrame:
     metadata = _combined_symbol_metadata(config, storage)
-    filtered = storage.load_signals("latest_filtered.csv")
+    filtered = _filter_weekly_screener_stock_rows(
+        storage.load_signals("latest_filtered.csv")
+    )
     filtered = _enrich_with_latest_daily_close(filtered, storage.load_signals("latest_scan_details.csv"), storage)
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     filtered = _apply_market_cap_filters(filtered, min_market_cap, max_market_cap, market_cap_bucket)
@@ -2406,6 +3158,10 @@ def _scan_redirect_url(summary: dict[str, Any], query_suffix: str) -> str:
         f"scan_ran=1&symbols_scanned={summary.get('symbols_scanned', 0)}"
         f"&filtered_matches={summary.get('filtered_matches', 0)}"
         f"&refresh_mode={quote(str(summary.get('refresh_mode', 'kite_refresh')))}"
+        f"&verified_market_date={quote(str(summary.get('verified_market_date', '')))}"
+        f"&symbols_reused_fresh={summary.get('symbols_reused_fresh', 0)}"
+        f"&symbols_fetched_from_kite={summary.get('symbols_fetched_from_kite', 0)}"
+        f"&symbols_stale_excluded={summary.get('symbols_stale_excluded', 0)}"
         f"{query_suffix}"
     )
 
@@ -3143,6 +3899,7 @@ def _fetch_kite_daily_chunks(
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+@serialized_daily_candle_refresh
 def _refresh_trader_setup_history(
     storage: Storage,
     *,
@@ -3151,13 +3908,15 @@ def _refresh_trader_setup_history(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     config = load_config()
-    access_token = load_access_token(storage.data_root)
-    if not access_token:
-        raise RuntimeError("Kite access token not found. Refresh Kite login before the 10-year backtest.")
-    provider = KiteDataProvider(access_token=access_token)
-    provider.validate_session()
-    instruments = provider.instruments()
-    storage.save_instruments(instruments)
+    provider: KiteDataProvider | None = None
+
+    def get_provider() -> KiteDataProvider:
+        nonlocal provider
+        if provider is None:
+            provider = _authenticated_kite_provider(storage, "the 10-year backtest")
+        return provider
+
+    instruments = _load_or_refresh_kite_instruments(storage, get_provider)
     universe = build_universe(instruments, config)
     candidates = universe[
         universe["exchange"].astype(str).str.upper().eq("NSE")
@@ -3183,6 +3942,8 @@ def _refresh_trader_setup_history(
     current_symbols: list[str] = []
     stale_symbols: list[str] = []
     failed_symbols: list[str] = []
+    reused_symbols = 0
+    fetched_symbols = 0
     if progress_callback:
         progress_callback(
             {
@@ -3211,10 +3972,14 @@ def _refresh_trader_setup_history(
                 if latest_date < required_date:
                     fetch_ranges.append((max(latest_date, start_date), required_date))
             fetched_frames = [
-                _fetch_kite_daily_chunks(provider, token, range_start, range_end)
+                _fetch_kite_daily_chunks(get_provider(), token, range_start, range_end)
                 for range_start, range_end in fetch_ranges
                 if range_start <= range_end
             ]
+            if fetch_ranges:
+                fetched_symbols += 1
+            else:
+                reused_symbols += 1
             fetched = (
                 pd.concat([frame for frame in fetched_frames if not frame.empty], ignore_index=True)
                 if any(not frame.empty for frame in fetched_frames)
@@ -3249,6 +4014,8 @@ def _refresh_trader_setup_history(
         "refresh_stale_count": len(stale_symbols),
         "refresh_failed_count": len(failed_symbols),
         "refresh_coverage_pct": coverage_pct,
+        "refresh_reused_count": reused_symbols,
+        "refresh_fetched_count": fetched_symbols,
     }
     _validate_refresh_coverage(audit, config)
     return current_symbols, audit
@@ -3371,6 +4138,37 @@ def _latest_candle_date(frame: pd.DataFrame) -> date | None:
     return None if pd.isna(latest) else pd.Timestamp(latest).date()
 
 
+def _instrument_snapshot_is_current(storage: Storage) -> bool:
+    path = storage.instruments_path()
+    if not path.exists():
+        return False
+    modified = pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").tz_convert("Asia/Kolkata")
+    return modified.date() == pd.Timestamp.now(tz="Asia/Kolkata").date()
+
+
+def _authenticated_kite_provider(storage: Storage, scan_label: str) -> KiteDataProvider:
+    access_token = load_access_token(storage.data_root)
+    if not access_token:
+        raise RuntimeError(
+            f"Kite access token not found. Refresh the Kite login before running {scan_label}."
+        )
+    provider = KiteDataProvider(access_token=access_token)
+    provider.validate_session()
+    return provider
+
+
+def _load_or_refresh_kite_instruments(
+    storage: Storage,
+    provider_factory: Callable[[], KiteDataProvider],
+) -> pd.DataFrame:
+    cached = storage.load_instruments()
+    if not cached.empty and _instrument_snapshot_is_current(storage):
+        return cached
+    instruments = provider_factory().instruments()
+    storage.save_instruments(instruments)
+    return instruments
+
+
 def _latest_completed_nse_calendar_date(now_ist: pd.Timestamp | None = None) -> date:
     """Return the latest calendar date that can contain a finalized NSE daily bar."""
     current = pd.Timestamp.now(tz="Asia/Kolkata") if now_ist is None else pd.Timestamp(now_ist)
@@ -3384,6 +4182,83 @@ def _latest_completed_nse_calendar_date(now_ist: pd.Timestamp | None = None) -> 
     while cutoff.weekday() >= 5:
         cutoff -= timedelta(days=1)
     return cutoff
+
+
+def _resolve_analysis_as_of_date(
+    storage: Storage,
+    benchmark_symbol: str,
+    requested_value: Any,
+    latest_available_date: date,
+) -> tuple[str, date]:
+    """Resolve a requested calendar date to the latest benchmark session on or before it."""
+    requested_text = str(requested_value or "").strip()
+    if not requested_text:
+        return "", latest_available_date
+    try:
+        requested = pd.Timestamp(requested_text).date()
+    except (TypeError, ValueError):
+        raise ValueError("As of date must be a valid date in YYYY-MM-DD format.") from None
+    if requested > _latest_completed_nse_calendar_date():
+        raise ValueError("As of date cannot be after the latest completed NSE session.")
+
+    benchmark = storage.load_candles("NSE_INDEX", benchmark_symbol, "1D")
+    benchmark_dates = pd.to_datetime(benchmark.get("date"), errors="coerce").dropna()
+    eligible = benchmark_dates[benchmark_dates.dt.date <= requested]
+    if eligible.empty:
+        raise ValueError(
+            f"No {benchmark_symbol} benchmark candle is available on or before {requested.isoformat()}."
+        )
+    effective_date = pd.Timestamp(eligible.max()).date()
+    return requested.isoformat(), min(effective_date, latest_available_date)
+
+
+def _as_of_date_input(request: Request, summary: dict[str, Any] | None = None) -> str:
+    value = request.query_params.get("as_of_date")
+    if value is None and summary:
+        value = summary.get("requested_as_of_date", "")
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+def _int_query_param(
+    request: Request,
+    summary: dict[str, Any],
+    key: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    try:
+        value = int(str(request.query_params.get(key, summary.get(key, default))).strip() or default)
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
+
+
+def _float_query_param(
+    request: Request,
+    summary: dict[str, Any],
+    key: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        value = float(str(request.query_params.get(key, summary.get(key, default))).strip() or default)
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
 
 
 def _clip_daily_candles(
@@ -3426,24 +4301,36 @@ def _validate_refresh_coverage(audit: dict[str, Any], config: dict[str, Any]) ->
         )
 
 
+@serialized_daily_candle_refresh
 def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str) -> date:
-    access_token = load_access_token(storage.data_root)
-    if not access_token:
-        raise RuntimeError("Kite access token not found. Refresh the Kite login before running the screener.")
+    completed_cutoff = _latest_completed_nse_calendar_date()
+    existing = _clip_daily_candles(
+        storage,
+        "NSE_INDEX",
+        benchmark_symbol,
+        storage.load_candles("NSE_INDEX", benchmark_symbol, "1D"),
+        completed_cutoff,
+    )
+    existing_latest = _latest_candle_date(existing)
+    if existing_latest is not None and existing_latest >= completed_cutoff:
+        return existing_latest
 
-    provider = KiteDataProvider(access_token=access_token)
-    provider.validate_session()
-    instruments = storage.load_instruments()
-    if instruments.empty:
-        instruments = provider.instruments()
-        storage.save_instruments(instruments)
+    provider: KiteDataProvider | None = None
+
+    def get_provider() -> KiteDataProvider:
+        nonlocal provider
+        if provider is None:
+            provider = _authenticated_kite_provider(storage, "the screener")
+        return provider
+
+    instruments = _load_or_refresh_kite_instruments(storage, get_provider)
 
     rows = instruments[
         (instruments["exchange"].astype(str).str.upper() == "NSE")
         & (instruments["tradingsymbol"].astype(str).str.upper() == benchmark_symbol.upper())
     ]
     if rows.empty:
-        instruments = provider.instruments()
+        instruments = get_provider().instruments()
         storage.save_instruments(instruments)
         rows = instruments[
             (instruments["exchange"].astype(str).str.upper() == "NSE")
@@ -3453,17 +4340,9 @@ def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str
         raise RuntimeError(f"Kite instrument {benchmark_symbol} was not found.")
 
     history_years = int(load_config().get("data", {}).get("history_years", 10))
-    completed_cutoff = _latest_completed_nse_calendar_date()
-    existing = _clip_daily_candles(
-        storage,
-        "NSE_INDEX",
-        benchmark_symbol,
-        storage.load_candles("NSE_INDEX", benchmark_symbol, "1D"),
-        completed_cutoff,
-    )
     from_date = _fetch_incremental_start_date(existing, history_years)
     if from_date <= completed_cutoff:
-        new_daily = provider.daily_candles(
+        new_daily = get_provider().daily_candles(
             int(rows.iloc[0]["instrument_token"]),
             from_date,
             completed_cutoff,
@@ -3486,6 +4365,7 @@ def _refresh_minervini_quality_benchmark(storage: Storage, benchmark_symbol: str
     return latest_date
 
 
+@serialized_daily_candle_refresh
 def _refresh_minervini_quality_candles(
     storage: Storage,
     *,
@@ -3494,14 +4374,15 @@ def _refresh_minervini_quality_candles(
 ) -> tuple[list[str], dict[str, Any]]:
     config = load_config()
     history_years = int(config.get("data", {}).get("history_years", 10))
-    access_token = load_access_token(storage.data_root)
-    if not access_token:
-        raise RuntimeError("Kite access token not found. Refresh the Kite login before running Minervini Quality.")
+    provider: KiteDataProvider | None = None
 
-    provider = KiteDataProvider(access_token=access_token)
-    provider.validate_session()
-    instruments = provider.instruments()
-    storage.save_instruments(instruments)
+    def get_provider() -> KiteDataProvider:
+        nonlocal provider
+        if provider is None:
+            provider = _authenticated_kite_provider(storage, "Minervini Quality")
+        return provider
+
+    instruments = _load_or_refresh_kite_instruments(storage, get_provider)
     universe = build_universe(instruments, config)
     candidates = universe[
         universe["exchange"].astype(str).str.upper().eq("NSE")
@@ -3509,6 +4390,8 @@ def _refresh_minervini_quality_candles(
     refreshed_symbols: list[str] = []
     stale_symbols: list[str] = []
     failed_symbols: list[str] = []
+    reused_symbols = 0
+    fetched_symbols = 0
 
     if progress_callback:
         progress_callback(
@@ -3524,17 +4407,27 @@ def _refresh_minervini_quality_candles(
     for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
         symbol = str(instrument["tradingsymbol"]).strip().upper()
         try:
-            existing = storage.load_candles("NSE", symbol, "1D")
-            from_date = _fetch_incremental_start_date(existing, history_years)
-            if from_date <= today:
-                new_daily = provider.daily_candles(
+            existing = _clip_daily_candles(
+                storage,
+                "NSE",
+                symbol,
+                storage.load_candles("NSE", symbol, "1D"),
+                required_date,
+            )
+            existing_latest = _latest_candle_date(existing)
+            if existing_latest is not None and existing_latest >= required_date:
+                daily = existing
+                reused_symbols += 1
+            else:
+                from_date = _fetch_incremental_start_date(existing, history_years)
+                new_daily = get_provider().daily_candles(
                     int(instrument["instrument_token"]),
                     from_date,
-                    today,
+                    required_date,
                 )
+                fetched_symbols += 1
                 daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
-            else:
-                daily = existing
+                daily = _clip_daily_candles(storage, "NSE", symbol, daily, required_date)
         except Exception:
             failed_symbols.append(symbol)
             daily = pd.DataFrame()
@@ -3562,6 +4455,8 @@ def _refresh_minervini_quality_candles(
         "refresh_stale_count": len(stale_symbols),
         "refresh_failed_count": len(failed_symbols),
         "refresh_coverage_pct": coverage_pct,
+        "refresh_reused_count": reused_symbols,
+        "refresh_fetched_count": fetched_symbols,
     }
     _validate_refresh_coverage(audit, config)
     return refreshed_symbols, audit
@@ -3572,6 +4467,7 @@ def _run_minervini_quality_job(
     data_root: Path,
     query_suffix: str,
     score_threshold: float,
+    requested_as_of_date: str = "",
 ) -> None:
     storage = Storage(data_root)
     symbol_total = len(list((data_root / "candles" / "NSE" / "1D").glob("*.csv")))
@@ -3621,6 +4517,12 @@ def _run_minervini_quality_job(
             storage,
             MINERVINI_QUALITY_DEFAULT_BENCHMARK,
         )
+        requested_date, analysis_date = _resolve_analysis_as_of_date(
+            storage,
+            MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+            requested_as_of_date,
+            expected_date,
+        )
         refreshed_symbols, refresh_audit = _refresh_minervini_quality_candles(
             storage,
             required_date=expected_date,
@@ -3644,9 +4546,12 @@ def _run_minervini_quality_job(
             symbols=refreshed_symbols,
             benchmark_symbol=MINERVINI_QUALITY_DEFAULT_BENCHMARK,
             score_threshold=score_threshold,
+            as_of_date=analysis_date,
             progress_callback=scan_progress_callback,
         )
         result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
         save_minervini_quality_outputs(result, _minervini_quality_dir(data_root))
         _set_scan_job(
             job_id,
@@ -3680,6 +4585,7 @@ def _fetch_incremental_start_date(existing: pd.DataFrame, history_years: int) ->
     return pd.Timestamp(last_date).date()
 
 
+@serialized_daily_candle_refresh
 def _refresh_adx_di_candles(
     storage: Storage,
     *,
@@ -3692,14 +4598,15 @@ def _refresh_adx_di_candles(
 ) -> tuple[list[str], dict[str, Any]]:
     config = load_config()
     history_years = int(config.get("data", {}).get("history_years", 10))
-    access_token = load_access_token(storage.data_root)
-    if not access_token:
-        raise RuntimeError(f"Kite access token not found. Refresh the Kite login before running the {scan_label}.")
+    provider: KiteDataProvider | None = None
 
-    provider = KiteDataProvider(access_token=access_token)
-    provider.validate_session()
-    instruments = provider.instruments()
-    storage.save_instruments(instruments)
+    def get_provider() -> KiteDataProvider:
+        nonlocal provider
+        if provider is None:
+            provider = _authenticated_kite_provider(storage, scan_label)
+        return provider
+
+    instruments = _load_or_refresh_kite_instruments(storage, get_provider)
 
     nse = instruments[
         (instruments["exchange"].astype(str).str.upper() == "NSE")
@@ -3718,10 +4625,11 @@ def _refresh_adx_di_candles(
         }
         nse = nse[nse["tradingsymbol"].isin(requested_symbols)].copy()
     candidates = nse.sort_values("tradingsymbol").reset_index(drop=True)
-    today = date.today()
     refreshed_symbols: list[str] = []
     stale_symbols: list[str] = []
     failed_symbols: list[str] = []
+    reused_symbols = 0
+    fetched_symbols = 0
 
     if progress_callback:
         progress_callback(
@@ -3745,12 +4653,15 @@ def _refresh_adx_di_candles(
                 storage.load_candles("NSE", symbol, "1D"),
                 required_date,
             )
-            from_date = _fetch_incremental_start_date(existing_daily, history_years)
-            if from_date <= required_date:
-                new_daily = provider.daily_candles(token, from_date, required_date)
-                daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
-            else:
+            existing_latest = _latest_candle_date(existing_daily)
+            if existing_latest is not None and existing_latest >= required_date:
                 daily = existing_daily
+                reused_symbols += 1
+            else:
+                from_date = _fetch_incremental_start_date(existing_daily, history_years)
+                new_daily = get_provider().daily_candles(token, from_date, required_date)
+                fetched_symbols += 1
+                daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
             daily = _clip_daily_candles(storage, "NSE", symbol, daily, required_date)
         except Exception:
             failed_symbols.append(symbol)
@@ -3785,6 +4696,8 @@ def _refresh_adx_di_candles(
         "refresh_stale_count": len(stale_symbols),
         "refresh_failed_count": len(failed_symbols),
         "refresh_coverage_pct": coverage_pct,
+        "refresh_reused_count": reused_symbols,
+        "refresh_fetched_count": fetched_symbols,
     }
     if validate_coverage:
         _validate_refresh_coverage(audit, config)
@@ -3809,6 +4722,7 @@ def _run_adx_di_job(
     atr_channel_atr_length: int,
     atr_channel_ma_type: str,
     atr_lower1_proximity_pct: float,
+    requested_as_of_date: str = "",
 ) -> None:
     storage = Storage(data_root)
     _set_scan_job(
@@ -3839,6 +4753,12 @@ def _run_adx_di_job(
 
     try:
         expected_date = _refresh_minervini_quality_benchmark(storage, "NIFTY 50")
+        requested_date, analysis_date = _resolve_analysis_as_of_date(
+            storage,
+            "NIFTY 50",
+            requested_as_of_date,
+            expected_date,
+        )
         refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
             storage,
             required_date=expected_date,
@@ -3864,9 +4784,12 @@ def _run_adx_di_job(
             atr_channel_atr_length=atr_channel_atr_length,
             atr_channel_ma_type=atr_channel_ma_type,
             atr_lower1_proximity_pct=atr_lower1_proximity_pct,
+            as_of_date=analysis_date,
             progress_callback=progress_callback,
         )
         result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
         save_adx_di_outputs(result, _adx_di_dir(data_root))
         _set_scan_job(
             job_id,
@@ -3913,6 +4836,7 @@ def _run_knox_envelope_job(
     sharpe_lookback_days: int,
     annual_risk_free_rate_pct: float,
     min_sharpe_ratio: float | None,
+    requested_as_of_date: str = "",
 ) -> None:
     storage = Storage(data_root)
     _set_scan_job(
@@ -3958,6 +4882,12 @@ def _run_knox_envelope_job(
 
     try:
         expected_date = _refresh_minervini_quality_benchmark(storage, "NIFTY 50")
+        requested_date, analysis_date = _resolve_analysis_as_of_date(
+            storage,
+            "NIFTY 50",
+            requested_as_of_date,
+            expected_date,
+        )
         refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
             storage,
             required_date=expected_date,
@@ -3990,10 +4920,12 @@ def _run_knox_envelope_job(
             sharpe_lookback_days=sharpe_lookback_days,
             annual_risk_free_rate_pct=annual_risk_free_rate_pct,
             min_sharpe_ratio=min_sharpe_ratio,
-            as_of_date=expected_date,
+            as_of_date=analysis_date,
             progress_callback=scan_progress,
         )
         result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
         save_knox_envelope_outputs(result, _knox_envelope_dir(data_root))
         _set_scan_job(
             job_id,
@@ -4135,6 +5067,10 @@ def _run_minervini_di_divergence_job(
     min_score: float,
     symbols: list[str] | None = None,
     targeted: bool = False,
+    requested_as_of_date: str = "",
+    require_fvg_bos: bool = False,
+    structure_sensitivity: int = MINERVINI_DI_DEFAULT_STRUCTURE_SENSITIVITY,
+    fvg_lookback: int = MINERVINI_DI_DEFAULT_FVG_LOOKBACK,
 ) -> None:
     storage = Storage(data_root)
     _set_scan_job(
@@ -4183,6 +5119,12 @@ def _run_minervini_di_divergence_job(
             storage,
             MINERVINI_QUALITY_DEFAULT_BENCHMARK,
         )
+        requested_date, analysis_date = _resolve_analysis_as_of_date(
+            storage,
+            MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+            requested_as_of_date,
+            expected_date,
+        )
         refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
             storage,
             required_date=expected_date,
@@ -4215,10 +5157,16 @@ def _run_minervini_di_divergence_job(
             adx_length=adx_length,
             divergence_days=divergence_days,
             min_score=min_score,
+            require_fvg_bos=require_fvg_bos,
+            structure_sensitivity=structure_sensitivity,
+            fvg_lookback=fvg_lookback,
             benchmark_symbol=MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+            as_of_date=analysis_date,
             progress_callback=scan_progress_callback,
         )
         result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
         if targeted:
             result.summary["targeted_scan"] = True
             result.summary["requested_symbols_csv"] = ",".join(symbols or [])
@@ -4259,6 +5207,506 @@ def _run_minervini_di_divergence_job(
                 else f"/minervini-di-divergence?study_error={quote(str(exc)[:500])}{query_suffix}"
             ),
         )
+
+
+def _run_dma_pullback_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    touch_lookback_bars: int,
+    proximity_pct: float,
+    max_distance_above_dma_pct: float,
+    require_di_minervini: bool,
+    adx_length: int,
+    divergence_days: int,
+    min_quality_score: float,
+    requested_as_of_date: str = "",
+) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Refreshing DMA pullback candles",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def refresh_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 50) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 50)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    def scan_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 50 + (int((completed / total) * 50) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(50, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        expected_date = _refresh_minervini_quality_benchmark(
+            storage,
+            MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+        )
+        requested_date, analysis_date = _resolve_analysis_as_of_date(
+            storage,
+            MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+            requested_as_of_date,
+            expected_date,
+        )
+        refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
+            storage,
+            required_date=expected_date,
+            progress_callback=refresh_progress_callback,
+            scan_label="DMA pullback scan",
+            progress_phase="Refreshing DMA pullback candles",
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh NSE daily candles were available for the DMA pullback scan.")
+        result = run_dma_pullback_study(
+            storage,
+            exchange="NSE",
+            symbols=refreshed_symbols,
+            touch_lookback_bars=touch_lookback_bars,
+            proximity_pct=proximity_pct,
+            max_distance_above_dma_pct=max_distance_above_dma_pct,
+            require_di_minervini=require_di_minervini,
+            adx_length=adx_length,
+            divergence_days=divergence_days,
+            min_quality_score=min_quality_score,
+            benchmark_symbol=MINERVINI_QUALITY_DEFAULT_BENCHMARK,
+            as_of_date=analysis_date,
+            progress_callback=scan_progress_callback,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
+        if result.summary.get("latest_stock_date") != result.summary.get("benchmark_latest_date"):
+            raise RuntimeError(
+                "Freshness check failed: latest NSE stock candle is "
+                f"{result.summary.get('latest_stock_date') or 'unavailable'}, but NIFTY 500 is "
+                f"{result.summary.get('benchmark_latest_date') or 'unavailable'}. Run again after Kite publishes both completed daily candles."
+            )
+        save_dma_pullback_outputs(result, _dma_pullback_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/dma-pullback?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/dma-pullback?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _run_stock_signature_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    pivot_order: int,
+    dma_touch_tolerance_pct: float,
+    lookback_months: int,
+    requested_as_of_date: str = "",
+    selected_universes: list[str] | None = None,
+    custom_symbols: str = "",
+) -> None:
+    storage = Storage(data_root)
+
+    def refresh_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 50) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    def scan_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 50 + (int((completed / total) * 50) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(50, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        universe_keys = list(STOCK_SIGNATURE_DEFAULT_UNIVERSES if selected_universes is None else selected_universes)
+        constituents, universe_meta = _build_stock_signature_universe(
+            data_root,
+            universe_keys,
+            custom_symbols,
+            allow_remote_fetch=True,
+        )
+        if constituents.empty:
+            raise RuntimeError(
+                "The selected research universe is empty. Choose Nifty 100, Nifty 500, or enter comma-separated symbols."
+            )
+        requested_date, analysis_date = _resolve_stock_signature_required_date(requested_as_of_date)
+        refreshed_symbols, refresh_audit = _refresh_stock_signature_candles(
+            storage,
+            constituents,
+            required_date=analysis_date,
+            lookback_months=lookback_months,
+            progress_callback=refresh_progress_callback,
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh daily candles were available for the selected Stock Signature universe.")
+        result = run_stock_signature_scan(
+            storage,
+            constituents,
+            exchange="NSE",
+            universe_name=str(universe_meta["universe_summary"]),
+            pivot_order=pivot_order,
+            dma_touch_tolerance_pct=dma_touch_tolerance_pct,
+            lookback_months=lookback_months,
+            as_of_date=analysis_date.isoformat(),
+            required_latest_date=analysis_date,
+            progress_callback=scan_progress_callback,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
+        result.summary["selected_universes"] = list(universe_meta["selected_universes"])
+        result.summary["custom_symbols"] = str(universe_meta["custom_symbols"])
+        result.summary["universe_label"] = str(universe_meta["universe_label"])
+        result.summary["constituent_source_url"] = ", ".join(universe_meta["source_urls"])
+        result.summary["constituent_source_file"] = ", ".join(universe_meta["source_files"])
+        save_stock_signature_scan_outputs(result, _stock_signature_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/stock-signature?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/stock-signature?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _run_drawdown_recovery_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    history_months: int,
+    prior_high_lookback_sessions: int,
+    min_drawdown_floor_pct: float,
+    target_recovery_pct: float,
+    dma_window: int,
+    min_volume_multiple: float,
+    min_dma_improvement_pct_points: float,
+    max_current_age_sessions: int,
+    trough_order: int,
+    requested_as_of_date: str = "",
+    selected_universes: list[str] | None = None,
+    custom_symbols: str = "",
+) -> None:
+    storage = Storage(data_root)
+
+    def refresh_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 45) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    def scan_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 45 + (int((completed / total) * 55) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(45, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        universe_keys = list(STOCK_SIGNATURE_DEFAULT_UNIVERSES if selected_universes is None else selected_universes)
+        constituents, universe_meta = _build_stock_signature_universe(
+            data_root,
+            universe_keys,
+            custom_symbols,
+            allow_remote_fetch=True,
+        )
+        if constituents.empty:
+            raise RuntimeError(
+                "The selected research universe is empty. Choose Nifty 100, Nifty 500, or enter comma-separated symbols."
+            )
+        requested_date, analysis_date = _resolve_stock_signature_required_date(requested_as_of_date)
+        refreshed_symbols, refresh_audit = _refresh_stock_signature_candles(
+            storage,
+            constituents,
+            required_date=analysis_date,
+            lookback_months=history_months,
+            progress_callback=refresh_progress_callback,
+            progress_phase="Downloading Drawdown Recovery OHLC",
+            provider_label="Drawdown Recovery",
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh daily candles were available for the selected Drawdown Recovery universe.")
+        result = run_drawdown_recovery_study(
+            storage,
+            constituents,
+            exchange="NSE",
+            universe_name=str(universe_meta["universe_summary"]),
+            history_months=history_months,
+            prior_high_lookback_sessions=prior_high_lookback_sessions,
+            min_drawdown_floor_pct=min_drawdown_floor_pct,
+            target_recovery_pct=target_recovery_pct,
+            dma_window=dma_window,
+            min_volume_multiple=min_volume_multiple,
+            min_dma_improvement_pct_points=min_dma_improvement_pct_points,
+            max_current_age_sessions=max_current_age_sessions,
+            trough_order=trough_order,
+            as_of_date=analysis_date.isoformat(),
+            required_latest_date=analysis_date,
+            progress_callback=scan_progress_callback,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
+        result.summary["selected_universes"] = list(universe_meta["selected_universes"])
+        result.summary["custom_symbols"] = str(universe_meta["custom_symbols"])
+        result.summary["universe_label"] = str(universe_meta["universe_label"])
+        result.summary["constituent_source_url"] = ", ".join(universe_meta["source_urls"])
+        result.summary["constituent_source_file"] = ", ".join(universe_meta["source_files"])
+        save_drawdown_recovery_outputs(result, _drawdown_recovery_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/drawdown-recovery?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/drawdown-recovery?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
+def _resolve_stock_signature_required_date(requested_as_of_date: Any) -> tuple[str, date]:
+    requested_text = str(requested_as_of_date or "").strip()
+    if requested_text:
+        try:
+            required_date = pd.Timestamp(requested_text).date()
+        except (TypeError, ValueError):
+            raise ValueError("As of date must be a valid date in YYYY-MM-DD format.") from None
+        if required_date > _latest_completed_nse_calendar_date():
+            raise ValueError("As of date cannot be after the latest completed NSE session.")
+        return required_date.isoformat(), required_date
+    latest_completed = _latest_completed_nse_calendar_date()
+    return latest_completed.isoformat(), latest_completed
+
+
+def _stock_signature_window_start_date(required_date: date, lookback_months: int) -> date:
+    return (pd.Timestamp(required_date) - pd.DateOffset(months=max(int(lookback_months), 1))).date()
+
+
+def _stock_signature_constituent_symbols(constituents: pd.DataFrame) -> list[str]:
+    if constituents.empty:
+        return []
+    symbol_column = next(
+        (column for column in ("Symbol", "symbol", "tradingsymbol", "Tradingsymbol") if column in constituents.columns),
+        "",
+    )
+    if not symbol_column:
+        return []
+    symbols = constituents[symbol_column].dropna().astype(str).str.upper().str.strip()
+    return sorted(dict.fromkeys(symbol for symbol in symbols if symbol))
+
+
+@serialized_daily_candle_refresh
+def _refresh_stock_signature_candles(
+    storage: Storage,
+    constituents: pd.DataFrame,
+    *,
+    required_date: date,
+    lookback_months: int,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_phase: str = "Downloading Stock Signature OHLC",
+    provider_label: str = "Stock Signature",
+) -> tuple[list[str], dict[str, Any]]:
+    config = load_config()
+    fetch_start = _stock_signature_window_start_date(required_date, lookback_months)
+    provider: KiteDataProvider | None = None
+
+    def get_provider() -> KiteDataProvider:
+        nonlocal provider
+        if provider is None:
+            provider = _authenticated_kite_provider(storage, provider_label)
+        return provider
+
+    requested_symbols = set(_stock_signature_constituent_symbols(constituents))
+    instruments = _load_or_refresh_kite_instruments(storage, get_provider)
+    nse = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NSE")
+        & (instruments["segment"].astype(str).str.upper() != "INDICES")
+    ].copy()
+    if "instrument_type" in nse.columns:
+        nse = nse[nse["instrument_type"].astype(str).str.upper().isin({"EQ"})].copy()
+    nse["tradingsymbol"] = nse["tradingsymbol"].astype(str).str.upper().str.strip()
+    candidates = (
+        nse[nse["tradingsymbol"].isin(requested_symbols)]
+        .drop_duplicates(subset=["tradingsymbol"])
+        .sort_values("tradingsymbol")
+        .reset_index(drop=True)
+    )
+    unavailable_symbols = requested_symbols - set(candidates["tradingsymbol"].astype(str).str.upper())
+    if candidates.empty:
+        missing_text = ", ".join(sorted(unavailable_symbols)) or "the selected symbols"
+        raise RuntimeError(f"No NSE Kite instruments matched: {missing_text}. Use NSE trading symbols such as RELIANCE or HDFCBANK.")
+
+    refreshed_symbols: list[str] = []
+    stale_symbols: list[str] = []
+    failed_symbols: list[str] = []
+    fetched_symbols = 0
+    reused_symbols = 0
+
+    if progress_callback:
+        progress_callback(
+            {
+                "phase": progress_phase,
+                "completed": 0,
+                "total": len(candidates),
+                "current_symbol": "",
+                "current_exchange": "NSE",
+            }
+        )
+
+    for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
+        symbol = str(instrument["tradingsymbol"]).strip().upper()
+        try:
+            existing = _clip_daily_candles(
+                storage,
+                "NSE",
+                symbol,
+                storage.load_candles("NSE", symbol, "1D"),
+                required_date,
+            )
+            new_daily = get_provider().daily_candles(
+                int(instrument["instrument_token"]),
+                fetch_start,
+                required_date,
+            )
+            if new_daily.empty:
+                daily = existing
+                reused_symbols += 1
+            else:
+                fetched_symbols += 1
+                daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
+            daily = _clip_daily_candles(storage, "NSE", symbol, daily, required_date)
+        except Exception:
+            failed_symbols.append(symbol)
+            daily = pd.DataFrame()
+        if _latest_candle_date(daily) == required_date:
+            refreshed_symbols.append(symbol)
+        elif symbol not in failed_symbols:
+            stale_symbols.append(symbol)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": progress_phase,
+                    "completed": completed,
+                    "total": len(candidates),
+                    "current_symbol": symbol,
+                    "current_exchange": "NSE",
+                }
+            )
+
+    total = len(candidates)
+    coverage_pct = len(refreshed_symbols) / total * 100.0 if total else 0.0
+    audit = {
+        "refresh_expected_date": required_date.isoformat(),
+        "refresh_start_date": fetch_start.isoformat(),
+        "refresh_requested_count": len(requested_symbols),
+        "refresh_unavailable_count": len(unavailable_symbols),
+        "refresh_universe_count": total,
+        "refresh_current_count": len(refreshed_symbols),
+        "refresh_stale_count": len(stale_symbols),
+        "refresh_failed_count": len(failed_symbols),
+        "refresh_coverage_pct": coverage_pct,
+        "refresh_reused_count": reused_symbols,
+        "refresh_fetched_count": fetched_symbols,
+    }
+    _validate_refresh_coverage(audit, config)
+    return refreshed_symbols, audit
 
 
 def _run_minervini_sheet_job(job_id: str, data_root: Path, query_suffix: str) -> None:
@@ -4888,6 +6336,12 @@ def _adx_di_dir(data_root: Path) -> Path:
     return path
 
 
+def _dma_pullback_dir(data_root: Path) -> Path:
+    path = data_root / "dma_pullback"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _knox_envelope_dir(data_root: Path) -> Path:
     path = data_root / "knox_envelope"
     path.mkdir(parents=True, exist_ok=True)
@@ -5091,6 +6545,119 @@ def fetch_big_bull_deals_get(request: Request) -> RedirectResponse:
 @app.get("/health", response_class=PlainTextResponse)
 def health() -> str:
     return "ok"
+
+
+@app.get("/ohlcv-download", response_class=HTMLResponse)
+def ohlcv_download_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    symbols_text = request.query_params.get("symbols", "").strip()
+    start_text = request.query_params.get("start_date", "").strip()
+    end_text = request.query_params.get("end_date", "").strip()
+    exchange_scope = request.query_params.get("exchange_scope", "combined").strip().lower()
+    preview_requested = _truthy_param(request.query_params.getlist("preview"), default=False)
+    error = ""
+    preview = pd.DataFrame(columns=OHLCV_EXPORT_COLUMNS)
+    universe: list[tuple[str, str]] = []
+    requested_symbols: list[str] = []
+    try:
+        requested_symbols = _parse_ohlcv_symbols(symbols_text)
+        start_date = _parse_ohlcv_date(start_text, "start")
+        end_date = _parse_ohlcv_date(end_text, "end")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise ValueError("Start date cannot be after end date.")
+        storage = Storage(data_root)
+        universe = _ohlcv_export_universe(storage, exchange_scope, requested_symbols)
+        if preview_requested:
+            preview = _load_ohlcv_preview(storage, universe, start_date, end_date)
+    except ValueError as exc:
+        error = str(exc)
+
+    found_requested = {symbol for _, symbol in universe}
+    missing_symbols = [symbol for symbol in requested_symbols if symbol not in found_requested]
+    preview_display = preview.copy()
+    if not preview_display.empty:
+        preview_display["date"] = pd.to_datetime(
+            preview_display["date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+    dashboard_token = request.query_params.get("token", "").strip()
+    return templates.TemplateResponse(
+        "ohlcv_download.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": dashboard_token,
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "symbols_text": symbols_text,
+            "start_date": start_text,
+            "end_date": end_text,
+            "exchange_scope": exchange_scope,
+            "preview_requested": preview_requested,
+            "error": error,
+            "rows": _records(preview_display),
+            "preview_count": len(preview),
+            "universe_count": len(universe),
+            "nse_count": sum(1 for exchange, _ in universe if exchange == "NSE"),
+            "bse_only_count": sum(1 for exchange, _ in universe if exchange == "BSE"),
+            "missing_symbols": missing_symbols,
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.get("/ohlcv-download.csv")
+def download_ohlcv_csv(request: Request) -> StreamingResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    try:
+        symbols = _parse_ohlcv_symbols(request.query_params.get("symbols", ""))
+        exchange_scope = request.query_params.get("exchange_scope", "combined").strip().lower()
+        start_date = _parse_ohlcv_date(request.query_params.get("start_date", ""), "start")
+        end_date = _parse_ohlcv_date(request.query_params.get("end_date", ""), "end")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise ValueError("Start date cannot be after end date.")
+        storage = Storage(get_data_root(load_config()))
+        universe = _ohlcv_export_universe(storage, exchange_scope, symbols)
+        if not universe:
+            raise ValueError("No saved daily candle files match the selected universe.")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def stream_csv():
+        yield ",".join(OHLCV_EXPORT_COLUMNS) + "\n"
+        for exchange, symbol in universe:
+            frame = _filter_ohlcv_frame(
+                storage.load_candles(exchange, symbol, "1D"),
+                exchange,
+                symbol,
+                start_date,
+                end_date,
+            )
+            if frame.empty:
+                continue
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            yield frame.to_csv(index=False, header=False)
+
+    scope_name = "NSE_plus_BSE_only" if exchange_scope == "combined" else exchange_scope.upper()
+    filename = f"{scope_name}_daily_ohlcv.csv"
+    return StreamingResponse(
+        stream_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def _temporarily_removed_response(request: Request, page_name: str) -> HTMLResponse:
@@ -5396,7 +6963,7 @@ def gtt_gain_study_page(request: Request) -> HTMLResponse:
 
 
 @app.post("/gtt-gain-study/run")
-async def run_gtt_gain_study_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+async def run_gtt_gain_study_from_dashboard(request: Request) -> RedirectResponse:
     config = load_config()
     form = await request.form()
     selected_sensitivity = _parse_sensitivity_text(
@@ -5416,8 +6983,15 @@ async def run_gtt_gain_study_from_dashboard(request: Request, background_tasks: 
 
     try:
         job_id = uuid4().hex
-        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
-        background_tasks.add_task(_run_gtt_gain_job, job_id, config, data_root, query_suffix)
+        _submit_scan_job(
+            job_id,
+            "GTT Gain Study",
+            _run_gtt_gain_job,
+            config,
+            data_root,
+            query_suffix,
+            depends_on=_active_weekly_job_id(),
+        )
         redirect_url = f"/gtt-gain-study?gtt_job={job_id}{query_suffix}"
     except Exception as exc:
         redirect_url = _gtt_gain_error_url(exc, query_suffix)
@@ -6172,6 +7746,7 @@ def minervini_quality_page(request: Request) -> HTMLResponse:
     data_root = get_data_root(config)
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_minervini_quality_outputs(_minervini_quality_dir(data_root))
+    as_of_date = _as_of_date_input(request, latest.summary)
     stock_search = request.query_params.get("stock_search", "").strip()
     qualified_only = _truthy_param(request.query_params.getlist("qualified_only"), default=True)
     try:
@@ -6247,6 +7822,7 @@ def minervini_quality_page(request: Request) -> HTMLResponse:
             "stock_search": stock_search,
             "qualified_only": qualified_only,
             "score_threshold": score_threshold,
+            "as_of_date": as_of_date,
             "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
             "study_error": request.query_params.get("study_error", ""),
@@ -6264,6 +7840,7 @@ async def run_minervini_quality_from_dashboard(request: Request, background_task
     form = await request.form()
     dashboard_token = str(form.get("token", "")).strip()
     sensitivity_text = str(form.get("sensitivity", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
     try:
         score_threshold = float(
             str(form.get("score_threshold", MINERVINI_QUALITY_DEFAULT_THRESHOLD)).strip()
@@ -6273,6 +7850,8 @@ async def run_minervini_quality_from_dashboard(request: Request, background_task
         score_threshold = MINERVINI_QUALITY_DEFAULT_THRESHOLD
     score_threshold = max(0.0, min(score_threshold, 99.0))
     params = [f"score_threshold={quote(str(score_threshold))}", "qualified_only=1"]
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
     if sensitivity_text:
@@ -6288,10 +7867,825 @@ async def run_minervini_quality_from_dashboard(request: Request, background_task
             data_root,
             query_suffix,
             score_threshold,
+            as_of_date,
         )
         redirect_url = f"/minervini-quality?study_job={job_id}{query_suffix}"
     except Exception as exc:
         redirect_url = f"/minervini-quality?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/dma-pullback", response_class=HTMLResponse)
+def dma_pullback_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    latest = load_dma_pullback_outputs(_dma_pullback_dir(data_root))
+    summary = dict(latest.summary)
+    as_of_date = _as_of_date_input(request, summary)
+    stock_search = request.query_params.get("stock_search", "").strip()
+    matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+
+    def int_param(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            return max(int(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def float_param(name: str, default: float, minimum: float = 0.0, maximum: float | None = None) -> float:
+        try:
+            value = max(float(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            value = default
+        return min(value, maximum) if maximum is not None else value
+
+    touch_lookback_bars = int_param("touch_lookback_bars", DMA_PULLBACK_DEFAULT_LOOKBACK)
+    proximity_pct = float_param("proximity_pct", DMA_PULLBACK_DEFAULT_PROXIMITY, 0.0, 25.0)
+    max_distance_above_dma_pct = float_param(
+        "max_distance_above_dma_pct",
+        DMA_PULLBACK_DEFAULT_MAX_DISTANCE,
+        0.0,
+        50.0,
+    )
+    adx_length = int_param("adx_length", DMA_PULLBACK_DEFAULT_ADX_LENGTH, 2)
+    divergence_days = int_param("divergence_days", DMA_PULLBACK_DEFAULT_DIVERGENCE_DAYS)
+    min_quality_score = float_param(
+        "min_quality_score",
+        DMA_PULLBACK_DEFAULT_MIN_QUALITY_SCORE,
+        0.0,
+        100.0,
+    )
+    require_di_minervini = _truthy_param(
+        request.query_params.getlist("require_di_minervini"),
+        default=_truthy_param(summary.get("require_di_minervini"), default=False),
+    )
+
+    stock_stats = latest.stock_stats.copy()
+    qualified = pd.DataFrame()
+    if not stock_stats.empty:
+        for column in (
+            "dma_pullback_pass",
+            "di_divergence_pass",
+            "di_minervini_pass",
+            "combined_pass",
+            "is_latest_market_date",
+            "upward_turn",
+            "pullback_from_75dma",
+            "pullback_from_100dma",
+            "pullback_from_200dma",
+        ):
+            if column in stock_stats.columns:
+                stock_stats[column] = _truthy_series(stock_stats[column])
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        combined_mask = stock_stats.get(
+            "combined_pass",
+            pd.Series(False, index=stock_stats.index),
+        ).fillna(False).astype(bool)
+        qualified = stock_stats.loc[combined_mask].copy()
+        sort_columns = [
+            column
+            for column in ("nearest_dma_distance_pct", "latest_touch_date", "symbol")
+            if column in qualified.columns
+        ]
+        if sort_columns:
+            qualified = qualified.sort_values(
+                sort_columns,
+                ascending=[column != "latest_touch_date" for column in sort_columns],
+                na_position="last",
+            )
+        if matches_only:
+            stock_stats = qualified.copy()
+
+    return templates.TemplateResponse(
+        "dma_pullback.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "stock_symbols_csv": _comma_separated_symbols(qualified),
+            "stock_search": stock_search,
+            "matches_only": matches_only,
+            "touch_lookback_bars": touch_lookback_bars,
+            "proximity_pct": proximity_pct,
+            "max_distance_above_dma_pct": max_distance_above_dma_pct,
+            "require_di_minervini": require_di_minervini,
+            "adx_length": adx_length,
+            "divergence_days": divergence_days,
+            "min_quality_score": min_quality_score,
+            "as_of_date": as_of_date,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "common_filter_query": "",
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/dma-pullback/run")
+async def run_dma_pullback_from_dashboard(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sensitivity_text = str(form.get("sensitivity", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
+
+    def form_int(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            return max(int(str(form.get(name, default)).strip()), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def form_float(name: str, default: float, minimum: float = 0.0, maximum: float | None = None) -> float:
+        try:
+            value = max(float(str(form.get(name, default)).strip()), minimum)
+        except (TypeError, ValueError):
+            value = default
+        return min(value, maximum) if maximum is not None else value
+
+    touch_lookback_bars = form_int("touch_lookback_bars", DMA_PULLBACK_DEFAULT_LOOKBACK)
+    proximity_pct = form_float("proximity_pct", DMA_PULLBACK_DEFAULT_PROXIMITY, 0.0, 25.0)
+    max_distance_above_dma_pct = form_float(
+        "max_distance_above_dma_pct",
+        DMA_PULLBACK_DEFAULT_MAX_DISTANCE,
+        0.0,
+        50.0,
+    )
+    require_di_minervini = _truthy_param(form.getlist("require_di_minervini"), default=False)
+    adx_length = form_int("adx_length", DMA_PULLBACK_DEFAULT_ADX_LENGTH, 2)
+    divergence_days = form_int("divergence_days", DMA_PULLBACK_DEFAULT_DIVERGENCE_DAYS)
+    min_quality_score = form_float(
+        "min_quality_score",
+        DMA_PULLBACK_DEFAULT_MIN_QUALITY_SCORE,
+        0.0,
+        100.0,
+    )
+
+    params = [
+        f"touch_lookback_bars={touch_lookback_bars}",
+        f"proximity_pct={quote(str(proximity_pct))}",
+        f"max_distance_above_dma_pct={quote(str(max_distance_above_dma_pct))}",
+        f"require_di_minervini={1 if require_di_minervini else 0}",
+        f"adx_length={adx_length}",
+        f"divergence_days={divergence_days}",
+        f"min_quality_score={quote(str(min_quality_score))}",
+        "matches_only=1",
+    ]
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    if sensitivity_text:
+        params.append(f"sensitivity={quote(sensitivity_text)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _submit_scan_job(
+            job_id,
+            "DMA Pullback",
+            _run_dma_pullback_job,
+            data_root,
+            query_suffix,
+            touch_lookback_bars,
+            proximity_pct,
+            max_distance_above_dma_pct,
+            require_di_minervini,
+            adx_length,
+            divergence_days,
+            min_quality_score,
+            as_of_date,
+        )
+        redirect_url = f"/dma-pullback?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/dma-pullback?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/stock-signature", response_class=HTMLResponse)
+def stock_signature_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    storage = Storage(data_root)
+    latest = load_stock_signature_scan_outputs(_stock_signature_dir(data_root))
+    stock_search = request.query_params.get("stock_search", "").strip()
+    universe_values = request.query_params.getlist("universe")
+    custom_symbols_param = request.query_params.get("custom_symbols")
+    if custom_symbols_param is not None:
+        custom_symbols = str(custom_symbols_param or "").strip()
+    elif universe_values:
+        custom_symbols = ""
+    else:
+        custom_symbols = str(latest.summary.get("custom_symbols", "") or "").strip()
+    if not universe_values:
+        saved_universes = latest.summary.get("selected_universes", "")
+        if isinstance(saved_universes, list):
+            universe_values = saved_universes
+        elif str(saved_universes or "").strip():
+            universe_values = re.split(r"[\s,;]+", str(saved_universes))
+    selected_universes = _stock_signature_selected_universes(universe_values, custom_symbols=custom_symbols)
+    universe_error = ""
+    try:
+        constituents, universe_meta = _build_stock_signature_universe(
+            data_root,
+            selected_universes,
+            custom_symbols,
+            allow_remote_fetch=False,
+        )
+    except ValueError as exc:
+        constituents = pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
+        universe_meta = {
+            "selected_universes": selected_universes,
+            "custom_symbols": custom_symbols,
+            "universe_label": _stock_signature_universe_label(selected_universes, custom_symbols),
+            "universe_summary": _stock_signature_universe_summary(selected_universes, custom_symbols),
+            "missing_universes": [],
+            "source_urls": [],
+            "source_files": [],
+        }
+        universe_error = str(exc)
+    as_of_date = _as_of_date_input(request, latest.summary)
+    try:
+        pivot_order = max(
+            int(request.query_params.get("pivot_order", latest.summary.get("pivot_order", STOCK_SIGNATURE_DEFAULT_PIVOT_ORDER)) or STOCK_SIGNATURE_DEFAULT_PIVOT_ORDER),
+            1,
+        )
+    except (TypeError, ValueError):
+        pivot_order = STOCK_SIGNATURE_DEFAULT_PIVOT_ORDER
+    try:
+        dma_touch_tolerance_pct = max(
+            float(
+                request.query_params.get(
+                    "dma_touch_tolerance_pct",
+                    latest.summary.get("dma_touch_tolerance_pct", STOCK_SIGNATURE_DEFAULT_DMA_TOUCH_TOLERANCE),
+                )
+                or STOCK_SIGNATURE_DEFAULT_DMA_TOUCH_TOLERANCE
+            ),
+            0.0,
+        )
+    except (TypeError, ValueError):
+        dma_touch_tolerance_pct = STOCK_SIGNATURE_DEFAULT_DMA_TOUCH_TOLERANCE
+    try:
+        lookback_months = min(
+            max(int(request.query_params.get("lookback_months", latest.summary.get("lookback_months", STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS)) or STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS), 1),
+            STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS,
+        )
+    except (TypeError, ValueError):
+        lookback_months = STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS
+
+    scope_matches_saved_scan = _stock_signature_saved_scope_matches(latest.summary, universe_meta)
+    summary = dict(latest.summary) if scope_matches_saved_scan else {
+        "exchange": "NSE",
+        "universe": str(universe_meta["universe_summary"]),
+        "symbols_requested": len(constituents),
+        "symbols_processed": 0,
+        "stocks_with_ready_signature": 0,
+        "latest_market_date": "",
+        "lookback_months": lookback_months,
+        "requested_as_of_date": as_of_date,
+        "selected_universes": list(universe_meta["selected_universes"]),
+        "custom_symbols": str(universe_meta["custom_symbols"]),
+        "universe_label": str(universe_meta["universe_label"]),
+    }
+    stock_stats = latest.stock_stats.copy()
+    if not scope_matches_saved_scan:
+        stock_stats = pd.DataFrame()
+    if stock_stats.empty and not constituents.empty:
+        stock_stats = constituents.rename(columns={"Symbol": "symbol", "Company Name": "name", "Industry": "industry"}).copy()
+        stock_stats["exchange"] = "NSE"
+        stock_stats["data_status"] = "NOT_RUN"
+    if not stock_stats.empty:
+        if "symbol" not in stock_stats.columns and "Symbol" in stock_stats.columns:
+            stock_stats["symbol"] = stock_stats["Symbol"]
+        if "name" not in stock_stats.columns and "Company Name" in stock_stats.columns:
+            stock_stats["name"] = stock_stats["Company Name"]
+        if "industry" not in stock_stats.columns and "Industry" in stock_stats.columns:
+            stock_stats["industry"] = stock_stats["Industry"]
+        stock_stats["symbol"] = stock_stats["symbol"].astype(str).str.upper().str.strip()
+        stock_stats["exchange"] = stock_stats.get("exchange", pd.Series("NSE", index=stock_stats.index)).astype(str).str.upper()
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        if "historical_rank_score" in stock_stats.columns:
+            stock_stats["historical_rank_score"] = pd.to_numeric(stock_stats["historical_rank_score"], errors="coerce")
+            stock_stats = stock_stats.sort_values(["historical_rank_score", "symbol"], ascending=[False, True], na_position="last")
+        else:
+            stock_stats = stock_stats.sort_values("symbol")
+
+    selected_symbol = str(request.query_params.get("symbol", "")).strip().upper()
+    visible_symbols = stock_stats["symbol"].astype(str).str.upper().tolist() if not stock_stats.empty and "symbol" in stock_stats.columns else []
+    if selected_symbol and visible_symbols and selected_symbol not in visible_symbols:
+        selected_symbol = ""
+    if not selected_symbol and visible_symbols:
+        selected_symbol = visible_symbols[0]
+
+    chart_pack: dict[str, str] = {}
+    detail_summary: dict[str, Any] = {}
+    current_state: dict[str, Any] = {}
+    dma_summary = pd.DataFrame()
+    selected_row: dict[str, Any] = {}
+    chart_message = "Run the selected research universe scan, then choose a stock to inspect."
+    if selected_symbol:
+        daily = storage.load_candles("NSE", selected_symbol, "1D")
+        if daily.empty:
+            chart_message = f"No local daily candles found for NSE:{selected_symbol}."
+        else:
+            detail = run_stock_signature_study(
+                daily,
+                exchange="NSE",
+                symbol=selected_symbol,
+                pivot_order=pivot_order,
+                dma_touch_tolerance_pct=dma_touch_tolerance_pct,
+                lookback_months=lookback_months,
+                as_of_date=as_of_date,
+            )
+            chart_pack = build_stock_signature_chart_pack(detail)
+            detail_summary = detail.summary
+            current_state = detail.current
+            dma_summary = detail.dma_summary
+            chart_message = "" if chart_pack.get("structure") else "No structural pivots were found in the selected six-month window."
+        if not stock_stats.empty and "symbol" in stock_stats.columns:
+            selected_matches = stock_stats[stock_stats["symbol"].astype(str).str.upper() == selected_symbol]
+            if not selected_matches.empty:
+                selected_row = _records(selected_matches.head(1))[0]
+
+    ready_status = (
+        stock_stats.get("data_status", pd.Series("", index=stock_stats.index)).astype(str)
+        if not stock_stats.empty
+        else pd.Series(dtype=str)
+    )
+    top_research_candidates = stock_stats[ready_status == "READY"].head(3).copy() if not stock_stats.empty else pd.DataFrame()
+    stock_symbol_options = [{"value": symbol, "label": symbol} for symbol in visible_symbols]
+
+    return templates.TemplateResponse(
+        "stock_signature.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "top_research_candidates": _records(top_research_candidates),
+            "stock_search": stock_search,
+            "stock_symbol_options": stock_symbol_options,
+            "selected_symbol": selected_symbol,
+            "selected_row": selected_row,
+            "detail_summary": detail_summary,
+            "current_state": current_state,
+            "dma_summary": _records(dma_summary),
+            "chart_pack": chart_pack,
+            "chart_message": chart_message,
+            "as_of_date": as_of_date,
+            "pivot_order": pivot_order,
+            "dma_touch_tolerance_pct": dma_touch_tolerance_pct,
+            "lookback_months": lookback_months,
+            "selected_universes": list(universe_meta["selected_universes"]),
+            "universe_options": _stock_signature_universe_options(universe_meta["selected_universes"]),
+            "custom_symbols": str(universe_meta["custom_symbols"]),
+            "universe_label": str(universe_meta["universe_label"]),
+            "missing_universes": list(universe_meta["missing_universes"]),
+            "constituents_available": not constituents.empty and not universe_meta["missing_universes"],
+            "constituents_count": len(constituents),
+            "constituent_source_url": ", ".join(universe_meta["source_urls"]),
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", "") or universe_error,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/stock-signature/run")
+async def run_stock_signature_from_dashboard(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
+    raw_custom_symbols = str(form.get("custom_symbols", "")).strip()
+    try:
+        custom_symbols = ",".join(_parse_stock_signature_custom_symbols(raw_custom_symbols))
+    except ValueError as exc:
+        redirect_url = f"/stock-signature?study_error={quote(str(exc)[:500])}"
+        if dashboard_token:
+            redirect_url += f"&token={quote(dashboard_token)}"
+        return RedirectResponse(redirect_url, status_code=303)
+    run_scope = str(form.get("run_scope", "selected")).strip().lower()
+    selected_universes = [] if run_scope == "custom_only" else _stock_signature_selected_universes(
+        form.getlist("universe"),
+        custom_symbols=custom_symbols,
+    )
+    if run_scope == "custom_only" and not custom_symbols:
+        redirect_url = "/stock-signature?study_error=Enter%20at%20least%20one%20custom%20stock%20symbol%20for%20a%20custom-only%20scan."
+        if dashboard_token:
+            redirect_url += f"&token={quote(dashboard_token)}"
+        return RedirectResponse(redirect_url, status_code=303)
+    try:
+        pivot_order = max(int(str(form.get("pivot_order", STOCK_SIGNATURE_DEFAULT_PIVOT_ORDER)).strip() or STOCK_SIGNATURE_DEFAULT_PIVOT_ORDER), 1)
+    except (TypeError, ValueError):
+        pivot_order = STOCK_SIGNATURE_DEFAULT_PIVOT_ORDER
+    try:
+        dma_touch_tolerance_pct = max(float(str(form.get("dma_touch_tolerance_pct", STOCK_SIGNATURE_DEFAULT_DMA_TOUCH_TOLERANCE)).strip() or STOCK_SIGNATURE_DEFAULT_DMA_TOUCH_TOLERANCE), 0.0)
+    except (TypeError, ValueError):
+        dma_touch_tolerance_pct = STOCK_SIGNATURE_DEFAULT_DMA_TOUCH_TOLERANCE
+    try:
+        lookback_months = min(
+            max(int(str(form.get("lookback_months", STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS)).strip() or STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS), 1),
+            STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS,
+        )
+    except (TypeError, ValueError):
+        lookback_months = STOCK_SIGNATURE_DEFAULT_LOOKBACK_MONTHS
+
+    params = [
+        f"pivot_order={pivot_order}",
+        f"dma_touch_tolerance_pct={quote(str(dma_touch_tolerance_pct))}",
+        f"lookback_months={lookback_months}",
+    ]
+    for universe in selected_universes:
+        params.append(f"universe={quote(universe)}")
+    if custom_symbols:
+        params.append(f"custom_symbols={quote(custom_symbols)}")
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _submit_scan_job(
+            job_id,
+            "Stock Signature",
+            _run_stock_signature_job,
+            data_root,
+            query_suffix,
+            pivot_order,
+            dma_touch_tolerance_pct,
+            lookback_months,
+            as_of_date,
+            selected_universes,
+            custom_symbols,
+        )
+        redirect_url = f"/stock-signature?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/stock-signature?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/drawdown-recovery", response_class=HTMLResponse)
+def drawdown_recovery_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    latest = load_drawdown_recovery_outputs(_drawdown_recovery_dir(data_root))
+    stock_search = request.query_params.get("stock_search", "").strip()
+    universe_values = request.query_params.getlist("universe")
+    custom_symbols_param = request.query_params.get("custom_symbols")
+    if custom_symbols_param is not None:
+        custom_symbols = str(custom_symbols_param or "").strip()
+    elif universe_values:
+        custom_symbols = ""
+    else:
+        custom_symbols = str(latest.summary.get("custom_symbols", "") or "").strip()
+    if not universe_values:
+        saved_universes = latest.summary.get("selected_universes", "")
+        if isinstance(saved_universes, list):
+            universe_values = saved_universes
+        elif str(saved_universes or "").strip():
+            universe_values = re.split(r"[\s,;]+", str(saved_universes))
+    selected_universes = _stock_signature_selected_universes(universe_values, custom_symbols=custom_symbols)
+    universe_error = ""
+    try:
+        constituents, universe_meta = _build_stock_signature_universe(
+            data_root,
+            selected_universes,
+            custom_symbols,
+            allow_remote_fetch=False,
+        )
+    except ValueError as exc:
+        constituents = pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
+        universe_meta = {
+            "selected_universes": selected_universes,
+            "custom_symbols": custom_symbols,
+            "universe_label": _stock_signature_universe_label(selected_universes, custom_symbols),
+            "universe_summary": _stock_signature_universe_summary(selected_universes, custom_symbols),
+            "missing_universes": [],
+            "source_urls": [],
+            "source_files": [],
+        }
+        universe_error = str(exc)
+
+    as_of_date = _as_of_date_input(request, latest.summary)
+    history_months = _int_query_param(
+        request,
+        latest.summary,
+        "history_months",
+        DRAWDOWN_RECOVERY_DEFAULT_HISTORY_MONTHS,
+        minimum=6,
+        maximum=60,
+    )
+    prior_high_lookback_sessions = _int_query_param(
+        request,
+        latest.summary,
+        "prior_high_lookback_sessions",
+        DRAWDOWN_RECOVERY_DEFAULT_PRIOR_HIGH_LOOKBACK,
+        minimum=60,
+        maximum=900,
+    )
+    min_drawdown_floor_pct = _float_query_param(
+        request,
+        latest.summary,
+        "min_drawdown_floor_pct",
+        DRAWDOWN_RECOVERY_DEFAULT_MIN_DRAWDOWN,
+        minimum=5.0,
+        maximum=80.0,
+    )
+    target_recovery_pct = _float_query_param(
+        request,
+        latest.summary,
+        "target_recovery_pct",
+        DRAWDOWN_RECOVERY_DEFAULT_TARGET_RECOVERY,
+        minimum=1.0,
+        maximum=50.0,
+    )
+    dma_window = _int_query_param(
+        request,
+        latest.summary,
+        "dma_window",
+        DRAWDOWN_RECOVERY_DEFAULT_DMA_WINDOW,
+        minimum=20,
+        maximum=300,
+    )
+    min_volume_multiple = _float_query_param(
+        request,
+        latest.summary,
+        "min_volume_multiple",
+        DRAWDOWN_RECOVERY_DEFAULT_VOLUME_MULTIPLE,
+        minimum=0.0,
+        maximum=20.0,
+    )
+    min_dma_improvement_pct_points = _float_query_param(
+        request,
+        latest.summary,
+        "min_dma_improvement_pct_points",
+        DRAWDOWN_RECOVERY_DEFAULT_DMA_IMPROVEMENT,
+        minimum=0.0,
+        maximum=40.0,
+    )
+    max_current_age_sessions = _int_query_param(
+        request,
+        latest.summary,
+        "max_current_age_sessions",
+        DRAWDOWN_RECOVERY_DEFAULT_MAX_CURRENT_AGE,
+        minimum=5,
+        maximum=252,
+    )
+    trough_order = _int_query_param(
+        request,
+        latest.summary,
+        "trough_order",
+        DRAWDOWN_RECOVERY_DEFAULT_TROUGH_ORDER,
+        minimum=1,
+        maximum=15,
+    )
+    study_params = {
+        "history_months": history_months,
+        "prior_high_lookback_sessions": prior_high_lookback_sessions,
+        "min_drawdown_floor_pct": min_drawdown_floor_pct,
+        "target_recovery_pct": target_recovery_pct,
+        "dma_window": dma_window,
+        "min_volume_multiple": min_volume_multiple,
+        "min_dma_improvement_pct_points": min_dma_improvement_pct_points,
+        "max_current_age_sessions": max_current_age_sessions,
+        "trough_order": trough_order,
+        "requested_as_of_date": as_of_date,
+    }
+    scope_matches_saved_scan = _drawdown_recovery_saved_scope_matches(latest.summary, universe_meta, study_params)
+    summary = dict(latest.summary) if scope_matches_saved_scan else {
+        "exchange": "NSE",
+        "universe": str(universe_meta["universe_summary"]),
+        "symbols_requested": len(constituents),
+        "symbols_processed": 0,
+        "stocks_with_ready_history": 0,
+        "current_candidates": 0,
+        "historical_matching_events": 0,
+        "latest_market_date": "",
+        "history_months": history_months,
+        "prior_high_lookback_sessions": prior_high_lookback_sessions,
+        "min_drawdown_floor_pct": min_drawdown_floor_pct,
+        "target_recovery_pct": target_recovery_pct,
+        "dma_window": dma_window,
+        "min_volume_multiple": min_volume_multiple,
+        "min_dma_improvement_pct_points": min_dma_improvement_pct_points,
+        "max_current_age_sessions": max_current_age_sessions,
+        "trough_order": trough_order,
+        "requested_as_of_date": as_of_date,
+        "selected_universes": list(universe_meta["selected_universes"]),
+        "custom_symbols": str(universe_meta["custom_symbols"]),
+        "universe_label": str(universe_meta["universe_label"]),
+    }
+
+    stock_stats = latest.stock_stats.copy() if scope_matches_saved_scan else pd.DataFrame()
+    current_candidates = latest.current_candidates.copy() if scope_matches_saved_scan else pd.DataFrame()
+    historical_events = latest.events.copy() if scope_matches_saved_scan else pd.DataFrame()
+    if stock_stats.empty and not constituents.empty:
+        stock_stats = constituents.rename(columns={"Symbol": "symbol", "Company Name": "name", "Industry": "industry"}).copy()
+        stock_stats["exchange"] = "NSE"
+        stock_stats["data_status"] = "NOT_RUN"
+    for frame in (stock_stats, current_candidates, historical_events):
+        if not frame.empty and "symbol" in frame.columns:
+            frame["symbol"] = frame["symbol"].astype(str).str.upper().str.strip()
+    if stock_search:
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        current_candidates = _apply_stock_search(current_candidates, stock_search)
+        historical_events = _apply_stock_search(historical_events, stock_search)
+    if not stock_stats.empty:
+        sort_columns = [column for column in ("setup_score", "historical_success_rate", "symbol") if column in stock_stats.columns]
+        if sort_columns:
+            ascending = [False if column != "symbol" else True for column in sort_columns]
+            stock_stats = stock_stats.sort_values(sort_columns, ascending=ascending, na_position="last")
+    top_research_candidates = current_candidates.head(3).copy() if not current_candidates.empty else pd.DataFrame()
+
+    return templates.TemplateResponse(
+        "drawdown_recovery.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "stock_stats": _records(stock_stats),
+            "stock_stats_count": len(stock_stats),
+            "current_candidates": _records(current_candidates),
+            "top_research_candidates": _records(top_research_candidates),
+            "historical_events": _records(historical_events.head(250) if not historical_events.empty else historical_events),
+            "stock_search": stock_search,
+            "as_of_date": as_of_date,
+            "history_months": history_months,
+            "prior_high_lookback_sessions": prior_high_lookback_sessions,
+            "min_drawdown_floor_pct": min_drawdown_floor_pct,
+            "target_recovery_pct": target_recovery_pct,
+            "dma_window": dma_window,
+            "min_volume_multiple": min_volume_multiple,
+            "min_dma_improvement_pct_points": min_dma_improvement_pct_points,
+            "max_current_age_sessions": max_current_age_sessions,
+            "trough_order": trough_order,
+            "selected_universes": list(universe_meta["selected_universes"]),
+            "universe_options": _stock_signature_universe_options(universe_meta["selected_universes"]),
+            "custom_symbols": str(universe_meta["custom_symbols"]),
+            "universe_label": str(universe_meta["universe_label"]),
+            "missing_universes": list(universe_meta["missing_universes"]),
+            "constituents_count": len(constituents),
+            "constituent_source_url": ", ".join(universe_meta["source_urls"]),
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", "") or universe_error,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/drawdown-recovery/run")
+async def run_drawdown_recovery_from_dashboard(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    dashboard_token = str(form.get("token", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
+    raw_custom_symbols = str(form.get("custom_symbols", "")).strip()
+    try:
+        custom_symbols = ",".join(_parse_stock_signature_custom_symbols(raw_custom_symbols))
+    except ValueError as exc:
+        redirect_url = f"/drawdown-recovery?study_error={quote(str(exc)[:500])}"
+        if dashboard_token:
+            redirect_url += f"&token={quote(dashboard_token)}"
+        return RedirectResponse(redirect_url, status_code=303)
+
+    run_scope = str(form.get("run_scope", "selected")).strip().lower()
+    selected_universes = [] if run_scope == "custom_only" else _stock_signature_selected_universes(
+        form.getlist("universe"),
+        custom_symbols=custom_symbols,
+    )
+    if run_scope == "custom_only" and not custom_symbols:
+        redirect_url = "/drawdown-recovery?study_error=Enter%20at%20least%20one%20custom%20stock%20symbol%20for%20a%20custom-only%20scan."
+        if dashboard_token:
+            redirect_url += f"&token={quote(dashboard_token)}"
+        return RedirectResponse(redirect_url, status_code=303)
+
+    def form_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(form.get(key, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    def form_float(key: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(str(form.get(key, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    history_months = form_int("history_months", DRAWDOWN_RECOVERY_DEFAULT_HISTORY_MONTHS, 6, 60)
+    prior_high_lookback_sessions = form_int(
+        "prior_high_lookback_sessions",
+        DRAWDOWN_RECOVERY_DEFAULT_PRIOR_HIGH_LOOKBACK,
+        60,
+        900,
+    )
+    min_drawdown_floor_pct = form_float("min_drawdown_floor_pct", DRAWDOWN_RECOVERY_DEFAULT_MIN_DRAWDOWN, 5.0, 80.0)
+    target_recovery_pct = form_float("target_recovery_pct", DRAWDOWN_RECOVERY_DEFAULT_TARGET_RECOVERY, 1.0, 50.0)
+    dma_window = form_int("dma_window", DRAWDOWN_RECOVERY_DEFAULT_DMA_WINDOW, 20, 300)
+    min_volume_multiple = form_float("min_volume_multiple", DRAWDOWN_RECOVERY_DEFAULT_VOLUME_MULTIPLE, 0.0, 20.0)
+    min_dma_improvement_pct_points = form_float(
+        "min_dma_improvement_pct_points",
+        DRAWDOWN_RECOVERY_DEFAULT_DMA_IMPROVEMENT,
+        0.0,
+        40.0,
+    )
+    max_current_age_sessions = form_int("max_current_age_sessions", DRAWDOWN_RECOVERY_DEFAULT_MAX_CURRENT_AGE, 5, 252)
+    trough_order = form_int("trough_order", DRAWDOWN_RECOVERY_DEFAULT_TROUGH_ORDER, 1, 15)
+
+    params = [
+        f"history_months={history_months}",
+        f"prior_high_lookback_sessions={prior_high_lookback_sessions}",
+        f"min_drawdown_floor_pct={quote(str(min_drawdown_floor_pct))}",
+        f"target_recovery_pct={quote(str(target_recovery_pct))}",
+        f"dma_window={dma_window}",
+        f"min_volume_multiple={quote(str(min_volume_multiple))}",
+        f"min_dma_improvement_pct_points={quote(str(min_dma_improvement_pct_points))}",
+        f"max_current_age_sessions={max_current_age_sessions}",
+        f"trough_order={trough_order}",
+    ]
+    for universe in selected_universes:
+        params.append(f"universe={quote(universe)}")
+    if custom_symbols:
+        params.append(f"custom_symbols={quote(custom_symbols)}")
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _submit_scan_job(
+            job_id,
+            "Drawdown Recovery",
+            _run_drawdown_recovery_job,
+            data_root,
+            query_suffix,
+            history_months,
+            prior_high_lookback_sessions,
+            min_drawdown_floor_pct,
+            target_recovery_pct,
+            dma_window,
+            min_volume_multiple,
+            min_dma_improvement_pct_points,
+            max_current_age_sessions,
+            trough_order,
+            as_of_date,
+            selected_universes,
+            custom_symbols,
+        )
+        redirect_url = f"/drawdown-recovery?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/drawdown-recovery?study_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
 
 
@@ -6312,8 +8706,31 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
     targeted_latest = load_minervini_di_divergence_outputs(
         _minervini_di_divergence_targeted_dir(data_root)
     )
+    as_of_date = _as_of_date_input(request, latest.summary)
     stock_search = request.query_params.get("stock_search", "").strip()
     matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=True)
+    saved_require_fvg_bos = _truthy_param(
+        [latest.summary.get("require_fvg_bos")],
+        default=False,
+    )
+    require_fvg_bos = _truthy_param(
+        request.query_params.getlist("require_fvg_bos"),
+        default=saved_require_fvg_bos,
+    )
+    try:
+        structure_sensitivity = max(
+            int(latest.summary.get("structure_sensitivity", selected_sensitivity)),
+            1,
+        )
+    except (TypeError, ValueError):
+        structure_sensitivity = MINERVINI_DI_DEFAULT_STRUCTURE_SENSITIVITY
+    try:
+        fvg_lookback = max(
+            int(latest.summary.get("fvg_lookback", MINERVINI_DI_DEFAULT_FVG_LOOKBACK)),
+            1,
+        )
+    except (TypeError, ValueError):
+        fvg_lookback = MINERVINI_DI_DEFAULT_FVG_LOOKBACK
 
     try:
         adx_length = max(
@@ -6345,6 +8762,9 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
             "combined_pass",
             "di_divergence_pass",
             "minervini_threshold_pass",
+            "fvg_bos_pass",
+            "bullish_bos",
+            "latest_bullish_fvg",
             "is_latest_market_date",
         ):
             if column in targeted_stock_stats.columns:
@@ -6372,7 +8792,9 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
                 na_position="last",
             )
     targeted_summary = dict(targeted_latest.summary)
-    targeted_input_symbols = str(targeted_summary.get("requested_symbols_csv", "") or "")
+    targeted_input_symbols = ",".join(
+        _parse_nse_symbol_list(targeted_summary.get("requested_symbols_csv", ""))
+    )
 
     stock_stats = latest.stock_stats.copy()
     combined_stock_stats = pd.DataFrame()
@@ -6391,6 +8813,9 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
         divergence_mask = _truthy_series(
             stock_stats.get("di_divergence_pass", pd.Series(False, index=stock_stats.index))
         )
+        fvg_bos_mask = _truthy_series(
+            stock_stats.get("fvg_bos_pass", pd.Series(False, index=stock_stats.index))
+        )
         ready_mask = stock_stats.get("data_status", pd.Series("", index=stock_stats.index)).astype(str).eq("READY")
         current_date_mask = _truthy_series(
             stock_stats.get("is_latest_market_date", pd.Series(True, index=stock_stats.index))
@@ -6398,8 +8823,12 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
         minervini_mask = ready_mask & current_date_mask
         for column in score_columns:
             minervini_mask &= stock_stats[column] >= min_score
-        combined_mask = divergence_mask & minervini_mask & current_date_mask
+        di_minervini_mask = divergence_mask & minervini_mask & current_date_mask
+        combined_mask = di_minervini_mask
+        if require_fvg_bos:
+            combined_mask &= fvg_bos_mask
         stock_stats["minervini_threshold_pass"] = minervini_mask
+        stock_stats["di_minervini_pass"] = di_minervini_mask
         stock_stats["combined_pass"] = combined_mask
         pre_breakout_mask = _truthy_series(
             stock_stats.get("pre_breakout_pass", pd.Series(False, index=stock_stats.index))
@@ -6415,6 +8844,8 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
             )
         view_summary["di_divergence_matches"] = int((divergence_mask & current_date_mask).sum())
         view_summary["minervini_threshold_matches"] = int(minervini_mask.sum())
+        view_summary["di_minervini_matches"] = int(di_minervini_mask.sum())
+        view_summary["fvg_bos_matches"] = int((fvg_bos_mask & current_date_mask).sum())
         view_summary["combined_matches"] = int(combined_mask.sum())
         view_summary["pre_breakout_matches"] = int(pre_breakout_mask.sum())
         if matches_only:
@@ -6444,6 +8875,10 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
             "adx_length": adx_length,
             "divergence_days": divergence_days,
             "min_score": min_score,
+            "require_fvg_bos": require_fvg_bos,
+            "structure_sensitivity": structure_sensitivity,
+            "fvg_lookback": fvg_lookback,
+            "as_of_date": as_of_date,
             "targeted_summary": targeted_summary,
             "targeted_stock_stats": _records(targeted_qualified),
             "targeted_stock_symbols_csv": _comma_separated_symbols(targeted_qualified),
@@ -6464,13 +8899,13 @@ def minervini_di_divergence_page(request: Request) -> HTMLResponse:
 @app.post("/minervini-di-divergence/run")
 async def run_minervini_di_divergence_from_dashboard(
     request: Request,
-    background_tasks: BackgroundTasks,
 ) -> RedirectResponse:
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
     dashboard_token = str(form.get("token", "")).strip()
     sensitivity_text = str(form.get("sensitivity", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
     try:
         adx_length = max(int(str(form.get("adx_length", MINERVINI_DI_DEFAULT_ADX_LENGTH)).strip()), 2)
     except ValueError:
@@ -6484,6 +8919,15 @@ async def run_minervini_di_divergence_from_dashboard(
     except ValueError:
         min_score = MINERVINI_DI_DEFAULT_MIN_SCORE
     min_score = max(0.0, min(min_score, 100.0))
+    require_fvg_bos = _truthy_param(form.getlist("require_fvg_bos"), default=False)
+    structure_sensitivity = _parse_sensitivity_text(
+        sensitivity_text,
+        int(config.get("strategy", {}).get("sensitivity", MINERVINI_DI_DEFAULT_STRUCTURE_SENSITIVITY)),
+    ) or MINERVINI_DI_DEFAULT_STRUCTURE_SENSITIVITY
+    fvg_lookback = max(
+        int(config.get("strategy", {}).get("fvg_lookback", MINERVINI_DI_DEFAULT_FVG_LOOKBACK)),
+        1,
+    )
 
     params = [
         f"adx_length={adx_length}",
@@ -6491,6 +8935,10 @@ async def run_minervini_di_divergence_from_dashboard(
         f"min_score={quote(str(min_score))}",
         "matches_only=1",
     ]
+    if require_fvg_bos:
+        params.append("require_fvg_bos=1")
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
     if sensitivity_text:
@@ -6499,15 +8947,21 @@ async def run_minervini_di_divergence_from_dashboard(
 
     try:
         job_id = uuid4().hex
-        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
-        background_tasks.add_task(
-            _run_minervini_di_divergence_job,
+        _submit_scan_job(
             job_id,
+            "DI + Minervini",
+            _run_minervini_di_divergence_job,
             data_root,
             query_suffix,
             adx_length,
             divergence_days,
             min_score,
+            None,
+            False,
+            as_of_date,
+            require_fvg_bos,
+            structure_sensitivity,
+            fvg_lookback,
         )
         redirect_url = f"/minervini-di-divergence?study_job={job_id}{query_suffix}"
     except Exception as exc:
@@ -6518,13 +8972,13 @@ async def run_minervini_di_divergence_from_dashboard(
 @app.post("/minervini-di-divergence/run-targeted")
 async def run_targeted_minervini_di_divergence(
     request: Request,
-    background_tasks: BackgroundTasks,
 ) -> RedirectResponse:
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
     dashboard_token = str(form.get("token", "")).strip()
     sensitivity_text = str(form.get("sensitivity", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
     try:
         symbols = _parse_nse_symbol_list(form.get("target_symbols", ""))
         if not symbols:
@@ -6554,6 +9008,15 @@ async def run_targeted_minervini_di_divergence(
     except ValueError:
         min_score = MINERVINI_DI_DEFAULT_MIN_SCORE
     min_score = max(0.0, min(min_score, 100.0))
+    require_fvg_bos = _truthy_param(form.getlist("require_fvg_bos"), default=False)
+    structure_sensitivity = _parse_sensitivity_text(
+        sensitivity_text,
+        int(config.get("strategy", {}).get("sensitivity", MINERVINI_DI_DEFAULT_STRUCTURE_SENSITIVITY)),
+    ) or MINERVINI_DI_DEFAULT_STRUCTURE_SENSITIVITY
+    fvg_lookback = max(
+        int(config.get("strategy", {}).get("fvg_lookback", MINERVINI_DI_DEFAULT_FVG_LOOKBACK)),
+        1,
+    )
 
     params = [
         f"adx_length={adx_length}",
@@ -6561,6 +9024,10 @@ async def run_targeted_minervini_di_divergence(
         f"min_score={quote(str(min_score))}",
         "matches_only=1",
     ]
+    if require_fvg_bos:
+        params.append("require_fvg_bos=1")
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
     if sensitivity_text:
@@ -6568,10 +9035,10 @@ async def run_targeted_minervini_di_divergence(
     query_suffix = "&" + "&".join(params)
 
     job_id = uuid4().hex
-    _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=len(symbols), percent=0)
-    background_tasks.add_task(
-        _run_minervini_di_divergence_job,
+    _submit_scan_job(
         job_id,
+        "DI + Minervini",
+        _run_minervini_di_divergence_job,
         data_root,
         query_suffix,
         adx_length,
@@ -6579,6 +9046,10 @@ async def run_targeted_minervini_di_divergence(
         min_score,
         symbols,
         True,
+        as_of_date,
+        require_fvg_bos,
+        structure_sensitivity,
+        fvg_lookback,
     )
     return RedirectResponse(
         f"/minervini-di-divergence?targeted_job={job_id}{query_suffix}",
@@ -6601,6 +9072,7 @@ def knox_envelope_page(request: Request) -> HTMLResponse:
     latest = load_knox_envelope_outputs(_knox_envelope_dir(data_root))
     saved_logic_is_current = latest.summary.get("logic_version") == KNOX_ENVELOPE_LOGIC_VERSION
     summary = latest.summary if saved_logic_is_current else {}
+    as_of_date = _as_of_date_input(request, summary)
 
     def int_param(name: str, default: int, minimum: int = 1) -> int:
         try:
@@ -6754,6 +9226,7 @@ def knox_envelope_page(request: Request) -> HTMLResponse:
             "sharpe_lookback_days": sharpe_lookback_days,
             "annual_risk_free_rate_pct": annual_risk_free_rate_pct,
             "min_sharpe_ratio": min_sharpe_ratio,
+            "as_of_date": as_of_date,
             "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
             "study_error": request.query_params.get("study_error", ""),
@@ -6770,10 +9243,11 @@ def download_knox_envelope_pinescript() -> FileResponse:
 
 
 @app.post("/knox-envelope/run")
-async def run_knox_envelope_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+async def run_knox_envelope_from_dashboard(request: Request) -> RedirectResponse:
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
+    as_of_date = str(form.get("as_of_date", "")).strip()
 
     def form_int(name: str, default: int, minimum: int = 1) -> int:
         try:
@@ -6875,6 +9349,8 @@ async def run_knox_envelope_from_dashboard(request: Request, background_tasks: B
         f"min_sharpe_ratio={quote('' if min_sharpe_ratio is None else str(min_sharpe_ratio))}",
         "matches_only=1",
     ]
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
     if sensitivity_text:
@@ -6882,10 +9358,10 @@ async def run_knox_envelope_from_dashboard(request: Request, background_tasks: B
     query_suffix = "&" + "&".join(params)
 
     job_id = uuid4().hex
-    _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
-    background_tasks.add_task(
-        _run_knox_envelope_job,
+    _submit_scan_job(
         job_id,
+        "Knox + Envelope",
+        _run_knox_envelope_job,
         data_root,
         query_suffix,
         knox_lookback,
@@ -6907,6 +9383,7 @@ async def run_knox_envelope_from_dashboard(request: Request, background_tasks: B
         sharpe_lookback_days,
         annual_risk_free_rate_pct,
         min_sharpe_ratio,
+        as_of_date,
     )
     return RedirectResponse(f"/knox-envelope?study_job={job_id}{query_suffix}", status_code=303)
 
@@ -7161,6 +9638,7 @@ def adx_di_page(request: Request) -> HTMLResponse:
     data_root = get_data_root(config)
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     latest = load_adx_di_outputs(_adx_di_dir(data_root))
+    as_of_date = _as_of_date_input(request, latest.summary)
     stock_search = request.query_params.get("stock_search", "").strip()
     matches_only = _truthy_param(request.query_params.getlist("matches_only"), default=False)
     length = max(int(request.query_params.get("length", latest.summary.get("length", 14)) or 14), 2)
@@ -7400,6 +9878,10 @@ def adx_di_page(request: Request) -> HTMLResponse:
     selected_chart_symbol_display = _display_symbol(selected_chart_symbol)
     if selected_chart_symbol:
         daily = storage.load_candles("NSE", selected_chart_symbol, "1D")
+        chart_cutoff = pd.to_datetime(latest.summary.get("analysis_as_of_date"), errors="coerce")
+        if pd.notna(chart_cutoff) and not daily.empty:
+            daily_dates = pd.to_datetime(daily.get("date"), errors="coerce")
+            daily = daily[daily_dates.dt.normalize() <= pd.Timestamp(chart_cutoff).normalize()].copy()
         if daily.empty:
             chart_message = f"No local daily candles found for NSE:{selected_chart_symbol}."
         else:
@@ -7459,6 +9941,7 @@ def adx_di_page(request: Request) -> HTMLResponse:
             "require_obv_cross_filter": require_obv_cross_filter,
             "require_divergence_filter": require_divergence_filter,
             "require_support_filter": require_support_filter,
+            "as_of_date": as_of_date,
             "study_job": request.query_params.get("study_job", ""),
             "study_ran": request.query_params.get("study_ran", ""),
             "study_error": request.query_params.get("study_error", ""),
@@ -7478,13 +9961,14 @@ def adx_di_page(request: Request) -> HTMLResponse:
 
 
 @app.post("/adx-di/run")
-async def run_adx_di_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+async def run_adx_di_from_dashboard(request: Request) -> RedirectResponse:
     config = load_config()
     data_root = get_data_root(config)
     form = await request.form()
 
     dashboard_token = str(form.get("token", "")).strip()
     sensitivity_text = str(form.get("sensitivity", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
     length = max(int(str(form.get("length", "14")).strip() or "14"), 2)
     threshold = max(float(str(form.get("threshold", "20")).strip() or "20"), 0.0)
     cross_lookback_bars = max(int(str(form.get("cross_lookback_bars", "3")).strip() or "3"), 1)
@@ -7526,6 +10010,8 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
         f"atr_channel_ma_type={quote(atr_channel_ma_type)}",
         f"atr_lower1_proximity_pct={quote(str(atr_lower1_proximity_pct))}",
     ]
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
     if require_trend_filter:
         params.append("require_trend_filter=1")
     if require_volume_filter:
@@ -7552,10 +10038,10 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
 
     try:
         job_id = uuid4().hex
-        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
-        background_tasks.add_task(
-            _run_adx_di_job,
+        _submit_scan_job(
             job_id,
+            "ADX / DI",
+            _run_adx_di_job,
             data_root,
             query_suffix,
             length,
@@ -7572,6 +10058,7 @@ async def run_adx_di_from_dashboard(request: Request, background_tasks: Backgrou
             atr_channel_atr_length,
             atr_channel_ma_type,
             atr_lower1_proximity_pct,
+            as_of_date,
         )
         redirect_url = f"/adx-di?study_job={job_id}{query_suffix}"
     except Exception as exc:
@@ -7907,12 +10394,13 @@ def dashboard(request: Request) -> HTMLResponse:
     config = load_config()
     config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
+    as_of_date = str(request.query_params.get("as_of_date", "")).strip()
     common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
     storage = Storage(data_root)
     _ensure_market_cap_metadata(config, storage)
-    filtered = storage.load_signals("latest_filtered.csv")
-    raw = storage.load_signals("latest_raw_signals.csv")
-    scan_details = storage.load_signals("latest_scan_details.csv")
+    filtered = _filter_weekly_screener_stock_rows(storage.load_signals("latest_filtered.csv"))
+    raw = _filter_weekly_screener_stock_rows(storage.load_signals("latest_raw_signals.csv"))
+    scan_details = _filter_weekly_screener_stock_rows(storage.load_signals("latest_scan_details.csv"))
     metadata = _combined_symbol_metadata(config, storage)
     stock_search = request.query_params.get("stock_search", "").strip()
     selected_market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
@@ -7939,6 +10427,8 @@ def dashboard(request: Request) -> HTMLResponse:
     min_risk_reward_ratio = _optional_float(min_risk_reward_ratio_text)
     filter_link_suffix = _dashboard_link_suffix(request)
     active_filter_parts = []
+    if as_of_date:
+        active_filter_parts.append(f"As of: {as_of_date}")
     if stock_search:
         active_filter_parts.append(f"Search: {stock_search}")
     if selected_sensitivity != base_sensitivity:
@@ -7977,6 +10467,9 @@ def dashboard(request: Request) -> HTMLResponse:
     filtered = _enrich_with_symbol_metadata(filtered, metadata, "symbol")
     raw = _enrich_with_symbol_metadata(raw, metadata, "symbol")
     scan_details = _enrich_with_symbol_metadata(scan_details, metadata, "symbol")
+    filtered = _filter_weekly_screener_stock_rows(filtered)
+    raw = _filter_weekly_screener_stock_rows(raw)
+    scan_details = _filter_weekly_screener_stock_rows(scan_details)
     filtered = _enrich_with_latest_daily_close(filtered, scan_details, storage)
 
     filtered = _apply_market_cap_filters(filtered, min_market_cap, max_market_cap, selected_market_cap_bucket)
@@ -8102,6 +10595,10 @@ def dashboard(request: Request) -> HTMLResponse:
 
     if selected_exchange and selected_symbol:
         daily = storage.load_candles(selected_exchange, selected_symbol, "1D")
+        chart_cutoff = pd.to_datetime(as_of_date, errors="coerce")
+        if pd.notna(chart_cutoff) and not daily.empty:
+            daily_dates = pd.to_datetime(daily.get("date"), errors="coerce")
+            daily = daily[daily_dates.dt.normalize() <= pd.Timestamp(chart_cutoff).normalize()].copy()
         if daily.empty:
             chart_message = f"No local OHLC candles found for {selected_exchange}:{selected_symbol}. Update OHLC data first."
         else:
@@ -8147,6 +10644,7 @@ def dashboard(request: Request) -> HTMLResponse:
             "selected_symbol": selected_symbol or "",
             "stock_search": stock_search,
             "selected_sensitivity": selected_sensitivity,
+            "as_of_date": as_of_date,
             "default_sensitivity": base_sensitivity,
             "latest_summary": latest_summary,
             "latest_daily_summary": latest_daily_summary,
@@ -8177,6 +10675,7 @@ def dashboard(request: Request) -> HTMLResponse:
                 token=request.query_params.get("token", ""),
                 stock_search=stock_search,
                 sensitivity=str(selected_sensitivity),
+                as_of_date=as_of_date,
                 market_cap_bucket=selected_market_cap_bucket,
                 min_market_cap_cr=request.query_params.get("min_market_cap_cr", ""),
                 max_market_cap_cr=request.query_params.get("max_market_cap_cr", ""),
@@ -8187,6 +10686,7 @@ def dashboard(request: Request) -> HTMLResponse:
                 token=request.query_params.get("token", ""),
                 stock_search=stock_search,
                 sensitivity=str(selected_sensitivity),
+                as_of_date=as_of_date,
                 market_cap_bucket=selected_market_cap_bucket,
                 min_market_cap_cr=request.query_params.get("min_market_cap_cr", ""),
                 max_market_cap_cr=request.query_params.get("max_market_cap_cr", ""),
@@ -8214,6 +10714,10 @@ def dashboard(request: Request) -> HTMLResponse:
             "telegram_error": request.query_params.get("telegram_error", ""),
             "symbols_scanned": request.query_params.get("symbols_scanned", ""),
             "refresh_mode": request.query_params.get("refresh_mode", ""),
+            "verified_market_date": request.query_params.get("verified_market_date", ""),
+            "symbols_reused_fresh": request.query_params.get("symbols_reused_fresh", ""),
+            "symbols_fetched_from_kite": request.query_params.get("symbols_fetched_from_kite", ""),
+            "symbols_stale_excluded": request.query_params.get("symbols_stale_excluded", ""),
             "active_filter_summary": " · ".join(active_filter_parts),
             **common_filter_context,
         },
@@ -8229,7 +10733,7 @@ def scan_status(job_id: str) -> JSONResponse:
 
 
 @app.post("/run-screener")
-async def run_screener_from_dashboard(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+async def run_screener_from_dashboard(request: Request) -> RedirectResponse:
     config = load_config()
     data_root = get_data_root(config)
     storage = Storage(data_root)
@@ -8239,6 +10743,7 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
     dashboard_token = str(form.get("token", "")).strip()
     stock_search = str(form.get("stock_search", "")).strip()
     sensitivity_text = str(form.get("sensitivity", "")).strip()
+    as_of_date = str(form.get("as_of_date", "")).strip()
     market_cap_bucket = str(form.get("market_cap_bucket", "")).strip()
     min_market_cap_text = str(form.get("min_market_cap_cr", "")).strip()
     max_market_cap_text = str(form.get("max_market_cap_cr", "")).strip()
@@ -8262,6 +10767,8 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
     refresh_data = str(form.get("refresh_data", "0")).strip().lower() in {"1", "true", "on", "yes"}
 
     params = []
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
     if stock_search:
@@ -8319,9 +10826,25 @@ async def run_screener_from_dashboard(request: Request, background_tasks: Backgr
             sensitivity,
         )
         scan_config.setdefault("data", {})["skip_kite_fetch"] = not refresh_data
+        if as_of_date:
+            try:
+                parsed_as_of_date = pd.Timestamp(as_of_date).date()
+            except (TypeError, ValueError):
+                raise ValueError("As of date must be a valid date in YYYY-MM-DD format.") from None
+            if parsed_as_of_date > _latest_completed_nse_calendar_date():
+                raise ValueError("As of date cannot be after the latest completed NSE session.")
+            scan_config.setdefault("data", {})["analysis_as_of_date"] = parsed_as_of_date.isoformat()
+        else:
+            scan_config.setdefault("data", {}).pop("analysis_as_of_date", None)
         job_id = uuid4().hex
-        _set_scan_job(job_id, status="queued", phase="Queued", completed=0, total=0, percent=0)
-        background_tasks.add_task(_run_screener_job, job_id, scan_config, query_suffix)
+        _register_weekly_job(job_id)
+        _submit_scan_job(
+            job_id,
+            "Weekly BUY / SELL",
+            _run_screener_job,
+            scan_config,
+            query_suffix,
+        )
         redirect_url = f"/?scan_job={job_id}{query_suffix}"
     except Exception as exc:
         redirect_url = _scan_error_url(exc, query_suffix)

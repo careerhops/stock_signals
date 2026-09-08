@@ -11,6 +11,7 @@ from uuid import uuid4
 from stock_screener.adx_di_study import calculate_adx_di
 from stock_screener.data.storage import Storage
 from stock_screener.resample import resample_daily_to_weekly
+from stock_screener.stock_signature_study import StockSignatureStudyResult
 
 
 def _add_signal_highlight(fig: go.Figure, signal_date: pd.Timestamp, color: str) -> None:
@@ -833,6 +834,303 @@ def build_sector_mix_pie_chart(
         legend={"orientation": "h", "yanchor": "bottom", "y": -0.16, "xanchor": "left", "x": 0},
     )
     return fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
+
+
+def build_stock_signature_chart_pack(result: StockSignatureStudyResult) -> dict[str, str]:
+    return {
+        "structure": _build_stock_signature_structure_chart(result),
+        "rebound_distribution": _build_stock_signature_rebound_distribution(result),
+        "cycle_gains": _build_stock_signature_cycle_gains(result),
+        "hh_hl_cycles": _build_stock_signature_hh_hl_cycles(result),
+        "dma_boxplot": _build_stock_signature_dma_boxplot(result),
+        "dma_scatter": _build_stock_signature_dma_scatter(result),
+    }
+
+
+def _build_stock_signature_structure_chart(result: StockSignatureStudyResult, height: int = 560) -> str:
+    frame = result.daily.copy()
+    if frame.empty:
+        return ""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["close"],
+            mode="lines",
+            name="Close",
+            line={"color": "#111827", "width": 2.4},
+            hovertemplate="Date: %{x|%d %b %Y}<br>Close: %{y:.2f}<extra></extra>",
+        )
+    )
+    dma_colors = {75: "#2563eb", 100: "#d97706", 200: "#7c3aed"}
+    for dma in result.config.get("dma_windows", []):
+        column = f"dma_{dma}"
+        if column not in frame.columns or frame[column].dropna().empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=frame["date"],
+                y=frame[column],
+                mode="lines",
+                name=f"{dma} DMA",
+                line={"color": dma_colors.get(int(dma), "#64748b"), "width": 1.6, "dash": "dot"},
+                hovertemplate=f"{dma} DMA: %{{y:.2f}}<extra></extra>",
+            )
+        )
+
+    pivots = result.pivots.copy()
+    if not pivots.empty:
+        pivots["date"] = pd.to_datetime(pivots["date"], errors="coerce")
+        lows = pivots[pivots["type"] == "LOW"]
+        highs = pivots[pivots["type"] == "HIGH"]
+        if not lows.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=lows["date"],
+                    y=lows["price"],
+                    mode="markers+text",
+                    name="Swing lows",
+                    text=lows["structure"],
+                    textposition="bottom center",
+                    marker={"symbol": "triangle-up", "size": 12, "color": "#059669", "line": {"color": "#064e3b", "width": 1}},
+                    customdata=lows[["confirmation_date"]].astype(str),
+                    hovertemplate="Low %{text}<br>Date: %{x|%d %b %Y}<br>Price: %{y:.2f}<br>Confirmed: %{customdata[0]}<extra></extra>",
+                )
+            )
+        if not highs.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=highs["date"],
+                    y=highs["price"],
+                    mode="markers+text",
+                    name="Swing highs",
+                    text=highs["structure"],
+                    textposition="top center",
+                    marker={"symbol": "triangle-down", "size": 12, "color": "#dc2626", "line": {"color": "#7f1d1d", "width": 1}},
+                    customdata=highs[["confirmation_date"]].astype(str),
+                    hovertemplate="High %{text}<br>Date: %{x|%d %b %Y}<br>Price: %{y:.2f}<br>Confirmed: %{customdata[0]}<extra></extra>",
+                )
+            )
+
+    latest = frame.iloc[-1]
+    fig.add_trace(
+        go.Scatter(
+            x=[latest["date"]],
+            y=[latest["close"]],
+            mode="markers",
+            name="Latest close",
+            marker={"symbol": "circle", "size": 13, "color": "#0f172a", "line": {"color": "#ffffff", "width": 2}},
+            hovertemplate="Latest close<br>%{x|%d %b %Y}<br>%{y:.2f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=f"{result.exchange}:{result.symbol} six-month structure",
+        xaxis_title="Date",
+        yaxis_title="Price",
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        height=height,
+        margin={"l": 56, "r": 24, "t": 82, "b": 48},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)", tickformat=".2f")
+    return fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displaylogo": False, "responsive": True})
+
+
+def _build_stock_signature_rebound_distribution(result: StockSignatureStudyResult, height: int = 390) -> str:
+    legs = result.legs.copy()
+    if legs.empty or "jump_pct" not in legs.columns:
+        return ""
+    jump = pd.to_numeric(legs["jump_pct"], errors="coerce").dropna()
+    if jump.empty:
+        return ""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Histogram(
+            x=jump,
+            nbinsx=min(18, max(5, len(jump))),
+            marker={"color": "#2563eb", "line": {"color": "#ffffff", "width": 1}},
+            hovertemplate="Rebound: %{x:.2f}%<br>Count: %{y}<extra></extra>",
+        )
+    )
+    median = float(jump.median())
+    fig.add_vline(x=median, line_color="#111827", line_dash="dash", annotation_text=f"Median {median:.1f}%")
+    fig.update_layout(
+        title="Low to high rebound distribution",
+        xaxis_title="Rebound %",
+        yaxis_title="Count",
+        height=height,
+        margin={"l": 52, "r": 20, "t": 70, "b": 48},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=False,
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)", rangemode="tozero")
+    return fig.to_html(full_html=False, include_plotlyjs=False, config={"displaylogo": False, "responsive": True})
+
+
+def _build_stock_signature_cycle_gains(result: StockSignatureStudyResult, height: int = 390) -> str:
+    cycles = result.cycles.copy()
+    if cycles.empty or "low_to_peak_gain_pct" not in cycles.columns:
+        return ""
+    cycles["start_date"] = pd.to_datetime(cycles["start_date"], errors="coerce")
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=cycles["start_date"],
+            y=cycles["low_to_peak_gain_pct"],
+            mode="lines+markers",
+            name="Cycle gain",
+            line={"color": "#059669", "width": 2},
+            marker={"size": 8},
+            hovertemplate="Cycle start: %{x|%d %b %Y}<br>Low to peak: %{y:.2f}%<extra></extra>",
+        )
+    )
+    median = pd.to_numeric(cycles["low_to_peak_gain_pct"], errors="coerce").median()
+    if pd.notna(median):
+        fig.add_hline(y=float(median), line_color="#111827", line_dash="dash", annotation_text=f"Median {float(median):.1f}%")
+    fig.update_layout(
+        title="Completed bullish cycle gains",
+        xaxis_title="Cycle start",
+        yaxis_title="Low to peak %",
+        height=height,
+        margin={"l": 52, "r": 20, "t": 70, "b": 48},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    return fig.to_html(full_html=False, include_plotlyjs=False, config={"displaylogo": False, "responsive": True})
+
+
+def _build_stock_signature_hh_hl_cycles(result: StockSignatureStudyResult, height: int = 390) -> str:
+    cycles = result.cycles.copy()
+    if cycles.empty:
+        return ""
+    cycles["start_date"] = pd.to_datetime(cycles["start_date"], errors="coerce")
+    labels = cycles["start_date"].dt.strftime("%d %b")
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=cycles["higher_high_count"],
+            name="Higher highs",
+            marker={"color": "#2563eb"},
+            hovertemplate="Cycle %{x}<br>Higher highs: %{y}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=cycles["higher_low_count"],
+            name="Higher lows",
+            marker={"color": "#059669"},
+            hovertemplate="Cycle %{x}<br>Higher lows: %{y}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="HH vs HL count by completed cycle",
+        xaxis_title="Cycle start",
+        yaxis_title="Count",
+        barmode="group",
+        height=height,
+        margin={"l": 52, "r": 20, "t": 70, "b": 56},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)", rangemode="tozero")
+    return fig.to_html(full_html=False, include_plotlyjs=False, config={"displaylogo": False, "responsive": True})
+
+
+def _build_stock_signature_dma_boxplot(result: StockSignatureStudyResult, height: int = 390) -> str:
+    rebounds = result.dma_rebounds.copy()
+    if rebounds.empty:
+        return ""
+    fig = go.Figure()
+    nearest_dma = pd.to_numeric(rebounds["nearest_dma"], errors="coerce")
+    for dma in result.config.get("dma_windows", []):
+        rows = rebounds[nearest_dma == float(dma)]
+        values = pd.to_numeric(rows.get("jump_pct"), errors="coerce").dropna()
+        if values.empty:
+            continue
+        fig.add_trace(
+            go.Box(
+                y=values,
+                name=f"{dma} DMA",
+                boxmean=True,
+                hovertemplate=f"{dma} DMA<br>Rebound: %{{y:.2f}}%<extra></extra>",
+            )
+        )
+    if not fig.data:
+        return ""
+    fig.update_layout(
+        title="DMA rebound distribution",
+        xaxis_title="Nearest DMA at swing low",
+        yaxis_title="Low to high rebound %",
+        height=height,
+        margin={"l": 52, "r": 20, "t": 70, "b": 48},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        showlegend=False,
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    return fig.to_html(full_html=False, include_plotlyjs=False, config={"displaylogo": False, "responsive": True})
+
+
+def _build_stock_signature_dma_scatter(result: StockSignatureStudyResult, height: int = 390) -> str:
+    legs = result.legs.copy()
+    if legs.empty or "abs_nearest_dma_distance_pct" not in legs.columns:
+        return ""
+    legs["abs_nearest_dma_distance_pct"] = pd.to_numeric(legs["abs_nearest_dma_distance_pct"], errors="coerce")
+    legs["jump_pct"] = pd.to_numeric(legs["jump_pct"], errors="coerce")
+    legs = legs.dropna(subset=["abs_nearest_dma_distance_pct", "jump_pct"])
+    if legs.empty:
+        return ""
+    fig = go.Figure()
+    colors = {75: "#2563eb", 100: "#d97706", 200: "#7c3aed"}
+    for dma in sorted(legs["nearest_dma"].dropna().unique()):
+        rows = legs[legs["nearest_dma"] == dma]
+        try:
+            dma_int = int(float(dma))
+        except (TypeError, ValueError):
+            dma_int = 0
+        fig.add_trace(
+            go.Scatter(
+                x=rows["abs_nearest_dma_distance_pct"],
+                y=rows["jump_pct"],
+                mode="markers",
+                name=f"{dma_int} DMA" if dma_int else str(dma),
+                marker={"size": 10, "color": colors.get(dma_int, "#64748b"), "opacity": 0.78},
+                customdata=rows[["low_date", "high_date"]].astype(str),
+                hovertemplate=(
+                    "DMA distance: %{x:.2f}%<br>"
+                    "Rebound: %{y:.2f}%<br>"
+                    "Low: %{customdata[0]}<br>"
+                    "High: %{customdata[1]}<extra></extra>"
+                ),
+            )
+        )
+    tolerance = float(result.config.get("dma_touch_tolerance_pct", 0.0))
+    fig.add_vline(x=tolerance, line_color="#111827", line_dash="dash", annotation_text=f"DMA zone {tolerance:.1f}%")
+    fig.update_layout(
+        title="DMA distance vs subsequent rebound",
+        xaxis_title="Absolute distance from nearest DMA %",
+        yaxis_title="Low to high rebound %",
+        height=height,
+        margin={"l": 52, "r": 20, "t": 70, "b": 48},
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)", rangemode="tozero")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.8)")
+    return fig.to_html(full_html=False, include_plotlyjs=False, config={"displaylogo": False, "responsive": True})
 
 
 def latest_signal_summary(strategy_output: pd.DataFrame) -> dict[str, Any]:

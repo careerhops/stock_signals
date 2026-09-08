@@ -19,6 +19,8 @@ from stock_screener.weekly_buy_tracker_study import _emit_progress, _load_name_m
 DEFAULT_ADX_LENGTH = 14
 DEFAULT_DIVERGENCE_DAYS = 2
 DEFAULT_MIN_SCORE = 70.0
+DEFAULT_STRUCTURE_SENSITIVITY = 3
+DEFAULT_FVG_LOOKBACK = 5
 
 
 @dataclass(frozen=True)
@@ -35,10 +37,21 @@ def run_minervini_di_divergence_study(
     adx_length: int = DEFAULT_ADX_LENGTH,
     divergence_days: int = DEFAULT_DIVERGENCE_DAYS,
     min_score: float = DEFAULT_MIN_SCORE,
+    require_fvg_bos: bool = False,
+    structure_sensitivity: int = DEFAULT_STRUCTURE_SENSITIVITY,
+    fvg_lookback: int = DEFAULT_FVG_LOOKBACK,
     benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
+    as_of_date: Any | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> MinerviniDiDivergenceStudyResult:
-    benchmark = _prepare_benchmark(storage.load_candles("NSE_INDEX", benchmark_symbol, "1D"))
+    cutoff = pd.to_datetime(as_of_date, errors="coerce") if as_of_date is not None else pd.NaT
+    benchmark_source = storage.load_candles("NSE_INDEX", benchmark_symbol, "1D")
+    if pd.notna(cutoff) and not benchmark_source.empty:
+        benchmark_dates = pd.to_datetime(benchmark_source.get("date"), errors="coerce")
+        benchmark_source = benchmark_source[
+            benchmark_dates.dt.normalize() <= pd.Timestamp(cutoff).normalize()
+        ].copy()
+    benchmark = _prepare_benchmark(benchmark_source)
     if benchmark.empty:
         raise RuntimeError(
             f"{benchmark_symbol} daily candles are unavailable. Refresh Kite data and run the scan again."
@@ -63,7 +76,13 @@ def run_minervini_di_divergence_study(
     name_map = _load_name_map(storage, exchange)
     rows: list[dict[str, Any]] = []
     short_history_count = 0
-    minimum_history = max(253, int(adx_length) * 3, int(divergence_days) + 2)
+    minimum_history = max(
+        253,
+        int(adx_length) * 3,
+        int(divergence_days) + 2,
+        int(structure_sensitivity) + 2,
+        int(fvg_lookback) + 2,
+    )
 
     _emit_progress(
         progress_callback,
@@ -76,6 +95,11 @@ def run_minervini_di_divergence_study(
 
     for index, symbol in enumerate(all_symbols, start=1):
         daily = storage.load_candles(exchange, symbol, "1D")
+        if pd.notna(cutoff) and not daily.empty:
+            daily_dates = pd.to_datetime(daily.get("date"), errors="coerce")
+            daily = daily[
+                daily_dates.dt.normalize() <= pd.Timestamp(cutoff).normalize()
+            ].copy()
         _emit_progress(
             progress_callback,
             phase="Scanning DI divergence and Minervini quality",
@@ -94,6 +118,11 @@ def run_minervini_di_divergence_study(
             continue
 
         divergence = evaluate_di_divergence(adx_frame, divergence_days=int(divergence_days))
+        structure_fvg = evaluate_bullish_fvg_bos(
+            daily,
+            sensitivity=int(structure_sensitivity),
+            fvg_lookback=int(fvg_lookback),
+        )
         quality = evaluate_minervini_quality(daily, benchmark, score_threshold=float(min_score))
         minervini_threshold_pass = bool(
             quality.get("data_status") == "READY"
@@ -101,7 +130,13 @@ def run_minervini_di_divergence_study(
             and _score_at_least(quality.get("setup_quality_score"), min_score)
             and _score_at_least(quality.get("entry_quality_score"), min_score)
         )
-        combined_pass = bool(divergence["di_divergence_pass"] and minervini_threshold_pass)
+        di_minervini_pass = bool(
+            divergence["di_divergence_pass"] and minervini_threshold_pass
+        )
+        combined_pass = bool(
+            di_minervini_pass
+            and (not require_fvg_bos or structure_fvg["fvg_bos_pass"])
+        )
         pre_breakout_pass = _passes_pre_breakout_watchlist(divergence, quality)
         rows.append(
             {
@@ -113,6 +148,7 @@ def run_minervini_di_divergence_study(
                 "latest_52w_high": quality.get("latest_52w_high"),
                 "distance_below_52w_high_pct": quality.get("distance_below_52w_high_pct"),
                 **divergence,
+                **structure_fvg,
                 "stock_quality_score": quality.get("stock_quality_score"),
                 "stock_quality_grade": quality.get("stock_quality_grade", ""),
                 "setup_quality_score": quality.get("setup_quality_score"),
@@ -120,6 +156,7 @@ def run_minervini_di_divergence_study(
                 "entry_quality_score": quality.get("entry_quality_score"),
                 "entry_quality_grade": quality.get("entry_quality_grade", ""),
                 "minervini_threshold_pass": minervini_threshold_pass,
+                "di_minervini_pass": di_minervini_pass,
                 "combined_pass": combined_pass,
                 "pre_breakout_pass": pre_breakout_pass,
                 "data_status": quality.get("data_status", ""),
@@ -150,6 +187,10 @@ def run_minervini_di_divergence_study(
             stock_stats["combined_pass"].fillna(False).astype(bool)
             & stock_stats["is_latest_market_date"]
         )
+        stock_stats["di_minervini_pass"] = (
+            stock_stats["di_minervini_pass"].fillna(False).astype(bool)
+            & stock_stats["is_latest_market_date"]
+        )
         stock_stats["pre_breakout_pass"] = (
             stock_stats["pre_breakout_pass"].fillna(False).astype(bool)
             & stock_stats["is_latest_market_date"]
@@ -166,6 +207,8 @@ def run_minervini_di_divergence_study(
             "di_minus_2d_ago",
             "latest_di_spread",
             "spread_change_2d",
+            "latest_structure_upper",
+            "bullish_fvg_recent_count",
             "stock_quality_score",
             "setup_quality_score",
             "entry_quality_score",
@@ -187,13 +230,14 @@ def run_minervini_di_divergence_study(
             [
                 "pre_breakout_pass",
                 "combined_pass",
+                "fvg_bos_pass",
                 "spread_change_2d",
                 "entry_quality_score",
                 "setup_quality_score",
                 "stock_quality_score",
                 "symbol",
             ],
-            ascending=[False, False, False, False, False, False, True],
+            ascending=[False, False, False, False, False, False, False, True],
             na_position="last",
         ).reset_index(drop=True)
 
@@ -206,6 +250,8 @@ def run_minervini_di_divergence_study(
     pre_breakout_matches = int(stock_stats["pre_breakout_pass"].fillna(False).astype(bool).sum()) if not stock_stats.empty else 0
     divergence_matches = int((stock_stats["di_divergence_pass"].fillna(False).astype(bool) & current_date_mask).sum()) if not stock_stats.empty else 0
     quality_matches = int((stock_stats["minervini_threshold_pass"].fillna(False).astype(bool) & current_date_mask).sum()) if not stock_stats.empty else 0
+    di_minervini_matches = int(stock_stats["di_minervini_pass"].fillna(False).astype(bool).sum()) if not stock_stats.empty else 0
+    fvg_bos_matches = int((stock_stats["fvg_bos_pass"].fillna(False).astype(bool) & current_date_mask).sum()) if not stock_stats.empty else 0
     latest_dates = pd.to_datetime(stock_stats.get("latest_date", pd.Series(dtype="object")), errors="coerce").dropna()
     summary = {
         "exchange": exchange,
@@ -215,17 +261,72 @@ def run_minervini_di_divergence_study(
         "stale_stock_dates": int((~current_date_mask).sum()) if not stock_stats.empty else 0,
         "di_divergence_matches": divergence_matches,
         "minervini_threshold_matches": quality_matches,
+        "di_minervini_matches": di_minervini_matches,
+        "fvg_bos_matches": fvg_bos_matches,
         "combined_matches": combined_matches,
         "pre_breakout_matches": pre_breakout_matches,
         "adx_length": int(adx_length),
         "divergence_days": int(divergence_days),
         "min_score": float(min_score),
+        "require_fvg_bos": bool(require_fvg_bos),
+        "structure_sensitivity": int(structure_sensitivity),
+        "fvg_lookback": int(fvg_lookback),
+        "analysis_as_of_date": benchmark.iloc[-1]["date"].strftime("%Y-%m-%d"),
         "benchmark_symbol": benchmark_symbol,
         "benchmark_latest_date": benchmark.iloc[-1]["date"].strftime("%Y-%m-%d"),
         "latest_stock_date": latest_dates.max().strftime("%Y-%m-%d") if not latest_dates.empty else "",
         "generated_at_ist": pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S IST"),
     }
     return MinerviniDiDivergenceStudyResult(summary=summary, stock_stats=stock_stats)
+
+
+def evaluate_bullish_fvg_bos(
+    candles: pd.DataFrame,
+    *,
+    sensitivity: int = DEFAULT_STRUCTURE_SENSITIVITY,
+    fvg_lookback: int = DEFAULT_FVG_LOOKBACK,
+) -> dict[str, Any]:
+    """Evaluate the latest daily bar using the Weekly BUY/SELL FVG and BOS rules."""
+
+    sensitivity = max(int(sensitivity), 1)
+    fvg_lookback = max(int(fvg_lookback), 1)
+    frame = candles.copy()
+    for column in ("date", "high", "low", "close"):
+        if column not in frame.columns:
+            return _empty_fvg_bos(sensitivity, fvg_lookback)
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    for column in ("high", "low", "close"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["date", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
+    if len(frame) < max(sensitivity + 1, 3):
+        return _empty_fvg_bos(sensitivity, fvg_lookback)
+
+    upper_level = frame["high"].shift(1).rolling(
+        sensitivity,
+        min_periods=sensitivity,
+    ).max()
+    bull_break = (
+        (frame["close"] > upper_level)
+        & (frame["close"].shift(1) <= upper_level.shift(1))
+    ).fillna(False)
+    fvg_bull = (frame["low"] > frame["high"].shift(2)).fillna(False)
+    fvg_bull_recent = fvg_bull.astype(float).rolling(
+        fvg_lookback,
+        min_periods=1,
+    ).sum()
+    latest = frame.iloc[-1]
+    latest_bos = bool(bull_break.iloc[-1])
+    recent_fvg_count = float(fvg_bull_recent.iloc[-1])
+    return {
+        "fvg_bos_pass": bool(latest_bos and recent_fvg_count > 0),
+        "bullish_bos": latest_bos,
+        "latest_bullish_fvg": bool(fvg_bull.iloc[-1]),
+        "bullish_fvg_recent_count": recent_fvg_count,
+        "latest_structure_upper": _to_float(upper_level.iloc[-1]),
+        "structure_sensitivity": sensitivity,
+        "fvg_lookback": fvg_lookback,
+        "structure_event_date": latest["date"].strftime("%Y-%m-%d"),
+    }
 
 
 def evaluate_di_divergence(adx_frame: pd.DataFrame, *, divergence_days: int = DEFAULT_DIVERGENCE_DAYS) -> dict[str, Any]:
@@ -361,4 +462,17 @@ def _empty_divergence(days: int) -> dict[str, Any]:
         "di_plus_2d_ago": None,
         "di_minus_1d_ago": None,
         "di_minus_2d_ago": None,
+    }
+
+
+def _empty_fvg_bos(sensitivity: int, fvg_lookback: int) -> dict[str, Any]:
+    return {
+        "fvg_bos_pass": False,
+        "bullish_bos": False,
+        "latest_bullish_fvg": False,
+        "bullish_fvg_recent_count": 0.0,
+        "latest_structure_upper": None,
+        "structure_sensitivity": int(sensitivity),
+        "fvg_lookback": int(fvg_lookback),
+        "structure_event_date": "",
     }

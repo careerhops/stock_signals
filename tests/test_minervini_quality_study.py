@@ -90,6 +90,24 @@ class MinerviniQualityStudyTests(unittest.TestCase):
         self.assertFalse(bool(stale["quality_pass"]))
         self.assertEqual(int(result.summary["stale_stock_dates"]), 1)
 
+    def test_scan_clips_stock_and_benchmark_to_as_of_date(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            stock, benchmark = self._quality_frames()
+            cutoff = pd.Timestamp(stock.iloc[-5]["date"])
+            storage.save_candles("NSE", "QUALITY", stock, "1D")
+            storage.save_candles("NSE_INDEX", "NIFTY 500", benchmark, "1D")
+
+            result = run_minervini_quality_study(
+                storage,
+                symbols=["QUALITY"],
+                as_of_date=cutoff,
+            )
+
+        self.assertEqual(result.summary["analysis_as_of_date"], cutoff.strftime("%Y-%m-%d"))
+        self.assertEqual(result.summary["benchmark_latest_date"], cutoff.strftime("%Y-%m-%d"))
+        self.assertEqual(result.stock_stats.iloc[0]["latest_date"], cutoff.strftime("%Y-%m-%d"))
+
     def test_page_renders_qualified_results(self) -> None:
         with TemporaryDirectory() as temp_dir:
             data_root = Path(temp_dir)
@@ -151,6 +169,7 @@ class MinerviniQualityStudyTests(unittest.TestCase):
         self.assertIn("QUALITY", response.text)
         self.assertNotIn(">FAIL<", response.text)
         self.assertIn("Run Minervini Quality Scan", response.text)
+        self.assertIn('name="as_of_date"', response.text)
         self.assertIn("Below 52W High %", response.text)
         self.assertIn("6.25", response.text)
 

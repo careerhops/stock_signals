@@ -31,6 +31,11 @@
         <small>Use 1 for only the latest completed candle. Higher values intentionally keep older matches in the list.</small>
       </label>
       <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+        <small>Leave blank for the latest completed NSE session.</small>
+      </label>
+      <label>
         Knoxville Direction
         <select name="signal_direction">
           <option value="bullish" {% if signal_direction == "bullish" %}selected{% endif %}>Bullish</option>
@@ -110,7 +115,7 @@
         </label>
         <label>
           Annual Risk-Free Rate %
-          <input type="number" name="annual_risk_free_rate_pct" min="-99.99" step="0.1" value="{{ annual_risk_free_rate_pct }}">
+          <input type="number" name="annual_risk_free_rate_pct" min="-99.99" step="0.01" value="{{ annual_risk_free_rate_pct }}">
         </label>
         <label>
           Minimum Sharpe Ratio
@@ -186,14 +191,18 @@
   <section class="stats-grid">
     <article class="stat-card"><span>Matching Stocks</span><strong>{{ stock_stats_count }}</strong></article>
     <article class="stat-card"><span>Fresh Universe</span><strong>{{ summary.get("refresh_current_count", summary.get("symbols_processed", 0)) }}</strong></article>
+    <article class="stat-card"><span>Analysis Through</span><strong>{{ summary.get("analysis_as_of_date", summary.get("latest_date", "-")) or "-" }}</strong></article>
     <article class="stat-card"><span>Latest Stock Date</span><strong>{{ summary.get("latest_date", "-") }}</strong></article>
     <article class="stat-card"><span>Refresh Coverage</span><strong>{% if summary.get("refresh_coverage_pct") is not none %}{{ summary.get("refresh_coverage_pct", 0)|number }}%{% else %}-{% endif %}</strong></article>
+    <article class="stat-card"><span>Saved OHLC Reused</span><strong>{{ summary.get("refresh_reused_count", 0) }}</strong></article>
+    <article class="stat-card"><span>Fetched From Kite</span><strong>{{ summary.get("refresh_fetched_count", 0) }}</strong></article>
   </section>
 
   <section class="panel">
     <form method="get" action="/knox-envelope" class="filter-panel compact-form">
       {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
       <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
       <input type="hidden" name="matches_only" value="0">
       <label>
         Search stock

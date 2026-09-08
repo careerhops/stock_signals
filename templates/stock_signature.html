@@ -1,0 +1,285 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">EQUITY RESEARCH SIGNATURE</p>
+      <h1>Six-month structural signature scan</h1>
+      <p class="lede">Downloads the selected {{ lookback_months }}-month daily OHLC window for {{ universe_label }}, then ranks confirmed pivots, low-to-high rebounds, and DMA reaction history.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/stock-signature/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="lookback_months" value="{{ lookback_months }}">
+      <div class="filter-fieldset">
+        <span>Research universe</span>
+        <div class="inline-choice-row">
+          {% for option in universe_options %}
+            <label class="inline-checkbox">
+              <input type="checkbox" name="universe" value="{{ option.value }}" {% if option.selected %}checked{% endif %}>
+              {{ option.label }}
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+      <label>
+        Pivot order
+        <input type="number" name="pivot_order" min="1" max="10" value="{{ pivot_order }}">
+      </label>
+      <label>
+        DMA touch zone %
+        <input type="number" name="dma_touch_tolerance_pct" min="0" max="15" step="0.1" value="{{ dma_touch_tolerance_pct }}">
+      </label>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+      </label>
+      <label class="wide-field">
+        Custom stocks
+        <textarea name="custom_symbols" rows="3" placeholder="RELIANCE, HDFCBANK, INFY">{{ custom_symbols }}</textarea>
+        <small>Optional comma-separated NSE symbols. They are combined with the selected index universes.</small>
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit" name="run_scope" value="selected">Download 6M + Run Research Scan</button>
+        <button class="button secondary" type="submit" name="run_scope" value="custom_only">Run Custom List Only</button>
+      </div>
+    </form>
+
+    {% if missing_universes %}
+      <p class="status error">Constituent lists not cached locally: {{ missing_universes|join(", ") }}. The run button will try the official NSE Indices CSV.</p>
+    {% endif %}
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Research signature scan completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="stock-signature-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="stock-signature-progress-title">Stock signature scan is queued</strong>
+          <span id="stock-signature-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="stock-signature-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="stock-signature-progress-detail">Preparing selected research universe...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("stock-signature-progress");
+          if (!box) return;
+          const title = document.getElementById("stock-signature-progress-title");
+          const percent = document.getElementById("stock-signature-progress-percent");
+          const fill = document.getElementById("stock-signature-progress-fill");
+          const detail = document.getElementById("stock-signature-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`, { cache: "no-store" });
+              const status = await response.json();
+              if (!response.ok) throw new Error(status.error || "Status unavailable");
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "Stock signature scan is queued" : (status.phase || "Stock signature scan is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              const completed = Number(status.completed || 0);
+              const total = Number(status.total || 0);
+              const current = status.current_symbol ? `: ${status.current_symbol}` : "";
+              detail.textContent = `${status.phase || "Running"} · ${completed}/${total}${current}`;
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/stock-signature";
+                return;
+              }
+              window.setTimeout(poll, 1200);
+            } catch (error) {
+              title.textContent = "Stock signature status unavailable";
+              detail.textContent = "Refresh this page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 700);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Universe</span><strong>{{ universe_label }}</strong></article>
+    <article class="stat-card"><span>Symbols</span><strong>{{ constituents_count }}</strong></article>
+    <article class="stat-card"><span>Rows Visible</span><strong>{{ stock_stats_count }}</strong></article>
+    <article class="stat-card"><span>Processed</span><strong>{{ summary.get("symbols_processed", 0) }}</strong></article>
+    <article class="stat-card"><span>Ready Signatures</span><strong>{{ summary.get("stocks_with_ready_signature", 0) }}</strong></article>
+    <article class="stat-card"><span>Latest Market Date</span><strong>{{ summary.get("latest_market_date", "-") or "-" }}</strong></article>
+    <article class="stat-card"><span>Window</span><strong>{{ lookback_months }} months</strong></article>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Top 3 research candidates</h2>
+      <p>Sorted by the six-month historical rank score. Treat this as a research shortlist, not an investment recommendation.</p>
+    </div>
+    <div class="signature-candidate-grid">
+      {% for row in top_research_candidates %}
+        <article class="signature-candidate">
+          <div>
+            <span class="badge buy">#{{ row.get("rank", loop.index)|number(0) }}</span>
+            <h3>{{ row.get("symbol", "") }}</h3>
+            <p>{{ row.get("name", "") }}</p>
+          </div>
+          <dl>
+            <div><dt>Score</dt><dd>{{ row.get("historical_rank_score", "")|number(1) }}</dd></div>
+            <div><dt>Median rebound</dt><dd>{{ row.get("median_low_to_high_jump_pct", "")|number(1) }}%</dd></div>
+            <div><dt>Current rebound</dt><dd>{{ row.get("rebound_from_last_low_pct", "")|number(1) }}%</dd></div>
+            <div><dt>Nearest DMA</dt><dd>{{ row.get("nearest_dma", "") }}</dd></div>
+          </dl>
+          <a class="table-link" href="/stock-signature?symbol={{ row.get("symbol", "")|urlencode }}&pivot_order={{ pivot_order }}&dma_touch_tolerance_pct={{ dma_touch_tolerance_pct }}&lookback_months={{ lookback_months }}{% for universe in selected_universes %}&universe={{ universe|urlencode }}{% endfor %}{% if custom_symbols %}&custom_symbols={{ custom_symbols|urlencode }}{% endif %}{% if as_of_date %}&as_of_date={{ as_of_date|urlencode }}{% endif %}{% if dashboard_token %}&token={{ dashboard_token|urlencode }}{% endif %}">Open charts</a>
+        </article>
+      {% else %}
+        <p class="empty">Download the six-month research universe and run the scan to produce the top 3 shortlist.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel signature-picker-panel">
+    <form method="get" action="/stock-signature" class="filter-panel compact-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="pivot_order" value="{{ pivot_order }}">
+      <input type="hidden" name="dma_touch_tolerance_pct" value="{{ dma_touch_tolerance_pct }}">
+      <input type="hidden" name="lookback_months" value="{{ lookback_months }}">
+      {% for universe in selected_universes %}<input type="hidden" name="universe" value="{{ universe }}">{% endfor %}
+      {% if custom_symbols %}<input type="hidden" name="custom_symbols" value="{{ custom_symbols }}">{% endif %}
+      {% if as_of_date %}<input type="hidden" name="as_of_date" value="{{ as_of_date }}">{% endif %}
+      <label>
+        Pick stock
+        <select name="symbol">
+          {% for option in stock_symbol_options %}
+            <option value="{{ option.value }}" {% if option.value == selected_symbol %}selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Show Charts</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="workspace-header signature-workspace-header">
+      <div>
+        <h2>NSE:{{ selected_symbol or "-" }}</h2>
+        <p>
+          Score {{ selected_row.get("historical_rank_score", "")|number(1) or "-" }}
+          · Median rebound {{ detail_summary.get("median_low_to_high_jump_pct", "")|number(1) or "-" }}%
+          · Latest close {{ current_state.get("latest_close", "")|number(2) or "-" }}
+        </p>
+      </div>
+      <div class="token-pill">Last {{ lookback_months }} months only</div>
+    </div>
+
+    {% if chart_message %}
+      <p class="empty">{{ chart_message }}</p>
+    {% endif %}
+
+    <section class="summary-grid signature-summary">
+      <div class="metric"><span>Confirmed pivots</span><strong>{{ detail_summary.get("confirmed_pivots", 0) }}</strong></div>
+      <div class="metric"><span>Low to high legs</span><strong>{{ detail_summary.get("swing_low_to_high_legs", 0) }}</strong></div>
+      <div class="metric"><span>Completed cycles</span><strong>{{ detail_summary.get("completed_bullish_cycles", 0) }}</strong></div>
+      <div class="metric"><span>Last pivot</span><strong>{{ current_state.get("last_confirmed_pivot_structure", "-") or "-" }}</strong></div>
+      <div class="metric"><span>Nearest DMA</span><strong>{{ current_state.get("nearest_dma", "-") or "-" }}</strong></div>
+      <div class="metric"><span>DMA distance</span><strong>{{ current_state.get("nearest_dma_distance_pct", "")|number(2) or "-" }}%</strong></div>
+      <div class="metric"><span>Rebound from low</span><strong>{{ current_state.get("rebound_from_last_low_pct", "")|number(2) or "-" }}%</strong></div>
+      <div class="metric"><span>Drawdown from high</span><strong>{{ current_state.get("drawdown_from_last_high_pct", "")|number(2) or "-" }}%</strong></div>
+    </section>
+
+    {% if chart_pack.get("structure") %}
+      <div class="chart-frame signature-chart-full">{{ chart_pack.get("structure")|safe }}</div>
+    {% endif %}
+
+    <div class="signature-chart-grid">
+      {% for key, title in [
+        ("rebound_distribution", "Rebound distribution"),
+        ("cycle_gains", "Cycle gains"),
+        ("hh_hl_cycles", "HH / HL by cycle"),
+        ("dma_boxplot", "DMA rebound boxplot"),
+        ("dma_scatter", "DMA distance vs rebound")
+      ] %}
+        <div class="chart-frame">
+          {% if chart_pack.get(key) %}
+            {{ chart_pack.get(key)|safe }}
+          {% else %}
+            <p class="empty">{{ title }} needs more completed pivots in the six-month window.</p>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>DMA</th><th>Rebounds</th><th>Median Jump %</th><th>Mean Jump %</th><th>P25 %</th><th>P75 %</th><th>Median Sessions</th></tr>
+        </thead>
+        <tbody>
+          {% for row in dma_summary %}
+            <tr>
+              <td>{{ row.get("nearest_dma", "")|number(0) }}</td>
+              <td>{{ row.get("rebounds", "")|number(0) }}</td>
+              <td>{{ row.get("median_jump_pct", "")|number(2) }}</td>
+              <td>{{ row.get("mean_jump_pct", "")|number(2) }}</td>
+              <td>{{ row.get("p25_jump_pct", "")|number(2) }}</td>
+              <td>{{ row.get("p75_jump_pct", "")|number(2) }}</td>
+              <td>{{ row.get("median_sessions_to_high", "")|number(1) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7">No DMA-zone rebound samples in this six-month window.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Ranked equity signatures</h2>
+      <p>Ranked output from the saved {{ universe_label }} scan. Rows with stale or insufficient six-month structure remain visible for audit.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Symbol</th><th>Name</th><th>Industry</th><th>Source</th><th>Status</th><th>Score</th><th>Median Rebound %</th><th>P75 Rebound %</th>
+            <th>Current Rebound %</th><th>Nearest DMA</th><th>DMA Dist %</th><th>Best DMA</th><th>Legs</th><th>Cycles</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr class="{% if row.get("symbol", "") == selected_symbol %}selected-row{% endif %}">
+              <td>{{ row.get("rank", "")|number(0) }}</td>
+              <td><a class="table-link" href="/stock-signature?symbol={{ row.get("symbol", "")|urlencode }}&stock_search={{ stock_search|urlencode }}&pivot_order={{ pivot_order }}&dma_touch_tolerance_pct={{ dma_touch_tolerance_pct }}&lookback_months={{ lookback_months }}{% for universe in selected_universes %}&universe={{ universe|urlencode }}{% endfor %}{% if custom_symbols %}&custom_symbols={{ custom_symbols|urlencode }}{% endif %}{% if as_of_date %}&as_of_date={{ as_of_date|urlencode }}{% endif %}{% if dashboard_token %}&token={{ dashboard_token|urlencode }}{% endif %}">{{ row.get("symbol", "") }}</a></td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("industry", "") }}</td>
+              <td>{{ row.get("source_universe", "") }}</td>
+              <td>{{ row.get("data_status", "") }}</td>
+              <td>{{ row.get("historical_rank_score", "")|number(1) }}</td>
+              <td>{{ row.get("median_low_to_high_jump_pct", "")|number(2) }}</td>
+              <td>{{ row.get("p75_low_to_high_jump_pct", "")|number(2) }}</td>
+              <td>{{ row.get("rebound_from_last_low_pct", "")|number(2) }}</td>
+              <td>{{ row.get("nearest_dma", "") }}</td>
+              <td>{{ row.get("nearest_dma_distance_pct", "")|number(2) }}</td>
+              <td>{{ row.get("best_dma", "") }}</td>
+              <td>{{ row.get("swing_low_to_high_legs", "")|number(0) }}</td>
+              <td>{{ row.get("completed_bullish_cycles", "")|number(0) }}</td>
+              <td>{{ row.get("rank_reason", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="16">Download the six-month research universe and run the scan to populate this table.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

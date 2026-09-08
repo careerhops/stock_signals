@@ -813,6 +813,30 @@ tbody tr:hover {
   margin: 0;
 }
 
+.scan-progress .scan-run-timer {
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.scan-run-timer strong,
+.run-duration-summary strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.run-duration-summary {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  margin-top: 18px;
+  padding: 14px 0 2px;
+}
+
 .filter-summary {
   color: var(--muted);
   font-weight: 700;

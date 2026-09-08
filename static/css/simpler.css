@@ -164,12 +164,32 @@
   gap: 4px;
 }
 .simple-ui .filter-panel input,
-.simple-ui .filter-panel select {
+.simple-ui .filter-panel select,
+.simple-ui .filter-panel textarea {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 6px 8px;
   font-size: 13px;
   background: #fff;
+}
+.simple-ui .filter-panel textarea {
+  min-height: 78px;
+  resize: vertical;
+}
+.simple-ui .filter-fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.simple-ui .inline-choice-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+.simple-ui .filter-panel .wide-field {
+  grid-column: 1 / -1;
 }
 .simple-ui .inline-checkbox {
   flex-direction: row;
@@ -278,4 +298,117 @@
 @media (max-width: 720px) {
   .simple-ui .topbar-row { flex-direction: column; align-items: flex-start; gap: 8px; }
   .simple-ui .topnav { width: 100%; overflow-x: auto; }
+}
+
+/* ------ Stock signature ------ */
+.simple-ui .stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 0 0 16px;
+}
+
+.simple-ui .stat-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px 16px;
+}
+
+.simple-ui .stat-card span,
+.simple-ui .stat-card strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.simple-ui .stat-card span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.simple-ui .stat-card strong {
+  margin-top: 7px;
+  color: var(--text);
+  font-size: 22px;
+}
+
+.simple-ui .signature-candidate-grid,
+.simple-ui .signature-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+}
+
+.simple-ui .signature-candidate {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px;
+}
+
+.simple-ui .signature-candidate h3 {
+  margin: 8px 0 2px;
+}
+
+.simple-ui .signature-candidate p {
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+.simple-ui .signature-candidate dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 0 0 12px;
+}
+
+.simple-ui .signature-candidate dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.simple-ui .signature-candidate dd {
+  margin: 2px 0 0;
+  font-weight: 600;
+}
+
+.simple-ui .signature-workspace-header {
+  margin: -16px -16px 16px;
+  border-radius: 8px 8px 0 0;
+}
+
+.simple-ui .signature-summary {
+  margin-bottom: 16px;
+}
+
+.simple-ui .signature-summary .metric {
+  padding: 14px;
+}
+
+.simple-ui .signature-summary .metric::before {
+  display: none;
+}
+
+.simple-ui .signature-summary .metric span {
+  font-size: 12px;
+}
+
+.simple-ui .signature-summary .metric strong {
+  font-size: 18px;
+}
+
+.simple-ui .signature-chart-full {
+  min-height: 560px;
+}
+
+.simple-ui .signature-chart-grid .chart-frame {
+  min-height: 390px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px;
+}
+
+.simple-ui tr.selected-row td {
+  background: var(--accent-soft);
 }

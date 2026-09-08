@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">75 / 100 / 200 DMA SUPPORT</p>
+      <h1>DMA pullback screener</h1>
+      <p class="lede">Finds stocks that recently touched a major daily moving average, recovered above it, and turned upward.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/dma-pullback/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        Touch lookback bars
+        <input type="number" name="touch_lookback_bars" min="1" value="{{ touch_lookback_bars }}">
+        <small>The DMA zone must have been touched within this many trading sessions.</small>
+      </label>
+      <label>
+        DMA zone proximity %
+        <input type="number" name="proximity_pct" min="0" max="25" step="0.1" value="{{ proximity_pct }}">
+        <small>A candle touch is accepted inside this band above or below the DMA.</small>
+      </label>
+      <label>
+        Maximum close above DMA %
+        <input type="number" name="max_distance_above_dma_pct" min="0" max="50" step="0.1" value="{{ max_distance_above_dma_pct }}">
+        <small>The latest close must be above, but no farther than this distance from, the matched DMA.</small>
+      </label>
+      <label class="inline-checkbox">
+        <input type="hidden" name="require_di_minervini" value="0">
+        <input type="checkbox" name="require_di_minervini" value="1" {% if require_di_minervini %}checked{% endif %}>
+        Apply DI+Minervini quality filter
+        <small>Requires rising DI+, falling DI-, DI+ above DI-, and all three Minervini quality scores at or above the minimum.</small>
+      </label>
+      <label>
+        DI / ADX length
+        <input type="number" name="adx_length" min="2" value="{{ adx_length }}">
+      </label>
+      <label>
+        DI divergence days
+        <input type="number" name="divergence_days" min="1" value="{{ divergence_days }}">
+      </label>
+      <label>
+        Minimum quality score
+        <input type="number" name="min_quality_score" min="0" max="100" step="1" value="{{ min_quality_score|number(0) }}">
+      </label>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+        <small>Leave blank for the latest completed NSE session.</small>
+      </label>
+      <div class="filter-actions"><button class="button" type="submit">Run DMA Pullback Scan</button></div>
+    </form>
+    <p class="status">The scan refreshes NSE daily candles from Kite. DI+Minervini is calculated only for raw DMA pullback matches when selected.</p>
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">DMA Pullback Scan completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="dma-pullback-progress" data-job-id="{{ study_job }}">
+        <div class="progress-header">
+          <strong id="dma-pullback-progress-title">DMA Pullback Scan is queued</strong>
+          <span id="dma-pullback-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="dma-pullback-progress-fill" style="width: 0%"></div></div>
+        <p id="dma-pullback-progress-detail">Preparing fresh NSE history...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("dma-pullback-progress");
+          if (!box) return;
+          const title = document.getElementById("dma-pullback-progress-title");
+          const percent = document.getElementById("dma-pullback-progress-percent");
+          const fill = document.getElementById("dma-pullback-progress-fill");
+          const detail = document.getElementById("dma-pullback-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`, { cache: "no-store" });
+              if (!response.ok) throw new Error("Status unavailable");
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "DMA Pullback Scan is queued" : (status.phase || "DMA Pullback Scan is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              const completed = Number(status.completed || 0);
+              const total = Number(status.total || 0);
+              const current = status.current_symbol ? `: ${status.current_symbol}` : "";
+              detail.textContent = `${status.phase || "Running"} · ${completed}/${total}${current}`;
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/dma-pullback";
+                return;
+              }
+              window.setTimeout(poll, 1200);
+            } catch (error) {
+              title.textContent = "DMA Pullback status unavailable";
+              detail.textContent = "Refresh this page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 700);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Qualified Stocks</span><strong>{{ summary.get("combined_matches", 0) }}</strong></article>
+    <article class="stat-card"><span>Raw DMA Pullbacks</span><strong>{{ summary.get("dma_pullback_matches", 0) }}</strong></article>
+    <article class="stat-card"><span>DI + Minervini Pass</span><strong>{{ summary.get("di_minervini_matches", 0) }}</strong></article>
+    <article class="stat-card"><span>Universe Scanned</span><strong>{{ summary.get("symbols_processed", 0) }}</strong></article>
+    <article class="stat-card"><span>Analysis Through</span><strong>{{ summary.get("analysis_as_of_date", "-") or "-" }}</strong></article>
+    <article class="stat-card"><span>Latest Stock Date</span><strong>{{ summary.get("latest_stock_date", "-") or "-" }}</strong></article>
+    <article class="stat-card"><span>Fresh OHLC Coverage</span><strong>{{ summary.get("refresh_coverage_pct", 0)|number }}%</strong></article>
+    <article class="stat-card"><span>Fetched From Kite</span><strong>{{ summary.get("refresh_fetched_count", 0) }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/dma-pullback" class="filter-panel compact-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="touch_lookback_bars" value="{{ touch_lookback_bars }}">
+      <input type="hidden" name="proximity_pct" value="{{ proximity_pct }}">
+      <input type="hidden" name="max_distance_above_dma_pct" value="{{ max_distance_above_dma_pct }}">
+      <input type="hidden" name="require_di_minervini" value="{{ 1 if require_di_minervini else 0 }}">
+      <input type="hidden" name="adx_length" value="{{ adx_length }}">
+      <input type="hidden" name="divergence_days" value="{{ divergence_days }}">
+      <input type="hidden" name="min_quality_score" value="{{ min_quality_score }}">
+      {% if as_of_date %}<input type="hidden" name="as_of_date" value="{{ as_of_date }}">{% endif %}
+      <label>Search stock<input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company"></label>
+      <label class="inline-checkbox"><input type="checkbox" name="matches_only" value="1" {% if matches_only %}checked{% endif %}>Qualified stocks only</label>
+      <div class="filter-actions"><button class="button secondary" type="submit">Apply Table Filter</button></div>
+    </form>
+
+    {% if stock_symbols_csv %}
+      <div class="copy-block">
+        <div class="copy-row">
+          <div><h2>Qualified symbols</h2><p>{{ stock_symbols_csv.split(',')|length }} stocks match the active scan.</p></div>
+          <button class="button secondary" type="button" data-copy-target="dma-pullback-symbols">Copy Symbols</button>
+        </div>
+        <textarea id="dma-pullback-symbols" readonly rows="4">{{ stock_symbols_csv }}</textarea>
+      </div>
+    {% endif %}
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Name</th><th>Date</th><th>CMP</th><th>Matched DMA</th><th>Latest Touch</th><th>Nearest Distance %</th>
+            <th>75 DMA</th><th>75 Dist %</th><th>100 DMA</th><th>100 Dist %</th><th>200 DMA</th><th>200 Dist %</th>
+            <th>Turned Up</th><th>DI+</th><th>DI-</th><th>DI Divergence</th><th>Stock Quality</th><th>Setup Quality</th><th>Entry Quality</th><th>Final Pass</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td><td>{{ row.get("name", "") }}</td><td>{{ row.get("latest_date", "") }}</td><td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("matched_dma", "") }}</td><td>{{ row.get("latest_touch_date", "") }}</td><td>{{ row.get("nearest_dma_distance_pct", "")|number }}</td>
+              <td>{{ row.get("dma_75", "")|number }}</td><td>{{ row.get("distance_to_75dma_pct", "")|number }}</td>
+              <td>{{ row.get("dma_100", "")|number }}</td><td>{{ row.get("distance_to_100dma_pct", "")|number }}</td>
+              <td>{{ row.get("dma_200", "")|number }}</td><td>{{ row.get("distance_to_200dma_pct", "")|number }}</td>
+              <td>{% if row.get("upward_turn") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("latest_di_plus", "")|number }}</td><td>{{ row.get("latest_di_minus", "")|number }}</td>
+              <td>{% if row.get("di_divergence_pass") %}<span class="badge buy">Pass</span>{% elif require_di_minervini %}Fail{% else %}-{% endif %}</td>
+              <td>{{ row.get("stock_quality_score", "")|number }}</td><td>{{ row.get("setup_quality_score", "")|number }}</td><td>{{ row.get("entry_quality_score", "")|number }}</td>
+              <td>{% if row.get("combined_pass") %}<span class="badge buy">Pass</span>{% else %}Fail{% endif %}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="21">Run the screener or broaden the DMA settings to find candidates.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const field = document.getElementById(button.dataset.copyTarget);
+        if (!field) return;
+        await navigator.clipboard.writeText(field.value);
+        button.textContent = "Copied";
+      });
+    });
+  </script>
+{% endblock %}

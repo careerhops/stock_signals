@@ -7,9 +7,19 @@ import unittest
 import pandas as pd
 
 from stock_screener.universe import build_universe
+from stock_screener.symbols import is_excluded_weekly_screener_instrument
 
 
 class UniverseTests(unittest.TestCase):
+    def test_weekly_screener_excludes_sme_and_etf_rows_without_dropping_hyphenated_stocks(self) -> None:
+        self.assertTrue(is_excluded_weekly_screener_instrument("ASLIND-SM", "ASL INDUSTRIES"))
+        self.assertTrue(is_excluded_weekly_screener_instrument("MANAV-ST", "MANAV INFRA"))
+        self.assertTrue(is_excluded_weekly_screener_instrument("FINIETF", "FINANCE ETF"))
+        self.assertTrue(is_excluded_weekly_screener_instrument("NIFTYBEES", "NIFTY ETF"))
+        self.assertTrue(is_excluded_weekly_screener_instrument("LIQUID", "MIRAEAMC - LIQUID FUND"))
+        self.assertFalse(is_excluded_weekly_screener_instrument("BAJAJ-AUTO", "BAJAJ AUTO"))
+        self.assertFalse(is_excluded_weekly_screener_instrument("3MINDIA", "3M INDIA"))
+
     def test_nse_series_suffix_matches_base_metadata_symbol(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             metadata_path = Path(directory) / "symbol_metadata.csv"

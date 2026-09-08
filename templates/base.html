@@ -27,6 +27,10 @@
         <a class="{% if request.url.path == '/knox-recovery' %}active{% endif %}" href="/knox-recovery{{ _qs }}">Knox Recovery</a>
         <a class="{% if request.url.path == '/minervini-quality' %}active{% endif %}" href="/minervini-quality{{ _qs }}">Minervini Quality</a>
         <a class="{% if request.url.path == '/minervini-di-divergence' %}active{% endif %}" href="/minervini-di-divergence{{ _qs }}">DI + Minervini</a>
+        <a class="{% if request.url.path == '/dma-pullback' %}active{% endif %}" href="/dma-pullback{{ _qs }}">DMA Pullback</a>
+        <a class="{% if request.url.path == '/stock-signature' %}active{% endif %}" href="/stock-signature{{ _qs }}">Stock Signature</a>
+        <a class="{% if request.url.path == '/drawdown-recovery' %}active{% endif %}" href="/drawdown-recovery{{ _qs }}">Drawdown Recovery</a>
+        <a class="{% if request.url.path == '/ohlcv-download' %}active{% endif %}" href="/ohlcv-download{{ _qs }}">OHLCV Download</a>
         <a class="{% if request.url.path == '/big-bull-deals' %}active{% endif %}" href="/big-bull-deals{{ _qs }}">Deals</a>
         <a class="{% if request.url.path == '/login' %}active{% endif %}" href="/login{{ _qs }}">Kite</a>
       </nav>
@@ -45,6 +49,9 @@
             <form action="{{ shared_filter_action | default(request.url.path) }}" method="get" class="filter-panel">
               {% if shared_token %}
                 <input type="hidden" name="token" value="{{ shared_token }}">
+              {% endif %}
+              {% if shared_as_of_date %}
+                <input type="hidden" name="as_of_date" value="{{ shared_as_of_date }}">
               {% endif %}
               <label>
                 Search
@@ -106,6 +113,13 @@
         </section>
       {% endif %}
       {% block content %}{% endblock %}
+      {% set run_seconds = request.query_params.get('run_seconds', '') %}
+      {% if run_seconds %}
+        <section class="run-duration-summary" data-run-seconds="{{ run_seconds }}" aria-live="polite">
+          <span>Last run time</span>
+          <strong data-run-duration-value>Calculating...</strong>
+        </section>
+      {% endif %}
     </div>
   </main>
   <script src="/static/js/table_sort.js"></script>
@@ -122,6 +136,72 @@
       sources.forEach((source) => {
         source.addEventListener("input", () => sync(source.value));
         source.addEventListener("change", () => sync(source.value));
+      });
+    });
+
+    document.addEventListener("DOMContentLoaded", () => {
+      const formatDuration = (value) => {
+        const totalSeconds = Math.max(0, Math.round(Number(value) || 0));
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        if (hours > 0) {
+          return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+        }
+        return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+      };
+
+      document.querySelectorAll("[data-run-seconds]").forEach((summary) => {
+        const value = summary.querySelector("[data-run-duration-value]");
+        if (value) value.textContent = formatDuration(summary.dataset.runSeconds);
+      });
+
+      document.querySelectorAll(".scan-progress[data-job-id]").forEach((progressBox) => {
+        const timer = document.createElement("p");
+        timer.className = "scan-run-timer";
+        timer.setAttribute("aria-live", "polite");
+        timer.innerHTML = 'Elapsed time <strong data-live-run-duration>0m 00s</strong>';
+        progressBox.appendChild(timer);
+        const value = timer.querySelector("[data-live-run-duration]");
+
+        let queuedAt = Date.now() / 1000;
+        let completed = false;
+
+        const refreshDisplay = () => {
+          if (!completed && value) {
+            value.textContent = formatDuration((Date.now() / 1000) - queuedAt);
+          }
+        };
+
+        const refreshStatus = async () => {
+          if (completed) return;
+          try {
+            const response = await fetch(`/scan-status/${progressBox.dataset.jobId}`, { cache: "no-store" });
+            if (response.ok) {
+              const status = await response.json();
+              queuedAt = Number(status.queued_at) || queuedAt;
+              if (status.status === "completed" || status.status === "failed") {
+                completed = true;
+                if (value) {
+                  value.textContent = formatDuration(
+                    status.elapsed_seconds ?? ((Date.now() / 1000) - queuedAt)
+                  );
+                }
+                return;
+              }
+            }
+          } catch (_error) {
+            // The page-specific progress poll remains responsible for status errors.
+          }
+          window.setTimeout(refreshStatus, 1000);
+        };
+
+        refreshDisplay();
+        const displayInterval = window.setInterval(() => {
+          refreshDisplay();
+          if (completed) window.clearInterval(displayInterval);
+        }, 1000);
+        refreshStatus();
       });
     });
   </script>

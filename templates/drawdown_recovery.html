@@ -1,0 +1,315 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">EQUITY RESEARCH RECOVERY</p>
+      <h1>Deep drawdown recovery scan</h1>
+      <p class="lede">Ranks stocks whose own historical drawdown threshold, recovery window, DMA-distance repair, and volume expansion resemble a major-fall recovery setup.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/drawdown-recovery/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <div class="filter-fieldset">
+        <span>Research universe</span>
+        <div class="inline-choice-row">
+          {% for option in universe_options %}
+            <label class="inline-checkbox">
+              <input type="checkbox" name="universe" value="{{ option.value }}" {% if option.selected %}checked{% endif %}>
+              {{ option.label }}
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+      </label>
+      <label>
+        History months
+        <input type="number" name="history_months" min="6" max="60" value="{{ history_months }}">
+      </label>
+      <label>
+        Prior-high lookback sessions
+        <input type="number" name="prior_high_lookback_sessions" min="60" max="900" value="{{ prior_high_lookback_sessions }}">
+      </label>
+      <label>
+        Minimum fall %
+        <input type="number" name="min_drawdown_floor_pct" min="5" max="80" step="0.1" value="{{ min_drawdown_floor_pct }}">
+      </label>
+      <label>
+        Target recovery %
+        <input type="number" name="target_recovery_pct" min="1" max="50" step="0.1" value="{{ target_recovery_pct }}">
+      </label>
+      <label>
+        DMA window
+        <input type="number" name="dma_window" min="20" max="300" value="{{ dma_window }}">
+      </label>
+      <label>
+        Minimum volume multiple
+        <input type="number" name="min_volume_multiple" min="0" max="20" step="0.1" value="{{ min_volume_multiple }}">
+      </label>
+      <label>
+        Minimum DMA improvement
+        <input type="number" name="min_dma_improvement_pct_points" min="0" max="40" step="0.1" value="{{ min_dma_improvement_pct_points }}">
+      </label>
+      <label>
+        Current age sessions
+        <input type="number" name="max_current_age_sessions" min="5" max="252" value="{{ max_current_age_sessions }}">
+      </label>
+      <label>
+        Trough order
+        <input type="number" name="trough_order" min="1" max="15" value="{{ trough_order }}">
+      </label>
+      <label class="wide-field">
+        Custom stocks
+        <textarea name="custom_symbols" rows="3" placeholder="OFSS, RELIANCE, HDFCBANK">{{ custom_symbols }}</textarea>
+        <small>Optional comma-separated NSE symbols. They are combined with the selected index universes.</small>
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit" name="run_scope" value="selected">Download History + Run Recovery Scan</button>
+        <button class="button secondary" type="submit" name="run_scope" value="custom_only">Run Custom List Only</button>
+      </div>
+    </form>
+
+    {% if missing_universes %}
+      <p class="status error">Constituent lists not cached locally: {{ missing_universes|join(", ") }}. The run button will try the official NSE Indices CSV.</p>
+    {% endif %}
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Drawdown recovery scan completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="drawdown-recovery-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="drawdown-recovery-progress-title">Drawdown recovery scan is queued</strong>
+          <span id="drawdown-recovery-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="drawdown-recovery-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="drawdown-recovery-progress-detail">Preparing selected research universe...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("drawdown-recovery-progress");
+          if (!box) return;
+          const title = document.getElementById("drawdown-recovery-progress-title");
+          const percent = document.getElementById("drawdown-recovery-progress-percent");
+          const fill = document.getElementById("drawdown-recovery-progress-fill");
+          const detail = document.getElementById("drawdown-recovery-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`, { cache: "no-store" });
+              const status = await response.json();
+              if (!response.ok) throw new Error(status.error || "Status unavailable");
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "Drawdown recovery scan is queued" : (status.phase || "Drawdown recovery scan is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              const completed = Number(status.completed || 0);
+              const total = Number(status.total || 0);
+              const current = status.current_symbol ? `: ${status.current_symbol}` : "";
+              detail.textContent = `${status.phase || "Running"} · ${completed}/${total}${current}`;
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/drawdown-recovery";
+                return;
+              }
+              window.setTimeout(poll, 1200);
+            } catch (error) {
+              title.textContent = "Drawdown recovery status unavailable";
+              detail.textContent = "Refresh this page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 700);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Universe</span><strong>{{ universe_label }}</strong></article>
+    <article class="stat-card"><span>Symbols</span><strong>{{ constituents_count }}</strong></article>
+    <article class="stat-card"><span>Rows Visible</span><strong>{{ stock_stats_count }}</strong></article>
+    <article class="stat-card"><span>Processed</span><strong>{{ summary.get("symbols_processed", 0) }}</strong></article>
+    <article class="stat-card"><span>Ready Histories</span><strong>{{ summary.get("stocks_with_ready_history", 0) }}</strong></article>
+    <article class="stat-card"><span>Current Candidates</span><strong>{{ summary.get("current_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Historical Matches</span><strong>{{ summary.get("historical_matching_events", 0) }}</strong></article>
+    <article class="stat-card"><span>Latest Market Date</span><strong>{{ summary.get("latest_market_date", "-") or "-" }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Top 3 research candidates</h2>
+      <p>Current candidates that passed the optimized fall, recovery, DMA improvement, and volume checks.</p>
+    </div>
+    <div class="signature-candidate-grid">
+      {% for row in top_research_candidates %}
+        <article class="signature-candidate">
+          <div>
+            <span class="badge buy">#{{ row.get("rank", loop.index)|number(0) }}</span>
+            <h3>{{ row.get("symbol", "") }}</h3>
+            <p>{{ row.get("name", "") }}</p>
+          </div>
+          <dl>
+            <div><dt>Score</dt><dd>{{ row.get("setup_score", "")|number(1) }}</dd></div>
+            <div><dt>Fall</dt><dd>{{ row.get("drawdown_abs_pct", "")|number(1) }}%</dd></div>
+            <div><dt>Recovery</dt><dd>{{ row.get("current_recovery_pct", "")|number(1) }}%</dd></div>
+            <div><dt>Volume</dt><dd>{{ row.get("max_volume_multiple_to_current", "")|number(1) }}x</dd></div>
+          </dl>
+        </article>
+      {% else %}
+        <p class="empty">Run the drawdown recovery scan to produce current candidates.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Current drawdown recovery candidates</h2>
+      <p>Rows that pass the current setup filter as of {{ as_of_date or summary.get("analysis_as_of_date", "-") or "-" }}.</p>
+    </div>
+    <form method="get" action="/drawdown-recovery" class="filter-panel compact-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      {% for universe in selected_universes %}<input type="hidden" name="universe" value="{{ universe }}">{% endfor %}
+      {% if custom_symbols %}<input type="hidden" name="custom_symbols" value="{{ custom_symbols }}">{% endif %}
+      {% if as_of_date %}<input type="hidden" name="as_of_date" value="{{ as_of_date }}">{% endif %}
+      <input type="hidden" name="history_months" value="{{ history_months }}">
+      <input type="hidden" name="prior_high_lookback_sessions" value="{{ prior_high_lookback_sessions }}">
+      <input type="hidden" name="min_drawdown_floor_pct" value="{{ min_drawdown_floor_pct }}">
+      <input type="hidden" name="target_recovery_pct" value="{{ target_recovery_pct }}">
+      <input type="hidden" name="dma_window" value="{{ dma_window }}">
+      <input type="hidden" name="min_volume_multiple" value="{{ min_volume_multiple }}">
+      <input type="hidden" name="min_dma_improvement_pct_points" value="{{ min_dma_improvement_pct_points }}">
+      <input type="hidden" name="max_current_age_sessions" value="{{ max_current_age_sessions }}">
+      <input type="hidden" name="trough_order" value="{{ trough_order }}">
+      <label>
+        Search stock
+        <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Filter</button>
+      </div>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Symbol</th><th>Name</th><th>Source</th><th>Score</th><th>Prior High</th><th>Low</th>
+            <th>Fall %</th><th>Fall Days</th><th>Opt X %</th><th>Opt Y</th><th>Recovery %</th><th>DMA Low %</th>
+            <th>DMA Now %</th><th>DMA Improve</th><th>Volume</th><th>Success Rate</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in current_candidates %}
+            <tr>
+              <td>{{ row.get("rank", loop.index)|number(0) }}</td>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("source_universe", "") }}</td>
+              <td>{{ row.get("setup_score", "")|number(1) }}</td>
+              <td>{{ row.get("prior_high_date", "") }}<br>{{ row.get("prior_high_price", "")|number(2) }}</td>
+              <td>{{ row.get("low_date", "") }}<br>{{ row.get("low_price", "")|number(2) }}</td>
+              <td>{{ row.get("drawdown_abs_pct", "")|number(2) }}</td>
+              <td>{{ row.get("fall_calendar_days", "")|number(0) }}</td>
+              <td>{{ row.get("optimized_drawdown_pct", "")|number(2) }}</td>
+              <td>{{ row.get("optimized_recovery_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("current_recovery_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_distance_at_low_pct", "")|number(2) }}</td>
+              <td>{{ row.get("current_dma_distance_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_improvement_current_pct_points", "")|number(2) }}</td>
+              <td>{{ row.get("max_volume_multiple_to_current", "")|number(2) }}x</td>
+              <td>{{ (row.get("historical_success_rate", 0) * 100)|number(1) }}%</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="17">No current candidates passed the full optimized recovery filter.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>All ranked stocks</h2>
+      <p>Audit table for every selected stock, including those that did not pass the current filter.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Symbol</th><th>Name</th><th>Industry</th><th>Source</th><th>Status</th><th>Score</th><th>Pass</th>
+            <th>Fall %</th><th>Opt X %</th><th>Opt Y</th><th>Recovery %</th><th>DMA Improve</th><th>Volume</th><th>Hist Events</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("rank", loop.index)|number(0) }}</td>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("industry", "") }}</td>
+              <td>{{ row.get("source_universe", "") }}</td>
+              <td>{{ row.get("data_status", "") }}</td>
+              <td>{{ row.get("setup_score", "")|number(1) }}</td>
+              <td>{% if row.get("candidate_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("drawdown_abs_pct", "")|number(2) }}</td>
+              <td>{{ row.get("optimized_drawdown_pct", "")|number(2) }}</td>
+              <td>{{ row.get("optimized_recovery_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("current_recovery_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_improvement_current_pct_points", "")|number(2) }}</td>
+              <td>{{ row.get("max_volume_multiple_to_current", "")|number(2) }}x</td>
+              <td>{{ row.get("historical_events", 0)|number(0) }}</td>
+              <td>{{ row.get("reason", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="16">Choose a universe and run the scan.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Historical matching events</h2>
+      <p>Past drawdown troughs that reached the target recovery, with DMA and volume context.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Name</th><th>High Date</th><th>Low Date</th><th>Fall %</th><th>Fall Days</th>
+            <th>Target Date</th><th>Sessions</th><th>DMA Low %</th><th>DMA Target %</th><th>DMA Improve</th><th>Volume</th><th>Pass</th><th>Score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in historical_events %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("prior_high_date", "") }}</td>
+              <td>{{ row.get("low_date", "") }}</td>
+              <td>{{ row.get("drawdown_abs_pct", "")|number(2) }}</td>
+              <td>{{ row.get("fall_calendar_days", "")|number(0) }}</td>
+              <td>{{ row.get("target_date", "") }}</td>
+              <td>{{ row.get("sessions_to_target", "")|number(0) }}</td>
+              <td>{{ row.get("dma_distance_at_low_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_distance_at_target_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_improvement_to_target_pct_points", "")|number(2) }}</td>
+              <td>{{ row.get("max_volume_multiple_90d", "")|number(2) }}x</td>
+              <td>{% if row.get("event_pass") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("event_match_score", "")|number(1) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="14">No historical events are available for the saved scan.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

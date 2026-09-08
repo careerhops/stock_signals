@@ -10,6 +10,10 @@ NSE_TRADED_ALLOWED_SUFFIXES = ("", "-SM", "-ST", "-BZ", "-IV", "-E1", "-P1", "-R
 _NSE_DEBT_LIKE_SYMBOL_RE = re.compile(
     r"-SG|-GB|-N[0-9A-Z]+$|-Y[0-9A-Z]+$|-Z[0-9A-Z]+$|-A[0-9A-Z]+$|-P[0-9A-Z]+$|-W$|-NV$|-YW$"
 )
+_WEEKLY_FUND_NAME_RE = re.compile(
+    r"\bETF\b|EXCHANGE[ -]TRADED FUND|AMC\s*-|\bGOLD FUND$",
+    re.IGNORECASE,
+)
 
 
 def has_nse_series_suffix(value: object, suffixes: tuple[str, ...] | list[str] = NSE_SERIES_SUFFIXES) -> bool:
@@ -23,6 +27,24 @@ def normalize_nse_symbol(value: object) -> str:
         if symbol.endswith(suffix):
             return symbol[: -len(suffix)]
     return symbol
+
+
+def is_excluded_weekly_screener_instrument(symbol: object, name: object = "") -> bool:
+    """Return whether a Kite NSE row is an SME series or ETF/fund unit."""
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_name = str(name or "").strip()
+    if not normalized_symbol:
+        return True
+    if normalized_symbol.endswith(("-SM", "-ST")):
+        return True
+    if (
+        "ETF" in normalized_symbol
+        or "NIFTY" in normalized_symbol
+        or "BEES" in normalized_symbol
+        or normalized_symbol.endswith("INAV")
+    ):
+        return True
+    return bool(_WEEKLY_FUND_NAME_RE.search(normalized_name))
 
 
 def nse_series_suffix(value: object) -> str:

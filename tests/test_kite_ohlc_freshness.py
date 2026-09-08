@@ -78,6 +78,82 @@ class KiteOhlcFreshnessTests(unittest.TestCase):
                         required_date=date(2026, 8, 17),
                     )
 
+    def test_refresh_reuses_persisted_current_candles_without_kite_history_calls(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            provider = _NoHistoricalCallsProvider()
+            storage.save_instruments(provider.instruments())
+            for symbol in ("CURRENT", "STALE"):
+                storage.save_candles(
+                    "NSE",
+                    symbol,
+                    pd.DataFrame(
+                        [
+                            {
+                                "date": "2026-08-17",
+                                "open": 100.0,
+                                "high": 105.0,
+                                "low": 99.0,
+                                "close": 103.0,
+                                "volume": 100_000.0,
+                            }
+                        ]
+                    ),
+                )
+            config = {
+                "data": {
+                    "history_years": 5,
+                    "readiness": {"minimum_symbols_updated_percent": 80},
+                }
+            }
+            with (
+                patch("stock_screener.web.main.load_access_token", return_value="token"),
+                patch("stock_screener.web.main.KiteDataProvider", return_value=provider),
+                patch("stock_screener.web.main.load_config", return_value=config),
+            ):
+                symbols, audit = _refresh_adx_di_candles(
+                    storage,
+                    required_date=date(2026, 8, 17),
+                )
+
+        self.assertEqual(symbols, ["CURRENT", "STALE"])
+        self.assertEqual(provider.historical_calls, 0)
+        self.assertEqual(audit["refresh_reused_count"], 2)
+        self.assertEqual(audit["refresh_fetched_count"], 0)
+
+    def test_second_screener_refresh_reuses_first_screener_download(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            provider = _CountingFreshProvider()
+            storage.save_instruments(provider.instruments())
+            config = {
+                "data": {
+                    "history_years": 5,
+                    "readiness": {"minimum_symbols_updated_percent": 100},
+                }
+            }
+            with (
+                patch("stock_screener.web.main.load_access_token", return_value="token"),
+                patch("stock_screener.web.main.KiteDataProvider", return_value=provider),
+                patch("stock_screener.web.main.load_config", return_value=config),
+            ):
+                first_symbols, first_audit = _refresh_adx_di_candles(
+                    storage,
+                    required_date=date(2026, 8, 17),
+                )
+                calls_after_first = provider.historical_calls
+                second_symbols, second_audit = _refresh_adx_di_candles(
+                    storage,
+                    required_date=date(2026, 8, 17),
+                )
+
+        self.assertEqual(first_symbols, ["CURRENT", "STALE"])
+        self.assertEqual(second_symbols, first_symbols)
+        self.assertEqual(first_audit["refresh_fetched_count"], 2)
+        self.assertEqual(second_audit["refresh_reused_count"], 2)
+        self.assertEqual(second_audit["refresh_fetched_count"], 0)
+        self.assertEqual(provider.historical_calls, calls_after_first)
+
     def test_trader_setup_refresh_backfills_ten_years_for_all_equity_symbols(self) -> None:
         with TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir))
@@ -178,6 +254,35 @@ class _AllFreshKiteProvider:
         self.calls.append((instrument_token, from_date, to_date))
         return pd.DataFrame(
             [{"date": to_date, "open": 100.0, "high": 105.0, "low": 99.0, "close": 103.0, "volume": 100_000.0}]
+        )
+
+
+class _NoHistoricalCallsProvider(_FakeKiteProvider):
+    def __init__(self) -> None:
+        self.historical_calls = 0
+
+    def daily_candles(self, instrument_token: int, from_date: date, to_date: date) -> pd.DataFrame:
+        self.historical_calls += 1
+        raise AssertionError("Fresh persisted candles must be reused without a Kite historical request.")
+
+
+class _CountingFreshProvider(_FakeKiteProvider):
+    def __init__(self) -> None:
+        self.historical_calls = 0
+
+    def daily_candles(self, instrument_token: int, from_date: date, to_date: date) -> pd.DataFrame:
+        self.historical_calls += 1
+        return pd.DataFrame(
+            [
+                {
+                    "date": to_date,
+                    "open": 100.0,
+                    "high": 105.0,
+                    "low": 99.0,
+                    "close": 103.0,
+                    "volume": 100_000.0,
+                }
+            ]
         )
 
 if __name__ == "__main__":

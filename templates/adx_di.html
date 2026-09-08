@@ -27,6 +27,11 @@
         Cross Lookback Bars
         <input type="number" name="cross_lookback_bars" min="1" value="{{ cross_lookback_bars }}">
       </label>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+        <small>Leave blank for the latest completed NSE session.</small>
+      </label>
       <div class="filter-actions">
         <button class="button" type="submit">Run DI+ / DI- Scan</button>
       </div>
@@ -122,12 +127,24 @@
       <strong>{{ summary.get("symbols_processed", 0) }}</strong>
     </article>
     <article class="stat-card">
+      <span>Analysis Through</span>
+      <strong>{{ summary.get("analysis_as_of_date", summary.get("latest_close_date", "-")) or "-" }}</strong>
+    </article>
+    <article class="stat-card">
       <span>Average Latest ADX</span>
       <strong>{% if avg_latest_adx is not none %}{{ avg_latest_adx|number }}{% else %}-{% endif %}</strong>
     </article>
     <article class="stat-card">
       <span>Highest Latest ADX</span>
       <strong>{% if max_latest_adx is not none %}{{ max_latest_adx|number }}{% else %}-{% endif %}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Saved OHLC Reused</span>
+      <strong>{{ summary.get("refresh_reused_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Fetched From Kite</span>
+      <strong>{{ summary.get("refresh_fetched_count", 0) }}</strong>
     </article>
   </section>
 
@@ -137,6 +154,7 @@
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
       <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
       <input type="hidden" name="length" value="{{ length }}">
       <input type="hidden" name="threshold" value="{{ threshold }}">
       <input type="hidden" name="cross_lookback_bars" value="{{ cross_lookback_bars }}">
@@ -326,6 +344,7 @@
         <input type="hidden" name="token" value="{{ dashboard_token }}">
       {% endif %}
       <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
       <input type="hidden" name="length" value="{{ length }}">
       <input type="hidden" name="threshold" value="{{ threshold }}">
       <input type="hidden" name="cross_lookback_bars" value="{{ cross_lookback_bars }}">

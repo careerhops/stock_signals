@@ -476,6 +476,7 @@ class KnoxEnvelopeStudyTests(unittest.TestCase):
 
         self.assertEqual(page.status_code, 200)
         self.assertIn("Daily reversal confluence", page.text)
+        self.assertIn('name="as_of_date"', page.text)
         self.assertIn('name="cmf_length"', page.text)
         self.assertIn('name="cmf_condition"', page.text)
         self.assertIn('name="confirmation_mode"', page.text)
@@ -483,6 +484,7 @@ class KnoxEnvelopeStudyTests(unittest.TestCase):
         self.assertIn('name="use_sharpe_filter"', page.text)
         self.assertIn('name="sharpe_lookback_days"', page.text)
         self.assertIn('name="annual_risk_free_rate_pct"', page.text)
+        self.assertIn('name="annual_risk_free_rate_pct" min="-99.99" step="0.01"', page.text)
         self.assertIn('name="min_sharpe_ratio"', page.text)
         self.assertIn("Sharpe Ratio", page.text)
         self.assertIn("Strong bullish close", page.text)
@@ -511,6 +513,7 @@ class KnoxEnvelopeStudyTests(unittest.TestCase):
                         "sharpe_lookback_days": "126",
                         "annual_risk_free_rate_pct": "6.5",
                         "min_sharpe_ratio": "0.75",
+                        "as_of_date": "2026-08-20",
                     },
                     follow_redirects=False,
                 )
@@ -523,7 +526,9 @@ class KnoxEnvelopeStudyTests(unittest.TestCase):
         self.assertIn("sharpe_lookback_days=126", response.headers["location"])
         self.assertIn("annual_risk_free_rate_pct=6.5", response.headers["location"])
         self.assertIn("min_sharpe_ratio=0.75", response.headers["location"])
+        self.assertIn("as_of_date=2026-08-20", response.headers["location"])
         run_job.assert_called_once()
+        self.assertEqual(run_job.call_args.args[-1], "2026-08-20")
 
 
 if __name__ == "__main__":

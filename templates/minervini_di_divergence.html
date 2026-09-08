@@ -5,7 +5,7 @@
     <div>
       <p class="eyebrow">DI strength and Minervini quality</p>
       <h1>DI divergence with quality confirmation</h1>
-      <p class="lede">DI+ must rise and DI- must fall across each of the latest {{ divergence_days }} daily transitions, with DI+ above DI-. Stock, setup, and entry quality must each be at least {{ min_score|number(0) }}.</p>
+      <p class="lede">DI+ must rise and DI- must fall across each of the latest {{ divergence_days }} daily transitions, with DI+ above DI-. Stock, setup, and entry quality must each be at least {{ min_score|number(0) }}{% if require_fvg_bos %}, with bullish FVG and BOS confirmation{% endif %}.</p>
     </div>
   </section>
 
@@ -26,6 +26,17 @@
       <label>
         Minimum Quality Score
         <input type="number" name="min_score" min="0" max="100" step="1" value="{{ min_score|number(0) }}">
+      </label>
+      <label class="inline-checkbox">
+        <input type="hidden" name="require_fvg_bos" value="0">
+        <input type="checkbox" name="require_fvg_bos" value="1" {% if require_fvg_bos %}checked{% endif %}>
+        Require bullish FVG + BOS
+        <small>Latest daily close must cross the previous {{ structure_sensitivity }}-bar structural ceiling, with a bullish FVG in the latest {{ fvg_lookback }} candles.</small>
+      </label>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+        <small>Leave blank for the latest completed NSE session.</small>
       </label>
       <div class="filter-actions">
         <button class="button" type="submit">Run DI + Minervini Scan</button>
@@ -109,8 +120,16 @@
       <strong>{{ summary.get("minervini_threshold_matches", 0) }}</strong>
     </article>
     <article class="stat-card">
+      <span>Bullish FVG + BOS</span>
+      <strong>{{ summary.get("fvg_bos_matches", 0) }}</strong>
+    </article>
+    <article class="stat-card">
       <span>Universe Scanned</span>
       <strong>{{ summary.get("symbols_processed", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Analysis Through</span>
+      <strong>{{ summary.get("analysis_as_of_date", summary.get("benchmark_latest_date", "-")) or "-" }}</strong>
     </article>
     <article class="stat-card">
       <span>Latest Stock Date</span>
@@ -139,6 +158,14 @@
     <article class="stat-card">
       <span>Stale / Failed</span>
       <strong>{{ summary.get("refresh_stale_count", 0) }} / {{ summary.get("refresh_failed_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Saved OHLC Reused</span>
+      <strong>{{ summary.get("refresh_reused_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Fetched From Kite</span>
+      <strong>{{ summary.get("refresh_fetched_count", 0) }}</strong>
     </article>
   </section>
 
@@ -237,6 +264,8 @@
       <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}">
       <input type="hidden" name="adx_length" value="{{ adx_length }}">
       <input type="hidden" name="divergence_days" value="{{ divergence_days }}">
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
+      {% if require_fvg_bos %}<input type="hidden" name="require_fvg_bos" value="1">{% endif %}
       <label>
         Search stock
         <input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company">
@@ -260,7 +289,7 @@
         <div class="copy-row">
           <div>
             <h3>Combined symbols</h3>
-            <p>DI divergence and all three quality thresholds passed.</p>
+            <p>DI divergence and all three quality thresholds passed{% if require_fvg_bos %}, with bullish FVG and BOS confirmation{% endif %}.</p>
           </div>
           <button class="button secondary" type="button" data-copy-target="minervini-di-symbols-csv">Copy Symbols</button>
         </div>
@@ -280,6 +309,10 @@
             <th>52W High</th>
             <th>Below 52W High %</th>
             <th>Combined Pass</th>
+            <th>FVG + BOS Pass</th>
+            <th>Bullish BOS</th>
+            <th>Bull FVG Count</th>
+            <th>Structure Ceiling</th>
             <th>DI Divergence</th>
             <th>DI+ Above DI-</th>
             <th>DI+ Rising</th>
@@ -316,6 +349,10 @@
               <td>{{ row.get("latest_52w_high", "")|number }}</td>
               <td>{{ row.get("distance_below_52w_high_pct", "")|number }}</td>
               <td>{% if row.get("combined_pass") %}<span class="badge buy">Yes</span>{% else %}<span class="badge hot">No</span>{% endif %}</td>
+              <td>{% if row.get("fvg_bos_pass") %}<span class="badge buy">Yes</span>{% else %}<span class="badge hot">No</span>{% endif %}</td>
+              <td>{% if row.get("bullish_bos") %}Yes{% else %}No{% endif %}</td>
+              <td>{{ row.get("bullish_fvg_recent_count", "")|number(0) }}</td>
+              <td>{{ row.get("latest_structure_upper", "")|number }}</td>
               <td>{% if row.get("di_divergence_pass") %}<span class="badge buy">Yes</span>{% else %}<span class="badge hot">No</span>{% endif %}</td>
               <td>{% if row.get("di_plus_above_di_minus") %}Yes{% else %}No{% endif %}</td>
               <td>{% if row.get("di_plus_rising_each_day") %}Yes{% else %}No{% endif %}</td>
@@ -358,10 +395,12 @@
       <input type="hidden" name="adx_length" value="{{ adx_length }}">
       <input type="hidden" name="divergence_days" value="{{ divergence_days }}">
       <input type="hidden" name="min_score" value="{{ min_score }}">
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
+      <input type="hidden" name="require_fvg_bos" value="{% if require_fvg_bos %}1{% else %}0{% endif %}">
       <label>
         NSE stock symbols
         <textarea name="target_symbols" rows="6" placeholder="RELIANCE, HDFCBANK, INFY">{{ targeted_input_symbols }}</textarea>
-        <small>Maximum 500 symbols. Current rules: DI / ADX {{ adx_length }}, divergence {{ divergence_days }} days, and all three quality scores ≥ {{ min_score|number(0) }}.</small>
+        <small>Maximum 500 symbols. Current rules: DI / ADX {{ adx_length }}, divergence {{ divergence_days }} days, all three quality scores ≥ {{ min_score|number(0) }}{% if require_fvg_bos %}, and bullish FVG + BOS{% endif %}.</small>
       </label>
       <div class="filter-actions">
         <button class="button" type="submit">Run Selected Stocks</button>
@@ -433,7 +472,7 @@
         <div class="copy-row">
           <div>
             <h3>Qualified selected symbols</h3>
-            <p>These stocks pass DI divergence and all three Minervini quality thresholds.</p>
+            <p>These stocks pass DI divergence and all three Minervini quality thresholds{% if require_fvg_bos %}, with bullish FVG and BOS confirmation{% endif %}.</p>
           </div>
           <button class="button secondary" type="button" data-copy-target="targeted-minervini-symbols">Copy Symbols</button>
         </div>
@@ -444,7 +483,7 @@
         <table>
           <thead>
             <tr>
-              <th>Symbol</th><th>Name</th><th>Date</th><th>CMP</th><th>DI+</th><th>DI-</th><th>Spread Change</th><th>Stock Quality</th><th>Setup Quality</th><th>Entry Quality</th>
+              <th>Symbol</th><th>Name</th><th>Date</th><th>CMP</th><th>FVG + BOS</th><th>Bull FVG Count</th><th>Structure Ceiling</th><th>DI+</th><th>DI-</th><th>Spread Change</th><th>Stock Quality</th><th>Setup Quality</th><th>Entry Quality</th>
             </tr>
           </thead>
           <tbody>
@@ -454,6 +493,9 @@
                 <td>{{ row.get("name", "") }}</td>
                 <td>{{ row.get("latest_date", "") }}</td>
                 <td>{{ row.get("latest_close", "")|number }}</td>
+                <td>{% if row.get("fvg_bos_pass") %}Yes{% else %}No{% endif %}</td>
+                <td>{{ row.get("bullish_fvg_recent_count", "")|number(0) }}</td>
+                <td>{{ row.get("latest_structure_upper", "")|number }}</td>
                 <td>{{ row.get("latest_di_plus", "")|number }}</td>
                 <td>{{ row.get("latest_di_minus", "")|number }}</td>
                 <td>{{ row.get("spread_change_2d", "")|number }}</td>
@@ -462,7 +504,7 @@
                 <td>{{ row.get("entry_quality_score", "")|number }}</td>
               </tr>
             {% else %}
-              <tr><td colspan="10">None of the evaluated symbols pass all DI + Minervini conditions.</td></tr>
+              <tr><td colspan="13">None of the evaluated symbols pass all selected conditions.</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -475,11 +517,14 @@
     const targetedMinerviniDiForm = document.querySelector('form[action="/minervini-di-divergence/run-targeted"]');
     if (fullMinerviniDiForm && targetedMinerviniDiForm) {
       targetedMinerviniDiForm.addEventListener("submit", () => {
-        ["adx_length", "divergence_days", "min_score"].forEach((name) => {
+        ["adx_length", "divergence_days", "min_score", "as_of_date"].forEach((name) => {
           const source = fullMinerviniDiForm.querySelector(`[name="${name}"]`);
           const target = targetedMinerviniDiForm.querySelector(`[name="${name}"]`);
           if (source && target) target.value = source.value;
         });
+        const fvgBosSource = fullMinerviniDiForm.querySelector('input[type="checkbox"][name="require_fvg_bos"]');
+        const fvgBosTarget = targetedMinerviniDiForm.querySelector('input[name="require_fvg_bos"]');
+        if (fvgBosSource && fvgBosTarget) fvgBosTarget.value = fvgBosSource.checked ? "1" : "0";
       });
     }
 

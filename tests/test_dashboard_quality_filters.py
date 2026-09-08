@@ -15,12 +15,28 @@ from stock_screener.web.main import (
     _apply_signal_quality_filters,
     _apply_weekly_shortlist_filters,
     _enrich_with_latest_daily_close,
+    _filter_weekly_screener_stock_rows,
     _manual_screener_config,
     _refresh_live_cmp,
 )
 
 
 class DashboardQualityFilterTests(unittest.TestCase):
+    def test_saved_weekly_rows_hide_sme_and_etf_instruments(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"symbol": "TCS", "name": "TATA CONSULTANCY SERVICES"},
+                {"symbol": "ABC-SM", "name": "ABC SME LIMITED"},
+                {"symbol": "MANAV-ST", "name": "MANAV INFRA"},
+                {"symbol": "FINIETF", "name": "FINANCE ETF"},
+                {"symbol": "LIQUID", "name": "MIRAEAMC - LIQUID FUND"},
+            ]
+        )
+
+        filtered = _filter_weekly_screener_stock_rows(frame)
+
+        self.assertEqual(filtered["symbol"].tolist(), ["TCS"])
+
     def test_manual_screener_config_does_not_narrow_scan_universe_with_ui_filters(self) -> None:
         base_config = {
             "universe": {"filters": {"min_market_cap_cr": 100.0, "stock_search": "OLD"}},

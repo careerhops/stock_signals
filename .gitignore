@@ -9,3 +9,4 @@ reports/*.txt
 docs/*
 data/secrets/*
 tests/
+tests/*

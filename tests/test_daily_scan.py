@@ -9,10 +9,111 @@ import unittest
 import pandas as pd
 
 from stock_screener.data.storage import Storage
-from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
+from stock_screener.jobs.daily_scan import (
+    _drop_excluded_weekly_rows,
+    daily_signal_config,
+    run_daily_scan,
+)
 
 
 class DailyScanTests(unittest.TestCase):
+    def test_benchmark_date_is_authoritative_and_stale_stock_is_excluded(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            instruments = pd.DataFrame(
+                [
+                    {
+                        "exchange": "NSE",
+                        "tradingsymbol": "TCS",
+                        "instrument_type": "EQ",
+                        "segment": "NSE",
+                        "instrument_token": 123,
+                        "name": "TATA CONSULTANCY SERVICES",
+                    },
+                    {
+                        "exchange": "NSE",
+                        "tradingsymbol": "NIFTY 50",
+                        "instrument_type": "EQ",
+                        "segment": "INDICES",
+                        "instrument_token": 500,
+                        "name": "NIFTY 50",
+                    },
+                ]
+            )
+
+            class FakeProvider:
+                def __init__(self, access_token: str) -> None:
+                    self.access_token = access_token
+
+                def validate_session(self) -> None:
+                    return None
+
+                def instruments(self) -> pd.DataFrame:
+                    return instruments
+
+                def daily_candles(self, token: int, from_date, to_date) -> pd.DataFrame:
+                    candle_date = "2026-08-31" if token == 500 else "2026-08-28"
+                    return pd.DataFrame(
+                        [
+                            {
+                                "date": candle_date,
+                                "open": 100,
+                                "high": 105,
+                                "low": 99,
+                                "close": 103,
+                                "volume": 1000,
+                            }
+                        ]
+                    )
+
+            config = {
+                "data": {
+                    "scan_timeframe": "1W",
+                    "history_years": 1,
+                    "data_root_env": "DATA_ROOT",
+                },
+                "daily_signals": {"enabled": False},
+                "universe": {
+                    "mode": "nse_all",
+                    "instrument_types": ["EQ"],
+                    "restrict_to_metadata_symbols": False,
+                },
+                "strategy": {"weekly_anchor": "W-FRI", "use_completed_weeks_only": True},
+                "filters": {"enabled": False},
+                "notifications": {"enabled": False},
+            }
+
+            with (
+                patch.dict(os.environ, {"DATA_ROOT": temp_dir}),
+                patch("stock_screener.jobs.daily_scan.load_access_token", return_value="token"),
+                patch("stock_screener.jobs.daily_scan.KiteDataProvider", FakeProvider),
+                patch(
+                    "stock_screener.jobs.daily_scan._latest_completed_nse_calendar_date",
+                    return_value=pd.Timestamp("2026-08-31").date(),
+                ),
+            ):
+                summary = run_daily_scan(config)
+
+            audit = storage.load_signals("latest_scan_details.csv")
+
+        self.assertEqual(summary["verified_market_date"], "2026-08-31")
+        self.assertEqual(summary["symbols_stale_excluded"], 1)
+        self.assertEqual(audit["fetch_status"].tolist(), ["stale_after_refresh"])
+
+    def test_final_weekly_output_guard_removes_excluded_symbols(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"symbol": "TCS", "name": "TATA CONSULTANCY SERVICES"},
+                {"symbol": "CANARYS-SM", "name": "CANARYS AUTOMATIONS"},
+                {"symbol": "CMNL-ST", "name": "CMNL LIMITED"},
+                {"symbol": "FINIETF", "name": "FINANCE ETF"},
+            ]
+        )
+
+        filtered = _drop_excluded_weekly_rows(frame, "symbol")
+
+        self.assertEqual(filtered["symbol"].tolist(), ["TCS"])
+
     def test_daily_signal_config_uses_daily_timeframe_and_age_window(self) -> None:
         config = {
             "data": {"scan_timeframe": "1W"},
@@ -137,7 +238,39 @@ class DailyScanTests(unittest.TestCase):
                             "segment": "NSE",
                             "instrument_token": 123,
                             "name": "TATA CONSULTANCY SERVICES",
-                        }
+                        },
+                        {
+                            "exchange": "NSE",
+                            "tradingsymbol": "ABC-SM",
+                            "instrument_type": "EQ",
+                            "segment": "NSE",
+                            "instrument_token": 124,
+                            "name": "ABC SME LIMITED",
+                        },
+                        {
+                            "exchange": "NSE",
+                            "tradingsymbol": "MANAV-ST",
+                            "instrument_type": "EQ",
+                            "segment": "NSE",
+                            "instrument_token": 125,
+                            "name": "MANAV INFRA",
+                        },
+                        {
+                            "exchange": "NSE",
+                            "tradingsymbol": "FINIETF",
+                            "instrument_type": "EQ",
+                            "segment": "NSE",
+                            "instrument_token": 126,
+                            "name": "FINANCE ETF",
+                        },
+                        {
+                            "exchange": "NSE",
+                            "tradingsymbol": "LIQUID",
+                            "instrument_type": "EQ",
+                            "segment": "NSE",
+                            "instrument_token": 127,
+                            "name": "MIRAEAMC - LIQUID FUND",
+                        },
                     ]
                 )
             )
@@ -196,7 +329,80 @@ class DailyScanTests(unittest.TestCase):
 
             self.assertEqual(summary["refresh_mode"], "cached_only")
             self.assertEqual(summary["symbols_scanned"], 1)
+            self.assertEqual(summary["symbols_excluded_non_stock"], 4)
             self.assertEqual(audit["fetch_status"].tolist(), ["cached"])
+
+    def test_as_of_date_excludes_later_candles_without_trimming_cache(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir))
+            storage.save_instruments(
+                pd.DataFrame(
+                    [
+                        {
+                            "exchange": "NSE",
+                            "tradingsymbol": "TCS",
+                            "instrument_type": "EQ",
+                            "segment": "NSE",
+                            "instrument_token": 123,
+                            "name": "TATA CONSULTANCY SERVICES",
+                        }
+                    ]
+                )
+            )
+            candles = pd.DataFrame(
+                [
+                    {"date": "2026-04-13", "open": 100, "high": 104, "low": 99, "close": 103, "volume": 1000},
+                    {"date": "2026-04-17", "open": 103, "high": 112, "low": 101, "close": 111, "volume": 1300},
+                    {"date": "2026-04-20", "open": 111, "high": 115, "low": 110, "close": 114, "volume": 1500},
+                ]
+            )
+            storage.save_candles("NSE", "TCS", candles)
+            observed_latest_dates: list[pd.Timestamp] = []
+
+            def fake_strategy(frame: pd.DataFrame, _config: dict) -> pd.DataFrame:
+                observed_latest_dates.append(pd.Timestamp(frame["date"].max()))
+                output = frame.copy().reset_index(drop=True)
+                output["signal"] = "NONE"
+                output["final_buy"] = False
+                output["final_sell"] = False
+                output["avg_volume_20"] = output["volume"]
+                output["avg_traded_value_20"] = output["close"] * output["volume"]
+                return output
+
+            config = {
+                "data": {
+                    "scan_timeframe": "1W",
+                    "history_years": 1,
+                    "data_root_env": "DATA_ROOT",
+                    "skip_kite_fetch": True,
+                    "analysis_as_of_date": "2026-04-17",
+                },
+                "daily_signals": {"enabled": True, "max_signal_age_bars": 5},
+                "universe": {
+                    "mode": "nse_all",
+                    "instrument_types": ["EQ"],
+                    "restrict_to_metadata_symbols": False,
+                },
+                "strategy": {"weekly_anchor": "W-FRI", "use_completed_weeks_only": True},
+                "filters": {
+                    "enabled": True,
+                    "signal": {"direction": "BUY", "latest_only": True, "max_signal_age_bars": 1},
+                },
+                "notifications": {"enabled": False},
+            }
+
+            with (
+                patch.dict(os.environ, {"DATA_ROOT": temp_dir}),
+                patch("stock_screener.jobs.daily_scan.run_weekly_buy_sell", side_effect=fake_strategy),
+            ):
+                summary = run_daily_scan(config)
+
+            saved_candles = storage.load_candles("NSE", "TCS", "1D")
+
+        self.assertTrue(observed_latest_dates)
+        self.assertTrue(all(value <= pd.Timestamp("2026-04-17") for value in observed_latest_dates))
+        self.assertEqual(summary["analysis_as_of_date"], "2026-04-17")
+        self.assertEqual(pd.Timestamp(saved_candles["date"].max()), pd.Timestamp("2026-04-20"))
 
     def test_weekly_scan_handles_symbols_without_completed_monday_week(self) -> None:
         with TemporaryDirectory() as temp_dir:

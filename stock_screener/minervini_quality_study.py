@@ -31,9 +31,17 @@ def run_minervini_quality_study(
     symbols: list[str] | None = None,
     benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
+    as_of_date: Any | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> MinerviniQualityStudyResult:
-    benchmark = _prepare_benchmark(storage.load_candles("NSE_INDEX", benchmark_symbol, "1D"))
+    cutoff = pd.to_datetime(as_of_date, errors="coerce") if as_of_date is not None else pd.NaT
+    benchmark_source = storage.load_candles("NSE_INDEX", benchmark_symbol, "1D")
+    if pd.notna(cutoff) and not benchmark_source.empty:
+        benchmark_dates = pd.to_datetime(benchmark_source.get("date"), errors="coerce")
+        benchmark_source = benchmark_source[
+            benchmark_dates.dt.normalize() <= pd.Timestamp(cutoff).normalize()
+        ].copy()
+    benchmark = _prepare_benchmark(benchmark_source)
     if benchmark.empty:
         raise RuntimeError(
             f"{benchmark_symbol} daily candles are unavailable. Refresh Kite data and run the scan again."
@@ -63,7 +71,13 @@ def run_minervini_quality_study(
     )
 
     for index, symbol in enumerate(all_symbols, start=1):
-        daily = _prepare_daily(storage.load_candles(exchange, symbol, "1D"))
+        daily_source = storage.load_candles(exchange, symbol, "1D")
+        if pd.notna(cutoff) and not daily_source.empty:
+            daily_dates = pd.to_datetime(daily_source.get("date"), errors="coerce")
+            daily_source = daily_source[
+                daily_dates.dt.normalize() <= pd.Timestamp(cutoff).normalize()
+            ].copy()
+        daily = _prepare_daily(daily_source)
         _emit_progress(
             progress_callback,
             phase="Scoring extended Minervini quality",
@@ -146,6 +160,7 @@ def run_minervini_quality_study(
             (~stock_stats.get("is_latest_market_date", pd.Series(dtype=bool))).sum()
         ) if not stock_stats.empty else 0,
         "score_threshold": float(score_threshold),
+        "analysis_as_of_date": benchmark.iloc[-1]["date"].strftime("%Y-%m-%d"),
         "latest_stock_date": latest_dates.max().strftime("%Y-%m-%d") if not latest_dates.empty else "",
     }
     return MinerviniQualityStudyResult(summary=summary, stock_stats=stock_stats)

@@ -19,6 +19,11 @@
         Score threshold
         <input type="number" name="score_threshold" min="0" max="99" step="1" value="{{ score_threshold|number(0) }}">
       </label>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+        <small>Leave blank for the latest completed NSE session.</small>
+      </label>
       <div class="filter-actions">
         <button class="button" type="submit">Run Minervini Quality Scan</button>
       </div>
@@ -90,6 +95,10 @@
       <strong>{{ summary.get("stocks_scored", 0) }}</strong>
     </article>
     <article class="stat-card">
+      <span>Analysis Through</span>
+      <strong>{{ summary.get("analysis_as_of_date", summary.get("benchmark_latest_date", "-")) or "-" }}</strong>
+    </article>
+    <article class="stat-card">
       <span>Latest Stock Date</span>
       <strong>{{ summary.get("latest_stock_date", "-") or "-" }}</strong>
     </article>
@@ -116,6 +125,14 @@
     <article class="stat-card">
       <span>Stale / Failed</span>
       <strong>{{ summary.get("refresh_stale_count", 0) }} / {{ summary.get("refresh_failed_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Saved OHLC Reused</span>
+      <strong>{{ summary.get("refresh_reused_count", 0) }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Fetched From Kite</span>
+      <strong>{{ summary.get("refresh_fetched_count", 0) }}</strong>
     </article>
   </section>
 

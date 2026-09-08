@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">Saved Kite market data</p>
+      <h1>Daily OHLCV download</h1>
+      <p class="lede">Export the exact daily open, high, low, close, and volume records used by the screeners.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form method="get" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <label>
+        Universe
+        <select name="exchange_scope">
+          <option value="combined" {% if exchange_scope == "combined" %}selected{% endif %}>NSE + BSE-only</option>
+          <option value="nse" {% if exchange_scope == "nse" %}selected{% endif %}>NSE only</option>
+          <option value="bse" {% if exchange_scope == "bse" %}selected{% endif %}>BSE only</option>
+        </select>
+        <small>NSE + BSE-only includes every saved NSE symbol and only BSE symbols that do not exist in NSE.</small>
+      </label>
+      <label>
+        Symbols (optional)
+        <textarea name="symbols" rows="3" placeholder="TORNTPHARM, HCLTECH">{{ symbols_text }}</textarea>
+        <small>Leave blank to export the entire selected universe. There is no stock-count limit on the CSV.</small>
+      </label>
+      <label>
+        Start date
+        <input type="date" name="start_date" value="{{ start_date }}">
+        <small>Inclusive. Leave blank for the earliest saved candle.</small>
+      </label>
+      <label>
+        End date
+        <input type="date" name="end_date" value="{{ end_date }}">
+        <small>Inclusive. Leave blank for the latest saved candle.</small>
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit" name="preview" value="1" formaction="/ohlcv-download">Preview Data</button>
+        <button class="button" type="submit" formaction="/ohlcv-download.csv">Download CSV</button>
+      </div>
+    </form>
+    {% if error %}<p class="status error">{{ error }}</p>{% endif %}
+    {% if missing_symbols %}<p class="status error">No saved data in this universe: {{ missing_symbols|join(', ') }}</p>{% endif %}
+    {% if exchange_scope == "combined" and bse_only_count == 0 %}
+      <p class="status">No BSE-only daily candle files are currently stored. The combined download will contain the available NSE data; BSE-only rows will appear automatically after those candles are fetched.</p>
+    {% endif %}
+  </section>
+
+  <section class="summary-grid compact-summary">
+    <article><span>Export Symbols</span><strong>{{ universe_count }}</strong></article>
+    <article><span>NSE</span><strong>{{ nse_count }}</strong></article>
+    <article><span>BSE-only</span><strong>{{ bse_only_count }}</strong></article>
+    <article><span>Preview Rows</span><strong>{{ preview_count }}</strong></article>
+  </section>
+
+  {% if preview_requested %}
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Data preview</p>
+          <h2>Latest matching rows</h2>
+        </div>
+      </div>
+      {% if rows %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Exchange</th><th>Symbol</th><th>Date</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr>
+            </thead>
+            <tbody>
+              {% for row in rows %}
+                <tr>
+                  <td>{{ row.get("exchange", "") }}</td>
+                  <td>{{ row.get("symbol", "") }}</td>
+                  <td>{{ row.get("date", "") }}</td>
+                  <td>{{ row.get("open", "")|number }}</td>
+                  <td>{{ row.get("high", "")|number }}</td>
+                  <td>{{ row.get("low", "")|number }}</td>
+                  <td>{{ row.get("close", "")|number }}</td>
+                  <td>{{ row.get("volume", "")|number(0) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="status">Only the on-screen preview is limited to 500 data rows. The CSV includes every matching row for every stock in the selected universe.</p>
+      {% else %}
+        <p class="status">No saved daily candles match the selected symbols and date range.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+{% endblock %}
