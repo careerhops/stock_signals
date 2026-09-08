@@ -1,0 +1,246 @@
+//@version=6
+indicator("DMA Pullback Detector - 75 / 100 / 200", overlay=true)
+
+// =====================================================
+// INPUTS
+// =====================================================
+
+proximityPct = input.float(
+     1.5,
+     "Maximum Distance From DMA (%)",
+     minval = 0.1,
+     step = 0.1
+)
+
+requireAbove = input.bool(
+     true,
+     "Require Close Above DMA"
+)
+
+requireRisingDMA = input.bool(
+     true,
+     "Require DMA To Be Rising"
+)
+
+lookbackAbove = input.int(
+     10,
+     "Lookback To Confirm Stock Was Above DMA",
+     minval = 2
+)
+
+
+// =====================================================
+// MOVING AVERAGES
+// =====================================================
+
+dma75  = ta.sma(close, 75)
+dma100 = ta.sma(close, 100)
+dma200 = ta.sma(close, 200)
+
+
+// =====================================================
+// DISTANCE FROM MOVING AVERAGE
+// =====================================================
+
+dist75 = math.abs(close - dma75) / dma75 * 100
+dist100 = math.abs(close - dma100) / dma100 * 100
+dist200 = math.abs(close - dma200) / dma200 * 100
+
+
+// =====================================================
+// WAS PRICE PREVIOUSLY ABOVE DMA?
+//
+// Helps distinguish:
+// pullback from an uptrend
+//
+// from:
+//
+// stock simply rallying upward into resistance.
+// =====================================================
+
+wasAbove75 =
+     ta.highest(close[1], lookbackAbove) > dma75
+
+wasAbove100 =
+     ta.highest(close[1], lookbackAbove) > dma100
+
+wasAbove200 =
+     ta.highest(close[1], lookbackAbove) > dma200
+
+
+// =====================================================
+// DMA TREND
+// =====================================================
+
+rising75 = dma75 > dma75[5]
+rising100 = dma100 > dma100[5]
+rising200 = dma200 > dma200[5]
+
+
+// =====================================================
+// BASIC PROXIMITY CONDITIONS
+// =====================================================
+
+near75 = dist75 <= proximityPct
+near100 = dist100 <= proximityPct
+near200 = dist200 <= proximityPct
+
+
+// =====================================================
+// CLOSE CONDITION
+// =====================================================
+
+closeOK75 =
+     not requireAbove or close >= dma75
+
+closeOK100 =
+     not requireAbove or close >= dma100
+
+closeOK200 =
+     not requireAbove or close >= dma200
+
+
+// =====================================================
+// TREND CONDITION
+// =====================================================
+
+trendOK75 =
+     not requireRisingDMA or rising75
+
+trendOK100 =
+     not requireRisingDMA or rising100
+
+trendOK200 =
+     not requireRisingDMA or rising200
+
+
+// =====================================================
+// FINAL PULLBACK SIGNALS
+// =====================================================
+
+pullback75 =
+     near75 and
+     closeOK75 and
+     trendOK75 and
+     wasAbove75
+
+pullback100 =
+     near100 and
+     closeOK100 and
+     trendOK100 and
+     wasAbove100
+
+pullback200 =
+     near200 and
+     closeOK200 and
+     trendOK200 and
+     wasAbove200
+
+
+// =====================================================
+// MOVING AVERAGES
+// =====================================================
+
+plot(
+     dma75,
+     title="75 DMA",
+     linewidth=2,
+     color=color.orange
+)
+
+plot(
+     dma100,
+     title="100 DMA",
+     linewidth=2,
+     color=color.blue
+)
+
+plot(
+     dma200,
+     title="200 DMA",
+     linewidth=2,
+     color=color.red
+)
+
+
+// =====================================================
+// SIGNAL MARKERS
+// =====================================================
+
+plotshape(
+     pullback75,
+     title="75 DMA Pullback",
+     text="75",
+     style=shape.labelup,
+     location=location.belowbar,
+     size=size.tiny,
+     color=color.orange,
+     textcolor=color.white
+)
+
+plotshape(
+     pullback100,
+     title="100 DMA Pullback",
+     text="100",
+     style=shape.labelup,
+     location=location.belowbar,
+     size=size.tiny,
+     color=color.blue,
+     textcolor=color.white
+)
+
+plotshape(
+     pullback200,
+     title="200 DMA Pullback",
+     text="200",
+     style=shape.labelup,
+     location=location.belowbar,
+     size=size.tiny,
+     color=color.red,
+     textcolor=color.white
+)
+
+
+// =====================================================
+// BACKGROUND HIGHLIGHT WHEN ANY PULLBACK EXISTS
+// =====================================================
+
+anyPullback =
+     pullback75 or
+     pullback100 or
+     pullback200
+
+bgcolor(
+     anyPullback
+     ? color.new(color.green, 90)
+     : na
+)
+
+
+// =====================================================
+// ALERTS
+// =====================================================
+
+alertcondition(
+     pullback75,
+     title="75 DMA Pullback",
+     message="{{ticker}} has pulled back close to its 75 DMA."
+)
+
+alertcondition(
+     pullback100,
+     title="100 DMA Pullback",
+     message="{{ticker}} has pulled back close to its 100 DMA."
+)
+
+alertcondition(
+     pullback200,
+     title="200 DMA Pullback",
+     message="{{ticker}} has pulled back close to its 200 DMA."
+)
+
+alertcondition(
+     anyPullback,
+     title="Any DMA Pullback",
+     message="{{ticker}} is close to its 75, 100 or 200 DMA."
+)
