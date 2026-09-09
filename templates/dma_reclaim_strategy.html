@@ -1,0 +1,359 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">75DMA RECLAIM LONG SETUP</p>
+      <h1>75DMA reclaim strategy</h1>
+      <p class="lede">Screen current 75DMA reclaim entries and backtest raw, trend-filtered, and strict long variants on the selected equity universe.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/dma-reclaim-strategy/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <div class="filter-fieldset">
+        <span>Research universe</span>
+        <div class="inline-choice-row">
+          {% for option in universe_options %}
+            <label class="inline-checkbox">
+              <input type="checkbox" name="universe" value="{{ option.value }}" {% if option.selected %}checked{% endif %}>
+              {{ option.label }}
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+      </label>
+      <label>
+        Backtest start
+        <input type="date" name="start_date" value="{{ start_date }}">
+      </label>
+      <label>
+        Warmup months
+        <input type="number" name="warmup_months" min="6" max="36" value="{{ warmup_months }}">
+      </label>
+      <label>
+        Break-to-reclaim sessions
+        <input type="number" name="max_reclaim_sessions" min="1" max="30" value="{{ max_reclaim_sessions }}">
+      </label>
+      <label>
+        Current signal lookback
+        <input type="number" name="current_signal_lookback_sessions" min="1" max="30" value="{{ current_signal_lookback_sessions }}">
+      </label>
+      <label>
+        Max hold sessions
+        <input type="number" name="holding_sessions" min="1" max="120" value="{{ holding_sessions }}">
+      </label>
+      <label>
+        Profit target %
+        <input type="number" name="profit_target_pct" min="0" max="100" step="0.1" value="{{ profit_target_pct }}">
+      </label>
+      <label>
+        Stop loss %
+        <input type="number" name="stop_loss_pct" min="0.1" max="50" step="0.1" value="{{ stop_loss_pct }}">
+      </label>
+      <label>
+        Reclaim-low buffer %
+        <input type="number" name="stop_buffer_pct" min="0" max="10" step="0.1" value="{{ stop_buffer_pct }}">
+      </label>
+      <label>
+        Round-trip cost %
+        <input type="number" name="round_trip_cost_pct" min="0" max="5" step="0.01" value="{{ round_trip_cost_pct }}">
+      </label>
+      <label>
+        Entry price
+        <select name="entry_price_mode">
+          <option value="next_open" {% if entry_price_mode == "next_open" %}selected{% endif %}>Next open</option>
+          <option value="next_close" {% if entry_price_mode == "next_close" %}selected{% endif %}>Next close</option>
+        </select>
+      </label>
+      <label>
+        Pivot order
+        <input type="number" name="pivot_order" min="1" max="10" value="{{ pivot_order }}">
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="exit_on_close_below_75dma" value="1" {% if exit_on_close_below_75dma %}checked{% endif %}>
+        Exit on close below 75DMA
+      </label>
+      <label class="wide-field">
+        Custom stocks
+        <textarea name="custom_symbols" rows="3" placeholder="OFSS, RELIANCE, HDFCBANK">{{ custom_symbols }}</textarea>
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit" name="run_scope" value="selected">Download History + Run Strategy</button>
+        <button class="button secondary" type="submit" name="run_scope" value="custom_only">Run Custom List Only</button>
+      </div>
+    </form>
+
+    {% if missing_universes %}
+      <p class="status error">Constituent lists not cached locally: {{ missing_universes|join(", ") }}. The run button will try the official NSE Indices CSV or Kite instruments.</p>
+    {% endif %}
+    {% if universe_error %}
+      <p class="status error">{{ universe_error }}</p>
+    {% endif %}
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">75DMA reclaim strategy completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="dma-reclaim-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="dma-reclaim-progress-title">75DMA reclaim strategy is queued</strong>
+          <span id="dma-reclaim-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="dma-reclaim-progress-fill" style="width: 0%"></div></div>
+        <p id="dma-reclaim-progress-detail">Preparing selected universe...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("dma-reclaim-progress");
+          if (!box) return;
+          const title = document.getElementById("dma-reclaim-progress-title");
+          const percent = document.getElementById("dma-reclaim-progress-percent");
+          const fill = document.getElementById("dma-reclaim-progress-fill");
+          const detail = document.getElementById("dma-reclaim-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`, { cache: "no-store" });
+              if (!response.ok) throw new Error("Status unavailable");
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              title.textContent = status.status === "queued" ? "75DMA reclaim strategy is queued" : (status.phase || "75DMA reclaim strategy is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              const completed = Number(status.completed || 0);
+              const total = Number(status.total || 0);
+              const current = status.current_symbol ? `: ${status.current_exchange || ""}:${status.current_symbol}` : "";
+              detail.textContent = `${status.phase || "Running"} · ${completed}/${total}${current}`;
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/dma-reclaim-strategy";
+                return;
+              }
+              window.setTimeout(poll, 1200);
+            } catch (_error) {
+              title.textContent = "75DMA reclaim status unavailable";
+              detail.textContent = "Refresh this page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 700);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Current Candidates</span><strong>{{ summary.get("current_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Strict Long</span><strong>{{ summary.get("current_strict_long_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Trend Candidates</span><strong>{{ summary.get("current_trend_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Total Trades</span><strong>{{ summary.get("total_trades", 0) }}</strong></article>
+    <article class="stat-card"><span>Best Strategy</span><strong>{{ summary.get("best_strategy", "-") or "-" }}</strong></article>
+    <article class="stat-card"><span>Best Win Rate</span><strong>{{ summary.get("best_strategy_win_rate_pct", "")|number(2) }}%</strong></article>
+    <article class="stat-card"><span>Best Avg Return</span><strong>{{ summary.get("best_strategy_avg_return_pct", "")|number(2) }}%</strong></article>
+    <article class="stat-card"><span>Profit Factor</span><strong>{{ summary.get("best_strategy_profit_factor", "")|number(2) }}</strong></article>
+    <article class="stat-card"><span>Symbols With History</span><strong>{{ summary.get("symbols_with_history", 0) }}</strong></article>
+    <article class="stat-card"><span>As Of</span><strong>{{ summary.get("requested_as_of_date", "-") or "-" }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/dma-reclaim-strategy" class="filter-panel compact-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      {% for universe in selected_universes %}<input type="hidden" name="universe" value="{{ universe }}">{% endfor %}
+      {% if custom_symbols %}<input type="hidden" name="custom_symbols" value="{{ custom_symbols }}">{% endif %}
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
+      <input type="hidden" name="warmup_months" value="{{ warmup_months }}">
+      <input type="hidden" name="max_reclaim_sessions" value="{{ max_reclaim_sessions }}">
+      <input type="hidden" name="current_signal_lookback_sessions" value="{{ current_signal_lookback_sessions }}">
+      <input type="hidden" name="holding_sessions" value="{{ holding_sessions }}">
+      <input type="hidden" name="profit_target_pct" value="{{ profit_target_pct }}">
+      <input type="hidden" name="stop_loss_pct" value="{{ stop_loss_pct }}">
+      <input type="hidden" name="stop_buffer_pct" value="{{ stop_buffer_pct }}">
+      <input type="hidden" name="round_trip_cost_pct" value="{{ round_trip_cost_pct }}">
+      <input type="hidden" name="entry_price_mode" value="{{ entry_price_mode }}">
+      <input type="hidden" name="exit_on_close_below_75dma" value="{{ 1 if exit_on_close_below_75dma else 0 }}">
+      <input type="hidden" name="pivot_order" value="{{ pivot_order }}">
+      <label>Search stock<input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company"></label>
+      <label>
+        Candidate tier
+        <select name="candidate_tier">
+          <option value="">All</option>
+          {% for tier in candidate_tier_options %}
+            <option value="{{ tier }}" {% if candidate_tier == tier %}selected{% endif %}>{{ tier }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Strategy
+        <select name="strategy">
+          <option value="">All</option>
+          {% for strategy in strategy_options %}
+            <option value="{{ strategy }}" {% if strategy_filter == strategy %}selected{% endif %}>{{ strategy }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="filter-actions"><button class="button secondary" type="submit">Apply Table Filters</button></div>
+    </form>
+
+    <div class="table-actions">
+      <p class="status">Showing {{ candidates_count }} current candidates.</p>
+      <div class="filter-actions">
+        <a class="button secondary" href="/dma-reclaim-strategy/candidates.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Candidates CSV</a>
+        <a class="button secondary" href="/dma-reclaim-strategy/trades.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Trades CSV</a>
+        <a class="button secondary" href="/dma-reclaim-strategy/report.xlsx{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Excel</a>
+      </div>
+    </div>
+
+    {% if strict_symbols_csv %}
+      <div class="copy-block">
+        <div class="copy-row">
+          <div><h2>Strict long symbols</h2><p>{{ strict_symbols_csv.split(',')|length }} stocks match strict long filters.</p></div>
+          <button class="button secondary" type="button" data-copy-target="dma-reclaim-strict-symbols">Copy Symbols</button>
+        </div>
+        <textarea id="dma-reclaim-strict-symbols" readonly rows="3">{{ strict_symbols_csv }}</textarea>
+      </div>
+    {% elif candidate_symbols_csv %}
+      <div class="copy-block">
+        <div class="copy-row">
+          <div><h2>Candidate symbols</h2><p>{{ candidate_symbols_csv.split(',')|length }} stocks match the current reclaim window.</p></div>
+          <button class="button secondary" type="button" data-copy-target="dma-reclaim-candidate-symbols">Copy Symbols</button>
+        </div>
+        <textarea id="dma-reclaim-candidate-symbols" readonly rows="3">{{ candidate_symbols_csv }}</textarea>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Current candidates</h2>
+      <p>Entries are ranked by trend alignment, reclaim quality, DMA repair, pivot structure, pullback context, and volume expansion.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Score</th><th>Tier</th><th>Bias</th><th>Stock</th><th>Name</th><th>Signal Date</th><th>Entry</th><th>As Of</th><th>CMP</th>
+            <th>Stop</th><th>Target</th><th>DMA Trend</th><th>75 Trend %</th><th>100 Trend %</th><th>75 Dist %</th><th>100 Dist %</th>
+            <th>Last Low</th><th>Pullback</th><th>Volume Ratio</th><th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in candidates %}
+            <tr>
+              <td>{{ row.get("candidate_rank", "")|number(0) }}</td>
+              <td>{{ row.get("candidate_score", "")|number(2) }}</td>
+              <td>{{ row.get("strategy_tier", "") }}</td>
+              <td>{{ row.get("entry_bias", "") }}</td>
+              <td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("signal_date", "") }}</td>
+              <td>{{ row.get("entry_status", "") }} {{ row.get("entry_date", "") }}</td>
+              <td>{{ row.get("as_of_date", "") }}</td>
+              <td>{{ row.get("as_of_close", "")|number(2) }}</td>
+              <td>{{ row.get("planned_stop_price", "")|number(2) }}</td>
+              <td>{{ row.get("planned_target_price", "")|number(2) }}</td>
+              <td>{{ row.get("dma_trend_20d_label", "") }}</td>
+              <td>{{ row.get("dma_75_trend_20d_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_100_trend_20d_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_75dma_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_100dma_pct", "")|number(2) }}</td>
+              <td>{{ row.get("last_low_pivot_structure", "") }}</td>
+              <td>{{ row.get("pullback_context", "") }}</td>
+              <td>{{ row.get("volume_ratio_50", "")|number(2) }}</td>
+              <td>{{ row.get("source_universe", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="21">Run the strategy or broaden the current signal lookback to find candidates.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Backtest summary</h2>
+      <p>Each variant uses the same reclaim trigger, entered on the next trading session and exited by target, stop, 75DMA failure, or max hold.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate %</th><th>Avg Return %</th><th>Median Return %</th><th>Profit Factor</th><th>Payoff</th><th>Avg Hold</th><th>Avg MFE %</th><th>Avg MAE %</th></tr></thead>
+        <tbody>
+          {% for row in strategy_stats %}
+            <tr>
+              <td>{{ row.get("strategy", "") }}</td><td>{{ row.get("trades", 0)|number(0) }}</td><td>{{ row.get("wins", 0)|number(0) }}</td><td>{{ row.get("losses", 0)|number(0) }}</td>
+              <td>{{ row.get("win_rate_pct", "")|number(2) }}</td><td>{{ row.get("avg_return_pct", "")|number(2) }}</td><td>{{ row.get("median_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("profit_factor", "")|number(2) }}</td><td>{{ row.get("payoff_ratio", "")|number(2) }}</td><td>{{ row.get("avg_hold_sessions", "")|number(1) }}</td>
+              <td>{{ row.get("avg_mfe_pct", "")|number(2) }}</td><td>{{ row.get("avg_mae_pct", "")|number(2) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="12">Run the strategy to calculate backtest statistics.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Stock edge</h2>
+      <p>Grouped by strategy and stock, ordered by profit factor, win rate, and average return.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Strategy</th><th>Stock</th><th>Name</th><th>Trades</th><th>Win Rate %</th><th>Avg Return %</th><th>Median %</th><th>Profit Factor</th><th>Avg Hold</th><th>Source</th></tr></thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("strategy", "") }}</td><td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td><td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("trades", 0)|number(0) }}</td><td>{{ row.get("win_rate_pct", "")|number(2) }}</td><td>{{ row.get("avg_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("median_return_pct", "")|number(2) }}</td><td>{{ row.get("profit_factor", "")|number(2) }}</td><td>{{ row.get("avg_hold_sessions", "")|number(1) }}</td><td>{{ row.get("source_universe", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10">No stock-level backtest rows yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Recent trades</h2>
+      <p>Latest 500 simulated trades after active table filters.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Signal</th><th>Stock</th><th>Strategy</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net %</th><th>Hold</th><th>MFE %</th><th>MAE %</th><th>DMA Trend</th></tr></thead>
+        <tbody>
+          {% for row in trades %}
+            <tr>
+              <td>{{ row.get("signal_date", "") }}</td><td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td><td>{{ row.get("strategy", "") }}</td>
+              <td>{{ row.get("entry_date", "") }} @ {{ row.get("entry_price", "")|number(2) }}</td>
+              <td>{{ row.get("exit_date", "") }} @ {{ row.get("exit_price", "")|number(2) }}</td>
+              <td>{{ row.get("exit_reason", "") }}</td><td>{{ row.get("net_return_pct", "")|number(2) }}</td><td>{{ row.get("hold_trading_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("mfe_pct", "")|number(2) }}</td><td>{{ row.get("mae_pct", "")|number(2) }}</td><td>{{ row.get("dma_trend_20d_label", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="11">No trades to display.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const field = document.getElementById(button.dataset.copyTarget);
+        if (!field) return;
+        await navigator.clipboard.writeText(field.value);
+        button.textContent = "Copied";
+      });
+    });
+  </script>
+{% endblock %}

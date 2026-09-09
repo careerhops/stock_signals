@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, timedelta
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,21 @@ from stock_screener.drawdown_recovery_study import (
     load_drawdown_recovery_outputs,
     run_drawdown_recovery_study,
     save_drawdown_recovery_outputs,
+)
+from stock_screener.dma_reclaim_strategy_study import (
+    DEFAULT_CURRENT_SIGNAL_LOOKBACK_SESSIONS as DMA_RECLAIM_DEFAULT_CURRENT_LOOKBACK,
+    DEFAULT_HOLDING_SESSIONS as DMA_RECLAIM_DEFAULT_HOLDING_SESSIONS,
+    DEFAULT_MAX_RECLAIM_SESSIONS as DMA_RECLAIM_DEFAULT_MAX_RECLAIM,
+    DEFAULT_PIVOT_ORDER as DMA_RECLAIM_DEFAULT_PIVOT_ORDER,
+    DEFAULT_PROFIT_TARGET_PCT as DMA_RECLAIM_DEFAULT_TARGET_PCT,
+    DEFAULT_ROUND_TRIP_COST_PCT as DMA_RECLAIM_DEFAULT_COST_PCT,
+    DEFAULT_STOP_BUFFER_PCT as DMA_RECLAIM_DEFAULT_STOP_BUFFER_PCT,
+    DEFAULT_STOP_LOSS_PCT as DMA_RECLAIM_DEFAULT_STOP_PCT,
+    DEFAULT_WARMUP_MONTHS as DMA_RECLAIM_DEFAULT_WARMUP_MONTHS,
+    load_dma_reclaim_strategy_outputs,
+    run_dma_reclaim_strategy_study,
+    save_dma_reclaim_strategy_outputs,
+    write_dma_reclaim_strategy_workbook,
 )
 from stock_screener.gtt_gain_report import write_gtt_gain_workbook
 from stock_screener.gtt_gain_study import (
@@ -120,6 +136,17 @@ from stock_screener.knox_recovery_study import (
 from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram, send_gtt_stock_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
 from stock_screener.rotation_study import load_rotation_study_outputs, run_rotation_study, save_rotation_study_outputs
+from stock_screener.roi_journal_dma_study import (
+    DEFAULT_LOOKBACK_MONTHS as ROI_JOURNAL_DEFAULT_LOOKBACK_MONTHS,
+    DEFAULT_PIVOT_ORDER as ROI_JOURNAL_DEFAULT_PIVOT_ORDER,
+    DEFAULT_PRE_SIGNAL_SESSIONS as ROI_JOURNAL_DEFAULT_PRE_SIGNAL_SESSIONS,
+    DEFAULT_RECOVERY_THRESHOLD_PCT as ROI_JOURNAL_DEFAULT_RECOVERY_THRESHOLD,
+    DEFAULT_SHEET_NAME as ROI_JOURNAL_DEFAULT_SHEET_NAME,
+    load_roi_journal_dma_outputs,
+    load_roi_journal_input,
+    run_roi_journal_dma_analysis,
+    save_roi_journal_dma_outputs,
+)
 from stock_screener.signal_outcome_report import write_signal_outcome_workbook
 from stock_screener.signal_outcome_study import (
     load_signal_outcome_outputs,
@@ -252,6 +279,7 @@ from stock_screener.web.charts import (
     build_adx_di_chart,
     build_sector_mix_pie_chart,
     build_gtt_opportunity_chart,
+    build_roi_journal_dma_distance_chart,
     build_rotation_group_chart,
     build_signal_chart,
     build_stock_signature_chart_pack,
@@ -280,8 +308,19 @@ STOCK_SIGNATURE_UNIVERSE_DEFINITIONS = {
         "url": NIFTY500_CONSTITUENTS_URL,
         "filename": "nifty500_constituents.csv",
     },
+    "all_nse_eq": {
+        "label": "All NSE EQ",
+        "summary": "ALL_NSE_EQ",
+        "dynamic": "kite_nse_eq",
+    },
+    "bse_only_eq": {
+        "label": "BSE-only EQ",
+        "summary": "BSE_ONLY_EQ",
+        "dynamic": "kite_bse_only_eq",
+    },
 }
 STOCK_SIGNATURE_DEFAULT_UNIVERSES = ("nifty100",)
+ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS = 8
 
 
 def _template_number(value: Any, digits: int = 2) -> str:
@@ -293,6 +332,17 @@ def _template_number(value: Any, digits: int = 2) -> str:
         return f"{float(value):.{int(digits)}f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def _template_yes_no(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "No"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return "Yes" if bool(value) else "No"
+    text = str(value).strip().lower()
+    return "No" if text in {"", "0", "false", "f", "no", "n", "nan", "none"} else "Yes"
 
 
 def _google_oauth_redirect_uri(request: Request) -> str:
@@ -314,6 +364,7 @@ def _append_query_param(url: str, param: str) -> str:
 
 
 templates.env.filters["number"] = _template_number
+templates.env.filters["yes_no"] = _template_yes_no
 
 
 def _template_ratio(value: Any, digits: int = 2) -> str:
@@ -710,7 +761,9 @@ def _combined_symbol_metadata(config: dict, storage: Storage) -> pd.DataFrame:
 
 def _stock_signature_index_path(data_root: Path, universe_key: str) -> Path:
     definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.get(str(universe_key).strip().lower())
-    filename = definition["filename"] if definition else f"{str(universe_key).strip().lower()}_constituents.csv"
+    filename = definition.get("filename") if definition else f"{str(universe_key).strip().lower()}_constituents.csv"
+    if not filename:
+        filename = f"{str(universe_key).strip().lower()}_constituents.csv"
     return data_root / "indices" / filename
 
 
@@ -728,6 +781,12 @@ def _load_stock_signature_index_constituents(
     definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.get(key)
     if not definition:
         return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "Series", "ISIN Code", "source_universe"])
+    if definition.get("dynamic"):
+        return _load_stock_signature_dynamic_constituents(
+            data_root,
+            key,
+            allow_remote_fetch=allow_remote_fetch,
+        )
 
     path = _stock_signature_index_path(data_root, key)
     if path.exists():
@@ -752,13 +811,120 @@ def _load_stock_signature_index_constituents(
         frame["Company Name"] = frame["Symbol"]
     if "Industry" not in frame.columns:
         frame["Industry"] = ""
+    frame["exchange"] = "NSE"
     frame["source_universe"] = str(definition["label"])
     return (
         frame[frame["Symbol"].ne("")]
         .drop_duplicates(subset=["Symbol"], keep="last")
-        .sort_values("Symbol")
+        .sort_values(["exchange", "Symbol"])
         .reset_index(drop=True)
     )
+
+
+def _load_stock_signature_dynamic_constituents(
+    data_root: Path,
+    universe_key: str,
+    *,
+    allow_remote_fetch: bool = False,
+) -> pd.DataFrame:
+    storage = Storage(data_root)
+    instruments = storage.load_instruments()
+    if (instruments.empty or not _instrument_snapshot_is_current(storage)) and allow_remote_fetch:
+        provider: KiteDataProvider | None = None
+
+        def get_provider() -> KiteDataProvider:
+            nonlocal provider
+            if provider is None:
+                provider = _authenticated_kite_provider(storage, "full-market research universe")
+            return provider
+
+        instruments = _load_or_refresh_kite_instruments(storage, get_provider)
+    return _stock_signature_dynamic_constituents_from_instruments(instruments, universe_key)
+
+
+def _stock_signature_dynamic_constituents_from_instruments(
+    instruments: pd.DataFrame,
+    universe_key: str,
+) -> pd.DataFrame:
+    key = str(universe_key or "").strip().lower()
+    definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.get(key, {})
+    columns = ["Company Name", "Industry", "Symbol", "exchange", "source_universe"]
+    if instruments.empty:
+        return pd.DataFrame(columns=columns)
+    required_columns = {"exchange", "tradingsymbol", "instrument_type"}
+    if not required_columns.issubset(instruments.columns):
+        return pd.DataFrame(columns=columns)
+
+    working = instruments.copy()
+    working["exchange"] = working["exchange"].astype(str).str.upper().str.strip()
+    working["tradingsymbol"] = working["tradingsymbol"].astype(str).str.upper().str.strip()
+    working["instrument_type"] = working["instrument_type"].astype(str).str.upper().str.strip()
+    if "segment" in working.columns:
+        working = working[working["segment"].astype(str).str.upper().ne("INDICES")].copy()
+    if "name" not in working.columns:
+        working["name"] = working["tradingsymbol"]
+    working["name"] = working["name"].fillna("").astype(str).str.strip()
+    working = working[
+        working["instrument_type"].eq("EQ")
+        & working["tradingsymbol"].ne("")
+        & working["name"].ne("")
+    ].copy()
+    if working.empty:
+        return pd.DataFrame(columns=columns)
+    excluded = working.apply(
+        lambda row: _is_non_stock_or_etf_instrument(row.get("tradingsymbol"), row.get("name")),
+        axis=1,
+    )
+    working = working[~excluded].copy()
+
+    nse = working[working["exchange"].eq("NSE")].copy()
+    bse = working[working["exchange"].eq("BSE")].copy()
+    if key == "all_nse_eq":
+        selected = nse
+    elif key == "bse_only_eq":
+        nse_symbols = set(nse["tradingsymbol"].astype(str).str.upper())
+        nse_names = set(nse["name"].map(_normalized_company_name_key))
+        selected = bse[
+            ~bse["tradingsymbol"].astype(str).str.upper().isin(nse_symbols)
+            & ~bse["name"].map(_normalized_company_name_key).isin(nse_names)
+        ].copy()
+    else:
+        selected = pd.DataFrame(columns=working.columns)
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+
+    selected = selected.drop_duplicates(subset=["exchange", "tradingsymbol"]).sort_values(["exchange", "tradingsymbol"])
+    return pd.DataFrame(
+        {
+            "Company Name": selected["name"].values,
+            "Industry": "",
+            "Symbol": selected["tradingsymbol"].values,
+            "exchange": selected["exchange"].values,
+            "source_universe": str(definition.get("label", "")),
+        }
+    ).reset_index(drop=True)
+
+
+def _is_non_stock_or_etf_instrument(symbol: Any, name: Any) -> bool:
+    symbol_text = str(symbol or "").strip().upper()
+    name_text = str(name or "").strip().upper()
+    if not symbol_text:
+        return True
+    if is_excluded_weekly_screener_instrument(symbol_text, name_text):
+        return True
+    return bool(
+        symbol_text.endswith(("-IV", "-RR", "-E1", "-P1", "INAV"))
+        or "ETF" in symbol_text
+        or "BEES" in symbol_text
+        or "ETF" in name_text
+        or "EXCHANGE TRADED FUND" in name_text
+        or "MUTUAL FUND" in name_text
+        or name_text.endswith(" GOLD FUND")
+    )
+
+
+def _normalized_company_name_key(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
 
 
 def _load_nifty100_constituents(data_root: Path, *, allow_remote_fetch: bool = False) -> pd.DataFrame:
@@ -780,15 +946,28 @@ def _stock_signature_selected_universes(values: Iterable[Any], *, custom_symbols
     return selected
 
 
-def _stock_signature_universe_options(selected_universes: Iterable[str]) -> list[dict[str, Any]]:
+def _stock_signature_universe_options(
+    selected_universes: Iterable[str],
+    *,
+    include_full_market: bool = False,
+) -> list[dict[str, Any]]:
     selected = {str(value).strip().lower() for value in selected_universes}
+    definitions = (
+        STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.items()
+        if include_full_market
+        else (
+            (key, definition)
+            for key, definition in STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.items()
+            if not definition.get("dynamic")
+        )
+    )
     return [
         {
             "value": key,
             "label": str(definition["label"]),
             "selected": key in selected,
         }
-        for key, definition in STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.items()
+        for key, definition in definitions
     ]
 
 
@@ -816,13 +995,14 @@ def _parse_stock_signature_custom_symbols(raw_symbols: Any, maximum: int | None 
 def _stock_signature_custom_symbols_frame(raw_symbols: str) -> pd.DataFrame:
     symbols = _parse_stock_signature_custom_symbols(raw_symbols)
     if not symbols:
-        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "exchange", "source_universe"])
     return pd.DataFrame(
         [
             {
                 "Company Name": symbol,
                 "Industry": "Custom",
                 "Symbol": symbol,
+                "exchange": "NSE",
                 "source_universe": "Custom list",
             }
             for symbol in symbols
@@ -841,17 +1021,19 @@ def _first_nonempty(values: pd.Series) -> str:
 def _combine_stock_signature_universe(frames: list[pd.DataFrame]) -> pd.DataFrame:
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
-        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "exchange", "source_universe"])
     combined = pd.concat(frames, ignore_index=True)
     combined["Symbol"] = combined["Symbol"].astype(str).str.upper().str.strip()
     combined = combined[combined["Symbol"].ne("")].copy()
     if combined.empty:
-        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "source_universe"])
-    for column in ("Company Name", "Industry", "source_universe"):
+        return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "exchange", "source_universe"])
+    for column in ("Company Name", "Industry", "exchange", "source_universe"):
         if column not in combined.columns:
             combined[column] = ""
+    combined["exchange"] = combined["exchange"].fillna("").astype(str).str.upper().str.strip()
+    combined["exchange"] = combined["exchange"].mask(combined["exchange"].eq(""), "NSE")
     grouped = (
-        combined.groupby("Symbol", as_index=False)
+        combined.groupby(["exchange", "Symbol"], as_index=False)
         .agg(
             {
                 "Company Name": _first_nonempty,
@@ -868,7 +1050,7 @@ def _combine_stock_signature_universe(frames: list[pd.DataFrame]) -> pd.DataFram
         .sort_values("Symbol")
         .reset_index(drop=True)
     )
-    return grouped[["Company Name", "Industry", "Symbol", "source_universe"]]
+    return grouped[["Company Name", "Industry", "Symbol", "exchange", "source_universe"]]
 
 
 def _stock_signature_universe_label(selected_universes: Iterable[str], custom_symbols: str) -> str:
@@ -971,8 +1153,12 @@ def _build_stock_signature_universe(
             allow_remote_fetch=allow_remote_fetch,
         )
         definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS[key]
-        source_urls.append(str(definition["url"]))
-        source_files.append(str(_stock_signature_index_path(data_root, key)))
+        if definition.get("url"):
+            source_urls.append(str(definition["url"]))
+        if definition.get("filename"):
+            source_files.append(str(_stock_signature_index_path(data_root, key)))
+        elif definition.get("dynamic"):
+            source_files.append(str(Storage(data_root).instruments_path()))
         if frame.empty:
             missing.append(str(definition["label"]))
         else:
@@ -998,6 +1184,437 @@ def _stock_signature_dir(data_root: Path) -> Path:
 
 def _drawdown_recovery_dir(data_root: Path) -> Path:
     return data_root / "drawdown_recovery"
+
+
+def _dma_reclaim_strategy_dir(data_root: Path) -> Path:
+    return data_root / "dma_reclaim_strategy"
+
+
+def _roi_journal_dma_dir(data_root: Path) -> Path:
+    return data_root / "roi_journal_dma"
+
+
+def _roi_journal_upload_dir(data_root: Path) -> Path:
+    return data_root / "roi_journal_uploads"
+
+
+ROI_JOURNAL_TABLE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("Rank", "candidate_rank", "number"),
+    ("Score", "research_score", "number"),
+    ("Setup Case", "research_setup_case", "text"),
+    ("Next-Day Long Bias", "next_day_long_bias", "text"),
+    ("Trend Around Date", "trend_around_date_identifier", "text"),
+    ("ID", "signal_id", "number"),
+    ("Stock", "__stock", "text"),
+    ("Strategy", "strategy", "text"),
+    ("Top 5", "top_5", "text"),
+    ("Date Identifier", "date_identifier", "date"),
+    ("Setup Date", "setup_date", "date"),
+    ("75DMA Reclaim Window", "__dma75_reclaim_signal_window_pass", "text"),
+    ("75DMA Reclaim Timing", "dma75_reclaim_timing", "text"),
+    ("Break Below 75DMA Date", "dma75_break_below_date", "date"),
+    ("Reclaim Above 75DMA Date", "dma75_reclaim_date", "date"),
+    ("Reclaim Offset Sessions", "dma75_reclaim_offset_sessions", "number"),
+    ("Sessions To Reclaim", "dma75_sessions_to_reclaim_after_break", "number"),
+    ("Entry Date After Reclaim", "dma75_entry_date", "date"),
+    ("Entry Close After Reclaim", "dma75_entry_close", "number"),
+    ("75DMA Exit Date", "dma75_exit_date", "date"),
+    ("75DMA Exit Close", "dma75_exit_close", "number"),
+    ("75DMA Hold Sessions", "dma75_hold_trading_sessions", "number"),
+    ("75DMA Hold Days", "dma75_hold_calendar_days", "number"),
+    ("75DMA Reclaim Return %", "dma75_return_pct", "number"),
+    ("75DMA Entry Status", "dma75_entry_status", "text"),
+    ("Setup Close", "setup_close", "number"),
+    ("DMA Trend", "dma_trend_20d_label", "text"),
+    ("75DMA 20D Trend %", "dma_75_trend_20d_pct", "number"),
+    ("100DMA 20D Trend %", "dma_100_trend_20d_pct", "number"),
+    ("DMA Stack", "dma_stack", "text"),
+    ("Both DMA Trends Positive", "__all_dma_trend_positive", "text"),
+    ("Both DMA Trends Non-Negative", "__all_dma_trend_non_negative", "text"),
+    ("Both DMA Distances Reducing", "__all_dma_distance_reducing", "text"),
+    ("Price Above Both DMAs", "__price_above_all_dma", "text"),
+    ("Long Trend Aligned", "__long_trend_aligned", "text"),
+    ("Best DMA Reduced", "best_dma_reduction_pct_points", "number"),
+    ("Nearest DMA Gap", "nearest_dma_distance_abs_pct", "number"),
+    ("75DMA Dist %", "distance_75dma_pct", "number"),
+    ("100DMA Dist %", "distance_100dma_pct", "number"),
+    ("Obs 75 Dist %", "observation_distance_75dma_pct", "number"),
+    ("Obs 100 Dist %", "observation_distance_100dma_pct", "number"),
+    ("75 Dist Reduced", "distance_reduction_75dma_pct_points", "number"),
+    ("100 Dist Reduced", "distance_reduction_100dma_pct_points", "number"),
+    ("Recovering DMA", "__recovering_dma", "text"),
+    ("Last Pivot", "__last_pivot", "text"),
+    ("Last High", "__last_high", "text"),
+    ("Last High Date", "last_high_pivot_date", "date"),
+    ("Last High Price", "last_high_pivot_price", "number"),
+    ("Last HH Date", "last_hh_pivot_date", "date"),
+    ("Last HH Price", "last_hh_pivot_price", "number"),
+    ("Distance To Last HH %", "distance_to_last_hh_pct", "number"),
+    ("Last HL Date", "last_hl_pivot_date", "date"),
+    ("Last HL Price", "last_hl_pivot_price", "number"),
+    ("Distance To Last HL %", "distance_to_last_hl_pct", "number"),
+    ("Closest HH/HL", "closest_hh_hl_reference", "text"),
+    ("Closest HH/HL Gap %", "closest_hh_hl_gap_pct", "number"),
+    ("Last Low", "last_low_pivot_structure", "text"),
+    ("Last LL Date", "last_ll_pivot_date", "date"),
+    ("LL Recovery %", "ll_recovery_pct", "number"),
+    ("LL Age", "ll_pivot_age_sessions", "number"),
+    ("Swings Window", "swing_count_6m", "number"),
+    ("Low-High Swings Window", "low_high_swings_6m", "number"),
+    ("Pullback Events Window", "pullback_events_6m", "number"),
+    ("Average Pullback %", "average_pullback_pct", "number"),
+    ("Median Pullback %", "median_pullback_pct", "number"),
+    ("Current Pullback From High %", "current_pullback_from_last_high_pct", "number"),
+    ("Current Pullback Abs %", "current_pullback_abs_pct", "number"),
+    ("Current Pullback / Avg", "current_pullback_vs_avg", "number"),
+    ("Pullback Context", "pullback_context", "text"),
+    ("Next Date", "next_trade_date", "date"),
+    ("Latest Date", "latest_return_date", "date"),
+    ("Forward Return %", "forward_return_pct", "number"),
+    ("Actual Return", "actual_return_input", "text"),
+    ("Status", "data_status", "text"),
+    ("Rank Reason", "ranking_reason", "text"),
+    ("Reason", "reason", "text"),
+)
+
+
+def _filter_roi_journal_signal_rows(
+    rows: pd.DataFrame,
+    *,
+    stock_search: str = "",
+    pivot_filter: str = "",
+    recovering_dma_filter: str = "",
+    dma_trend_filter: str = "",
+    min_dma_reduction: float | None = None,
+    min_swings: int | None = None,
+    max_swings: int | None = None,
+) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    filtered = rows.copy()
+    if "symbol" in filtered.columns:
+        filtered["symbol"] = filtered["symbol"].fillna("").astype(str).str.upper().str.strip()
+    filtered = _apply_stock_search(filtered, stock_search)
+    pivot_value = str(pivot_filter or "").strip().upper()
+    if pivot_value in {"LL", "HL"} and "last_low_pivot_structure" in filtered.columns:
+        filtered = filtered[filtered["last_low_pivot_structure"].astype(str).str.upper().eq(pivot_value)].copy()
+    recovery_value = str(recovering_dma_filter or "").strip().lower()
+    if recovery_value in {"yes", "no"} and "recovering_toward_any_dma" in filtered.columns:
+        recovery_mask = filtered["recovering_toward_any_dma"].map(_roi_journal_truthy)
+        filtered = filtered[recovery_mask if recovery_value == "yes" else ~recovery_mask].copy()
+    trend_value = str(dma_trend_filter or "").strip().upper()
+    if trend_value in {"BULLISH", "IMPROVING", "MIXED", "WEAKENING", "BEARISH", "UNKNOWN"} and "dma_trend_20d_label" in filtered.columns:
+        filtered = filtered[filtered["dma_trend_20d_label"].fillna("Unknown").astype(str).str.upper().eq(trend_value)].copy()
+    if min_dma_reduction is not None:
+        reduction_columns = [
+            column
+            for column in ("distance_reduction_75dma_pct_points", "distance_reduction_100dma_pct_points")
+            if column in filtered.columns
+        ]
+        if reduction_columns:
+            best_reduction = filtered[reduction_columns].apply(pd.to_numeric, errors="coerce").max(axis=1)
+            filtered = filtered[best_reduction >= min_dma_reduction].copy()
+    if min_swings is not None and "swing_count_6m" in filtered.columns:
+        filtered = filtered[pd.to_numeric(filtered["swing_count_6m"], errors="coerce") >= min_swings].copy()
+    if max_swings is not None and "swing_count_6m" in filtered.columns:
+        filtered = filtered[pd.to_numeric(filtered["swing_count_6m"], errors="coerce") <= max_swings].copy()
+    return filtered
+
+
+def _roi_journal_column_value(row: pd.Series, key: str) -> Any:
+    if key == "__stock":
+        exchange = str(row.get("exchange", "") or "").strip()
+        symbol = str(row.get("symbol", "") or "").strip()
+        return f"{exchange}:{symbol}" if exchange or symbol else ""
+    if key == "__recovering_dma":
+        return _roi_journal_yes_no(row.get("recovering_toward_any_dma", False))
+    if key == "__all_dma_trend_positive":
+        return _roi_journal_yes_no(row.get("all_dma_trend_positive", False))
+    if key == "__all_dma_trend_non_negative":
+        return _roi_journal_yes_no(row.get("all_dma_trend_non_negative", False))
+    if key == "__all_dma_distance_reducing":
+        return _roi_journal_yes_no(row.get("all_dma_distance_reducing", False))
+    if key == "__price_above_all_dma":
+        return _roi_journal_yes_no(row.get("price_above_all_dma", False))
+    if key == "__long_trend_aligned":
+        return _roi_journal_yes_no(row.get("long_trend_aligned", False))
+    if key == "__dma75_reclaim_signal_window_pass":
+        return _roi_journal_yes_no(row.get("dma75_reclaim_signal_window_pass", False))
+    if key == "__last_pivot":
+        structure = str(row.get("last_pivot_structure", "") or "").strip()
+        pivot_type = str(row.get("last_pivot_type", "") or "").strip()
+        return f"{structure} {pivot_type}".strip()
+    if key == "__last_high":
+        structure = str(row.get("last_high_pivot_structure", "") or "").strip()
+        return f"{structure} HIGH".strip() if structure else ""
+    return row.get(key, "")
+
+
+def _roi_journal_yes_no(value: Any) -> str:
+    return "Yes" if _roi_journal_truthy(value) else "No"
+
+
+def _roi_journal_truthy(value: Any) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"", "0", "false", "f", "no", "n", "nan", "none"}:
+        return False
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    return bool(text)
+
+
+def _apply_roi_journal_column_filters(rows: pd.DataFrame, query_params: Any) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    filtered = rows.copy()
+    for index, (_, key, kind) in enumerate(ROI_JOURNAL_TABLE_COLUMNS):
+        raw_filter = str(query_params.get(f"col_{index}", "") or "").strip()
+        if not raw_filter:
+            continue
+        mask = filtered.apply(
+            lambda row: _roi_journal_filter_matches(_roi_journal_column_value(row, key), raw_filter, kind),
+            axis=1,
+        )
+        filtered = filtered[mask].copy()
+        if filtered.empty:
+            break
+    return filtered
+
+
+def _roi_journal_filter_matches(value: Any, raw_filter: str, kind: str) -> bool:
+    query = str(raw_filter or "").strip()
+    if not query:
+        return True
+    text = _roi_journal_filter_text(value)
+    lower_text = text.lower()
+    lower_query = query.lower()
+    if lower_query.startswith("!"):
+        return lower_query[1:] not in lower_text
+    if kind in {"number", "date"}:
+        numeric_value = _roi_journal_filter_number(value, kind)
+        if numeric_value is not None:
+            numeric_match = _roi_journal_numeric_filter_matches(numeric_value, lower_query)
+            if numeric_match is not None:
+                return numeric_match
+    return lower_query in lower_text
+
+
+def _roi_journal_filter_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and not np.isfinite(value):
+        return ""
+    return str(value).strip()
+
+
+def _roi_journal_filter_number(value: Any, kind: str) -> float | None:
+    if kind == "date":
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return float(pd.Timestamp(parsed).timestamp())
+    text = _roi_journal_filter_text(value).replace(",", "").replace("%", "").replace("x", "")
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _roi_journal_numeric_filter_matches(value: float, query: str) -> bool | None:
+    if ".." in query:
+        start_text, end_text = query.split("..", 1)
+        start = _roi_journal_query_number(start_text)
+        end = _roi_journal_query_number(end_text)
+        if start is None and end is None:
+            return None
+        if start is not None and value < start:
+            return False
+        if end is not None and value > end:
+            return False
+        return True
+    for operator in (">=", "<=", "!=", ">", "<", "="):
+        if query.startswith(operator):
+            threshold = _roi_journal_query_number(query[len(operator):])
+            if threshold is None:
+                return None
+            if operator == ">=":
+                return value >= threshold
+            if operator == "<=":
+                return value <= threshold
+            if operator == "!=":
+                return value != threshold
+            if operator == ">":
+                return value > threshold
+            if operator == "<":
+                return value < threshold
+            return value == threshold
+    exact = _roi_journal_query_number(query)
+    if exact is None:
+        return None
+    return value == exact
+
+
+def _roi_journal_query_number(value: str) -> float | None:
+    text = str(value or "").strip().replace(",", "").replace("%", "").replace("x", "")
+    if not text:
+        return None
+    parsed_date = pd.to_datetime(text, errors="coerce") if re.match(r"^\d{4}-\d{2}-\d{2}$", text) else pd.NaT
+    if pd.notna(parsed_date):
+        return float(pd.Timestamp(parsed_date).timestamp())
+    try:
+        numeric = float(text)
+    except ValueError:
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _roi_journal_export_frame(rows: pd.DataFrame) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        record: dict[str, Any] = {}
+        for label, key, kind in ROI_JOURNAL_TABLE_COLUMNS:
+            value = _roi_journal_column_value(row, key)
+            if kind == "number":
+                numeric = _roi_journal_filter_number(value, kind)
+                record[label] = np.nan if numeric is None else numeric
+            else:
+                record[label] = "" if value is None or (isinstance(value, float) and not np.isfinite(value)) else value
+        records.append(record)
+    return pd.DataFrame(records, columns=[label for label, _, _ in ROI_JOURNAL_TABLE_COLUMNS])
+
+
+def _parse_roi_journal_manual_symbol(raw_symbol: Any, raw_exchange: Any = "NSE") -> tuple[str, str]:
+    symbol_text = str(raw_symbol or "").strip().upper()
+    if not symbol_text:
+        raise ValueError("Enter a stock symbol.")
+
+    exchange = str(raw_exchange or "NSE").strip().upper() or "NSE"
+    if exchange not in {"AUTO", "NSE", "BSE"}:
+        raise ValueError("Choose NSE, BSE, or Auto for the exchange.")
+
+    if ":" in symbol_text:
+        prefix, symbol_text = symbol_text.split(":", 1)
+        prefix = prefix.strip().upper()
+        if prefix in {"NSE", "BSE"}:
+            exchange = prefix
+    if symbol_text.endswith(".NS"):
+        symbol_text = symbol_text[:-3]
+        exchange = "NSE"
+    elif symbol_text.endswith(".BO"):
+        symbol_text = symbol_text[:-3]
+        exchange = "BSE"
+
+    symbol = re.split(r"[\s,;/|]+", symbol_text.strip())[0].strip("'\"")
+    if not symbol or ".." in symbol or not re.fullmatch(r"[A-Z0-9&._-]+", symbol):
+        raise ValueError(f"Invalid stock symbol: {symbol or raw_symbol}")
+    return exchange, symbol
+
+
+def _resolve_roi_journal_kite_instrument(
+    instruments: pd.DataFrame,
+    requested_exchange: str,
+    symbol: str,
+) -> pd.Series:
+    required_columns = {"exchange", "tradingsymbol", "instrument_token"}
+    if instruments.empty or not required_columns.issubset(instruments.columns):
+        raise RuntimeError("Kite instruments are unavailable. Refresh Kite login and try again.")
+
+    exchange = str(requested_exchange or "NSE").strip().upper()
+    symbol = str(symbol or "").strip().upper()
+    candidates = instruments.copy()
+    candidates["exchange"] = candidates["exchange"].astype(str).str.upper().str.strip()
+    candidates["tradingsymbol"] = candidates["tradingsymbol"].astype(str).str.upper().str.strip()
+    if "instrument_type" in candidates.columns:
+        candidates = candidates[candidates["instrument_type"].astype(str).str.upper().eq("EQ")].copy()
+    if "segment" in candidates.columns:
+        candidates = candidates[candidates["segment"].astype(str).str.upper().ne("INDICES")].copy()
+    if "name" not in candidates.columns:
+        candidates["name"] = candidates["tradingsymbol"]
+    candidates["name"] = candidates["name"].fillna("").astype(str).str.strip()
+    candidates = candidates[
+        candidates["exchange"].isin({"NSE", "BSE"})
+        & candidates["tradingsymbol"].eq(symbol)
+    ].copy()
+    if not candidates.empty:
+        excluded = candidates.apply(
+            lambda row: _is_non_stock_or_etf_instrument(row.get("tradingsymbol"), row.get("name")),
+            axis=1,
+        )
+        candidates = candidates[~excluded].copy()
+    if exchange in {"NSE", "BSE"}:
+        candidates = candidates[candidates["exchange"].eq(exchange)].copy()
+    if candidates.empty:
+        prefix = "" if exchange == "AUTO" else f"{exchange}:"
+        raise RuntimeError(f"No Kite EQ instrument matched {prefix}{symbol}.")
+    candidates["_exchange_rank"] = candidates["exchange"].map({"NSE": 0, "BSE": 1}).fillna(2).astype(int)
+    return candidates.sort_values(["_exchange_rank", "exchange", "tradingsymbol"]).iloc[0]
+
+
+@serialized_daily_candle_refresh
+def _refresh_roi_journal_symbol_history(
+    storage: Storage,
+    *,
+    requested_exchange: str,
+    symbol: str,
+    start_date: date,
+    latest_stock_date: date,
+    lookback_months: int,
+) -> tuple[str, str, dict[str, Any]]:
+    if latest_stock_date < start_date:
+        raise ValueError("Latest stock date must be on or after the start date.")
+
+    fetch_start = (pd.Timestamp(start_date) - pd.DateOffset(months=max(int(lookback_months), ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS))).date()
+    provider: KiteDataProvider | None = None
+
+    def get_provider() -> KiteDataProvider:
+        nonlocal provider
+        if provider is None:
+            provider = _authenticated_kite_provider(storage, f"ROI Journal DMA for {requested_exchange}:{symbol}")
+        return provider
+
+    instruments = _load_or_refresh_kite_instruments(storage, get_provider)
+    instrument = _resolve_roi_journal_kite_instrument(instruments, requested_exchange, symbol)
+    resolved_exchange = str(instrument["exchange"]).strip().upper()
+    resolved_symbol = str(instrument["tradingsymbol"]).strip().upper()
+    token = int(instrument["instrument_token"])
+
+    existing = _clip_daily_candles(
+        storage,
+        resolved_exchange,
+        resolved_symbol,
+        storage.load_candles(resolved_exchange, resolved_symbol, "1D"),
+        latest_stock_date,
+    )
+    downloaded = _fetch_kite_daily_chunks(get_provider(), token, fetch_start, latest_stock_date)
+    daily = storage.merge_and_save_candles(resolved_exchange, resolved_symbol, downloaded, "1D")
+    daily = _clip_daily_candles(storage, resolved_exchange, resolved_symbol, daily, latest_stock_date)
+
+    latest_seen = _latest_candle_date(daily)
+    earliest_seen = pd.to_datetime(daily.get("date"), errors="coerce").min() if not daily.empty else pd.NaT
+    if latest_seen is None or latest_seen < start_date:
+        raise RuntimeError(f"No daily candles reached the start date for {resolved_exchange}:{resolved_symbol}.")
+
+    audit = {
+        "manual_symbol": f"{resolved_exchange}:{resolved_symbol}",
+        "manual_start_date": start_date.isoformat(),
+        "manual_latest_stock_date": latest_stock_date.isoformat(),
+        "manual_fetch_start_date": fetch_start.isoformat(),
+        "manual_downloaded_candles": int(len(downloaded)),
+        "manual_existing_candles_before_download": int(len(existing)),
+        "manual_cached_candles_after_download": int(len(daily)),
+        "manual_earliest_cached_date": "" if pd.isna(earliest_seen) else pd.Timestamp(earliest_seen).strftime("%Y-%m-%d"),
+        "manual_latest_cached_date": latest_seen.isoformat(),
+    }
+    return resolved_exchange, resolved_symbol, audit
 
 
 def _enrich_with_symbol_metadata(frame: pd.DataFrame, metadata: pd.DataFrame, symbol_column: str) -> pd.DataFrame:
@@ -1150,12 +1767,22 @@ def _parse_sensitivity_text(value: str, default: int | None = None) -> int | Non
         return default
 
 
-def _optional_float(value: str) -> float | None:
-    value = value.strip()
+def _optional_float(value: Any) -> float | None:
+    value = str(value or "").strip()
     if not value:
         return None
     try:
         return float(value)
+    except ValueError:
+        return None
+
+
+def _optional_int(value: Any) -> int | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
     except ValueError:
         return None
 
@@ -5439,6 +6066,173 @@ def _run_stock_signature_job(
         )
 
 
+def _dma_reclaim_fetch_months(start_date: Any, required_date: date, warmup_months: int) -> int:
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(required_date).normalize()
+    span_months = int(max((end_ts - start_ts).days, 0) / 30.4375) + 2
+    return max(int(warmup_months), span_months + int(warmup_months))
+
+
+def _filter_constituents_to_pair_texts(constituents: pd.DataFrame, pair_texts: Iterable[str]) -> pd.DataFrame:
+    if constituents.empty:
+        return constituents
+    allowed = {
+        tuple(str(value).strip().upper().split(":", 1))
+        for value in pair_texts
+        if ":" in str(value)
+    }
+    if not allowed:
+        return constituents.iloc[0:0].copy()
+    working = constituents.copy()
+    symbol_column = next(
+        (column for column in ("Symbol", "symbol", "tradingsymbol", "Tradingsymbol") if column in working.columns),
+        "",
+    )
+    if not symbol_column:
+        return working.iloc[0:0].copy()
+    exchanges = (
+        working["exchange"].fillna("NSE").astype(str).str.upper().str.strip()
+        if "exchange" in working.columns
+        else pd.Series("NSE", index=working.index)
+    )
+    symbols = working[symbol_column].fillna("").astype(str).str.upper().str.strip()
+    mask = [
+        (exchange or "NSE", symbol) in allowed
+        for exchange, symbol in zip(exchanges, symbols, strict=False)
+    ]
+    return working[pd.Series(mask, index=working.index)].copy()
+
+
+def _run_dma_reclaim_strategy_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    start_date: str,
+    warmup_months: int,
+    max_reclaim_sessions: int,
+    current_signal_lookback_sessions: int,
+    holding_sessions: int,
+    profit_target_pct: float,
+    stop_loss_pct: float,
+    stop_buffer_pct: float,
+    round_trip_cost_pct: float,
+    entry_price_mode: str,
+    exit_on_close_below_75dma: bool,
+    pivot_order: int,
+    requested_as_of_date: str = "",
+    selected_universes: list[str] | None = None,
+    custom_symbols: str = "",
+) -> None:
+    storage = Storage(data_root)
+
+    def refresh_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 45) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 45)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    def scan_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 45 + (int((completed / total) * 55) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(45, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        universe_keys = list(STOCK_SIGNATURE_DEFAULT_UNIVERSES if selected_universes is None else selected_universes)
+        constituents, universe_meta = _build_stock_signature_universe(
+            data_root,
+            universe_keys,
+            custom_symbols,
+            allow_remote_fetch=True,
+        )
+        if constituents.empty:
+            raise RuntimeError(
+                "The selected research universe is empty. Choose Nifty 100, Nifty 500, All NSE EQ, BSE-only EQ, or enter comma-separated symbols."
+            )
+        start_ts = pd.Timestamp(start_date).normalize()
+        requested_date, analysis_date = _resolve_stock_signature_required_date(requested_as_of_date)
+        refresh_months = _dma_reclaim_fetch_months(start_ts, analysis_date, warmup_months)
+        refreshed_symbols, refresh_audit = _refresh_stock_signature_candles(
+            storage,
+            constituents,
+            required_date=analysis_date,
+            lookback_months=refresh_months,
+            progress_callback=refresh_progress_callback,
+            progress_phase="Downloading 75DMA reclaim OHLC",
+            provider_label="75DMA Reclaim Strategy",
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh daily candles were available for the selected 75DMA reclaim universe.")
+        run_constituents = _filter_constituents_to_pair_texts(constituents, refreshed_symbols)
+        result = run_dma_reclaim_strategy_study(
+            storage,
+            run_constituents,
+            universe_name=str(universe_meta["universe_summary"]),
+            start_date=start_ts,
+            as_of_date=analysis_date,
+            warmup_months=warmup_months,
+            max_reclaim_sessions=max_reclaim_sessions,
+            current_signal_lookback_sessions=current_signal_lookback_sessions,
+            holding_sessions=holding_sessions,
+            profit_target_pct=profit_target_pct,
+            stop_loss_pct=stop_loss_pct,
+            stop_buffer_pct=stop_buffer_pct,
+            round_trip_cost_pct=round_trip_cost_pct,
+            entry_price_mode=entry_price_mode,
+            exit_on_close_below_75dma=exit_on_close_below_75dma,
+            pivot_order=pivot_order,
+            required_latest_date=analysis_date,
+            progress_callback=scan_progress_callback,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
+        result.summary["selected_universes"] = list(universe_meta["selected_universes"])
+        result.summary["custom_symbols"] = str(universe_meta["custom_symbols"])
+        result.summary["universe_label"] = str(universe_meta["universe_label"])
+        result.summary["constituent_source_url"] = ", ".join(universe_meta["source_urls"])
+        result.summary["constituent_source_file"] = ", ".join(universe_meta["source_files"])
+        save_dma_reclaim_strategy_outputs(result, _dma_reclaim_strategy_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_with_history", 0)),
+            total=int(result.summary.get("symbols_requested", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/dma-reclaim-strategy?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/dma-reclaim-strategy?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
 def _run_drawdown_recovery_job(
     job_id: str,
     data_root: Path,
@@ -5592,6 +6386,29 @@ def _stock_signature_constituent_symbols(constituents: pd.DataFrame) -> list[str
     return sorted(dict.fromkeys(symbol for symbol in symbols if symbol))
 
 
+def _stock_signature_constituent_pairs(constituents: pd.DataFrame) -> list[tuple[str, str]]:
+    if constituents.empty:
+        return []
+    symbol_column = next(
+        (column for column in ("Symbol", "symbol", "tradingsymbol", "Tradingsymbol") if column in constituents.columns),
+        "",
+    )
+    if not symbol_column:
+        return []
+    exchange_values = (
+        constituents["exchange"].fillna("NSE").astype(str).str.upper().str.strip()
+        if "exchange" in constituents.columns
+        else pd.Series("NSE", index=constituents.index)
+    )
+    symbol_values = constituents[symbol_column].fillna("").astype(str).str.upper().str.strip()
+    pairs = [
+        (exchange or "NSE", symbol)
+        for exchange, symbol in zip(exchange_values, symbol_values, strict=False)
+        if symbol and (exchange or "NSE") in {"NSE", "BSE"}
+    ]
+    return sorted(dict.fromkeys(pairs))
+
+
 @serialized_daily_candle_refresh
 def _refresh_stock_signature_candles(
     storage: Storage,
@@ -5613,25 +6430,36 @@ def _refresh_stock_signature_candles(
             provider = _authenticated_kite_provider(storage, provider_label)
         return provider
 
-    requested_symbols = set(_stock_signature_constituent_symbols(constituents))
+    requested_pairs = set(_stock_signature_constituent_pairs(constituents))
     instruments = _load_or_refresh_kite_instruments(storage, get_provider)
-    nse = instruments[
-        (instruments["exchange"].astype(str).str.upper() == "NSE")
+    equity = instruments[
+        (instruments["exchange"].astype(str).str.upper().isin({"NSE", "BSE"}))
         & (instruments["segment"].astype(str).str.upper() != "INDICES")
     ].copy()
-    if "instrument_type" in nse.columns:
-        nse = nse[nse["instrument_type"].astype(str).str.upper().isin({"EQ"})].copy()
-    nse["tradingsymbol"] = nse["tradingsymbol"].astype(str).str.upper().str.strip()
+    if "instrument_type" in equity.columns:
+        equity = equity[equity["instrument_type"].astype(str).str.upper().isin({"EQ"})].copy()
+    equity["exchange"] = equity["exchange"].astype(str).str.upper().str.strip()
+    equity["tradingsymbol"] = equity["tradingsymbol"].astype(str).str.upper().str.strip()
+    if "name" not in equity.columns:
+        equity["name"] = equity["tradingsymbol"]
+    equity = equity[
+        ~equity.apply(
+            lambda row: _is_non_stock_or_etf_instrument(row.get("tradingsymbol"), row.get("name")),
+            axis=1,
+        )
+    ].copy()
+    equity["requested_pair"] = list(zip(equity["exchange"], equity["tradingsymbol"], strict=False))
     candidates = (
-        nse[nse["tradingsymbol"].isin(requested_symbols)]
-        .drop_duplicates(subset=["tradingsymbol"])
-        .sort_values("tradingsymbol")
+        equity[equity["requested_pair"].isin(requested_pairs)]
+        .drop_duplicates(subset=["exchange", "tradingsymbol"])
+        .sort_values(["exchange", "tradingsymbol"])
         .reset_index(drop=True)
     )
-    unavailable_symbols = requested_symbols - set(candidates["tradingsymbol"].astype(str).str.upper())
+    available_pairs = set(zip(candidates["exchange"].astype(str).str.upper(), candidates["tradingsymbol"].astype(str).str.upper(), strict=False))
+    unavailable_pairs = requested_pairs - available_pairs
     if candidates.empty:
-        missing_text = ", ".join(sorted(unavailable_symbols)) or "the selected symbols"
-        raise RuntimeError(f"No NSE Kite instruments matched: {missing_text}. Use NSE trading symbols such as RELIANCE or HDFCBANK.")
+        missing_text = ", ".join(f"{exchange}:{symbol}" for exchange, symbol in sorted(unavailable_pairs)) or "the selected symbols"
+        raise RuntimeError(f"No Kite EQ instruments matched: {missing_text}. Use trading symbols such as NSE:RELIANCE or BSE:OFSS.")
 
     refreshed_symbols: list[str] = []
     stale_symbols: list[str] = []
@@ -5652,12 +6480,13 @@ def _refresh_stock_signature_candles(
 
     for completed, (_, instrument) in enumerate(candidates.iterrows(), start=1):
         symbol = str(instrument["tradingsymbol"]).strip().upper()
+        exchange = str(instrument["exchange"]).strip().upper()
         try:
             existing = _clip_daily_candles(
                 storage,
-                "NSE",
+                exchange,
                 symbol,
-                storage.load_candles("NSE", symbol, "1D"),
+                storage.load_candles(exchange, symbol, "1D"),
                 required_date,
             )
             new_daily = get_provider().daily_candles(
@@ -5670,15 +6499,15 @@ def _refresh_stock_signature_candles(
                 reused_symbols += 1
             else:
                 fetched_symbols += 1
-                daily = storage.merge_and_save_candles("NSE", symbol, new_daily, "1D")
-            daily = _clip_daily_candles(storage, "NSE", symbol, daily, required_date)
+                daily = storage.merge_and_save_candles(exchange, symbol, new_daily, "1D")
+            daily = _clip_daily_candles(storage, exchange, symbol, daily, required_date)
         except Exception:
-            failed_symbols.append(symbol)
+            failed_symbols.append(f"{exchange}:{symbol}")
             daily = pd.DataFrame()
         if _latest_candle_date(daily) == required_date:
-            refreshed_symbols.append(symbol)
-        elif symbol not in failed_symbols:
-            stale_symbols.append(symbol)
+            refreshed_symbols.append(f"{exchange}:{symbol}")
+        elif f"{exchange}:{symbol}" not in failed_symbols:
+            stale_symbols.append(f"{exchange}:{symbol}")
         if progress_callback:
             progress_callback(
                 {
@@ -5686,7 +6515,7 @@ def _refresh_stock_signature_candles(
                     "completed": completed,
                     "total": len(candidates),
                     "current_symbol": symbol,
-                    "current_exchange": "NSE",
+                    "current_exchange": exchange,
                 }
             )
 
@@ -5695,8 +6524,8 @@ def _refresh_stock_signature_candles(
     audit = {
         "refresh_expected_date": required_date.isoformat(),
         "refresh_start_date": fetch_start.isoformat(),
-        "refresh_requested_count": len(requested_symbols),
-        "refresh_unavailable_count": len(unavailable_symbols),
+        "refresh_requested_count": len(requested_pairs),
+        "refresh_unavailable_count": len(unavailable_pairs),
         "refresh_universe_count": total,
         "refresh_current_count": len(refreshed_symbols),
         "refresh_stale_count": len(stale_symbols),
@@ -8354,6 +9183,711 @@ async def run_stock_signature_from_dashboard(request: Request) -> RedirectRespon
         redirect_url = f"/stock-signature?study_job={job_id}{query_suffix}"
     except Exception as exc:
         redirect_url = f"/stock-signature?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/dma-reclaim-strategy", response_class=HTMLResponse)
+def dma_reclaim_strategy_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    latest = load_dma_reclaim_strategy_outputs(_dma_reclaim_strategy_dir(data_root))
+    summary = dict(latest.summary)
+    default_as_of = str(summary.get("requested_as_of_date") or _latest_completed_nse_calendar_date().isoformat())
+    default_start = (pd.Timestamp(default_as_of) - pd.DateOffset(months=18)).strftime("%Y-%m-%d")
+    start_date = str(request.query_params.get("start_date", summary.get("requested_start_date", default_start)) or default_start).strip()
+    as_of_date = _as_of_date_input(request, summary) or default_as_of
+    warmup_months = _int_query_param(request, summary, "warmup_months", DMA_RECLAIM_DEFAULT_WARMUP_MONTHS, minimum=6, maximum=36)
+    max_reclaim_sessions = _int_query_param(request, summary, "max_reclaim_sessions", DMA_RECLAIM_DEFAULT_MAX_RECLAIM, minimum=1, maximum=30)
+    current_signal_lookback_sessions = _int_query_param(
+        request,
+        summary,
+        "current_signal_lookback_sessions",
+        DMA_RECLAIM_DEFAULT_CURRENT_LOOKBACK,
+        minimum=1,
+        maximum=30,
+    )
+    holding_sessions = _int_query_param(request, summary, "holding_sessions", DMA_RECLAIM_DEFAULT_HOLDING_SESSIONS, minimum=1, maximum=120)
+    profit_target_pct = _float_query_param(request, summary, "profit_target_pct", DMA_RECLAIM_DEFAULT_TARGET_PCT, minimum=0.0, maximum=100.0)
+    stop_loss_pct = _float_query_param(request, summary, "stop_loss_pct", DMA_RECLAIM_DEFAULT_STOP_PCT, minimum=0.1, maximum=50.0)
+    stop_buffer_pct = _float_query_param(request, summary, "stop_buffer_pct", DMA_RECLAIM_DEFAULT_STOP_BUFFER_PCT, minimum=0.0, maximum=10.0)
+    round_trip_cost_pct = _float_query_param(request, summary, "round_trip_cost_pct", DMA_RECLAIM_DEFAULT_COST_PCT, minimum=0.0, maximum=5.0)
+    pivot_order = _int_query_param(request, summary, "pivot_order", DMA_RECLAIM_DEFAULT_PIVOT_ORDER, minimum=1, maximum=10)
+    entry_price_mode = str(request.query_params.get("entry_price_mode", summary.get("entry_price_mode", "next_open")) or "next_open").strip().lower()
+    if entry_price_mode not in {"next_open", "next_close"}:
+        entry_price_mode = "next_open"
+    if "exit_on_close_below_75dma" in request.query_params:
+        exit_on_close_below_75dma = _truthy_param(request.query_params.getlist("exit_on_close_below_75dma"), default=True)
+    else:
+        exit_on_close_below_75dma = _truthy_param([summary.get("exit_on_close_below_75dma", True)], default=True)
+
+    universe_values = request.query_params.getlist("universe")
+    custom_symbols_param = request.query_params.get("custom_symbols")
+    if custom_symbols_param is not None:
+        custom_symbols = str(custom_symbols_param or "").strip()
+    elif universe_values:
+        custom_symbols = ""
+    else:
+        custom_symbols = str(summary.get("custom_symbols", "") or "").strip()
+    if not universe_values:
+        saved_universes = summary.get("selected_universes", "")
+        if isinstance(saved_universes, list):
+            universe_values = saved_universes
+        elif str(saved_universes or "").strip():
+            universe_values = re.split(r"[\s,;]+", str(saved_universes))
+    selected_universes = _stock_signature_selected_universes(universe_values, custom_symbols=custom_symbols)
+    try:
+        _, universe_meta = _build_stock_signature_universe(
+            data_root,
+            selected_universes,
+            custom_symbols,
+            allow_remote_fetch=False,
+        )
+        universe_error = ""
+    except ValueError as exc:
+        universe_meta = {
+            "selected_universes": selected_universes,
+            "custom_symbols": custom_symbols,
+            "universe_label": _stock_signature_universe_label(selected_universes, custom_symbols),
+            "universe_summary": _stock_signature_universe_summary(selected_universes, custom_symbols),
+            "missing_universes": [],
+            "source_urls": [],
+            "source_files": [],
+        }
+        universe_error = str(exc)
+
+    stock_search = request.query_params.get("stock_search", "").strip()
+    candidate_tier = request.query_params.get("candidate_tier", "").strip()
+    strategy_filter = request.query_params.get("strategy", "").strip()
+    candidates = latest.candidates.copy()
+    if not candidates.empty:
+        candidates = _apply_stock_search(candidates, stock_search)
+        if candidate_tier:
+            candidates = candidates[candidates.get("strategy_tier", pd.Series("", index=candidates.index)).astype(str).eq(candidate_tier)].copy()
+        candidates = candidates.sort_values(
+            [column for column in ("candidate_score", "strategy_tier_rank", "sessions_since_reclaim", "symbol") if column in candidates.columns],
+            ascending=[False, True, True, True][: len([column for column in ("candidate_score", "strategy_tier_rank", "sessions_since_reclaim", "symbol") if column in candidates.columns])],
+            na_position="last",
+        )
+    strict_candidates = candidates[candidates.get("strategy_tier", pd.Series("", index=candidates.index)).astype(str).eq("Strict Long")].copy() if not candidates.empty else pd.DataFrame()
+
+    strategy_stats = latest.strategy_stats.copy()
+    yearly_stats = latest.yearly_stats.copy()
+    stock_stats = latest.stock_stats.copy()
+    trades = latest.trades.copy()
+    if strategy_filter:
+        if not stock_stats.empty and "strategy" in stock_stats.columns:
+            stock_stats = stock_stats[stock_stats["strategy"].astype(str).eq(strategy_filter)].copy()
+        if not trades.empty and "strategy" in trades.columns:
+            trades = trades[trades["strategy"].astype(str).eq(strategy_filter)].copy()
+    if not stock_stats.empty:
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        sort_cols = [column for column in ("profit_factor", "win_rate_pct", "avg_return_pct", "trades") if column in stock_stats.columns]
+        if sort_cols:
+            stock_stats = stock_stats.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    if not trades.empty:
+        trades = _apply_stock_search(trades, stock_search)
+        trades = trades.sort_values(
+            [column for column in ("entry_date", "strategy", "symbol") if column in trades.columns],
+            ascending=[False, True, True][: len([column for column in ("entry_date", "strategy", "symbol") if column in trades.columns])],
+            na_position="last",
+        )
+    if not yearly_stats.empty and "year" in yearly_stats.columns:
+        yearly_stats = yearly_stats.sort_values(["year", "strategy"], ascending=[False, True], na_position="last")
+
+    return templates.TemplateResponse(
+        "dma_reclaim_strategy.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "candidates": _records(candidates.head(500)),
+            "candidates_count": len(candidates),
+            "strict_symbols_csv": _comma_separated_symbols(strict_candidates),
+            "candidate_symbols_csv": _comma_separated_symbols(candidates),
+            "strategy_stats": _records(strategy_stats),
+            "yearly_stats": _records(yearly_stats.head(100)),
+            "stock_stats": _records(stock_stats.head(300)),
+            "trades": _records(trades.head(500)),
+            "stock_search": stock_search,
+            "candidate_tier": candidate_tier,
+            "candidate_tier_options": ["Strict Long", "Trend Filtered", "Raw Reclaim"],
+            "strategy_filter": strategy_filter,
+            "strategy_options": [name for name, _ in (("Raw 75DMA Reclaim", ""), ("Trend Filtered 75DMA Reclaim", ""), ("Strict Long 75DMA Reclaim", ""))],
+            "start_date": start_date,
+            "as_of_date": as_of_date,
+            "warmup_months": warmup_months,
+            "max_reclaim_sessions": max_reclaim_sessions,
+            "current_signal_lookback_sessions": current_signal_lookback_sessions,
+            "holding_sessions": holding_sessions,
+            "profit_target_pct": profit_target_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "stop_buffer_pct": stop_buffer_pct,
+            "round_trip_cost_pct": round_trip_cost_pct,
+            "entry_price_mode": entry_price_mode,
+            "exit_on_close_below_75dma": exit_on_close_below_75dma,
+            "pivot_order": pivot_order,
+            "selected_universes": list(universe_meta["selected_universes"]),
+            "universe_options": _stock_signature_universe_options(universe_meta["selected_universes"], include_full_market=True),
+            "custom_symbols": str(universe_meta["custom_symbols"]),
+            "missing_universes": universe_meta.get("missing_universes", []),
+            "universe_error": universe_error,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/dma-reclaim-strategy/run")
+async def run_dma_reclaim_strategy_from_dashboard(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    run_scope = str(form.get("run_scope", "selected")).strip()
+    raw_custom_symbols = str(form.get("custom_symbols", "")).strip()
+    custom_symbols = ",".join(_parse_stock_signature_custom_symbols(raw_custom_symbols)) if raw_custom_symbols else ""
+    if run_scope == "custom_only" and not custom_symbols:
+        return RedirectResponse(
+            f"/dma-reclaim-strategy?study_error={quote('Enter at least one custom stock for Custom List Only.')}",
+            status_code=303,
+        )
+    selected_universes = [] if run_scope == "custom_only" else _stock_signature_selected_universes(
+        form.getlist("universe"),
+        custom_symbols=custom_symbols,
+    )
+
+    def form_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    def form_float(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    default_as_of = _latest_completed_nse_calendar_date().isoformat()
+    as_of_date = str(form.get("as_of_date", default_as_of)).strip() or default_as_of
+    try:
+        as_of_ts = pd.Timestamp(as_of_date)
+    except (TypeError, ValueError):
+        as_of_date = default_as_of
+        as_of_ts = pd.Timestamp(default_as_of)
+    default_start = (as_of_ts - pd.DateOffset(months=18)).strftime("%Y-%m-%d")
+    start_date = str(form.get("start_date", default_start)).strip() or default_start
+    try:
+        pd.Timestamp(start_date)
+    except (TypeError, ValueError):
+        start_date = default_start
+    warmup_months = form_int("warmup_months", DMA_RECLAIM_DEFAULT_WARMUP_MONTHS, 6, 36)
+    max_reclaim_sessions = form_int("max_reclaim_sessions", DMA_RECLAIM_DEFAULT_MAX_RECLAIM, 1, 30)
+    current_signal_lookback_sessions = form_int("current_signal_lookback_sessions", DMA_RECLAIM_DEFAULT_CURRENT_LOOKBACK, 1, 30)
+    holding_sessions = form_int("holding_sessions", DMA_RECLAIM_DEFAULT_HOLDING_SESSIONS, 1, 120)
+    profit_target_pct = form_float("profit_target_pct", DMA_RECLAIM_DEFAULT_TARGET_PCT, 0.0, 100.0)
+    stop_loss_pct = form_float("stop_loss_pct", DMA_RECLAIM_DEFAULT_STOP_PCT, 0.1, 50.0)
+    stop_buffer_pct = form_float("stop_buffer_pct", DMA_RECLAIM_DEFAULT_STOP_BUFFER_PCT, 0.0, 10.0)
+    round_trip_cost_pct = form_float("round_trip_cost_pct", DMA_RECLAIM_DEFAULT_COST_PCT, 0.0, 5.0)
+    pivot_order = form_int("pivot_order", DMA_RECLAIM_DEFAULT_PIVOT_ORDER, 1, 10)
+    entry_price_mode = str(form.get("entry_price_mode", "next_open")).strip().lower()
+    if entry_price_mode not in {"next_open", "next_close"}:
+        entry_price_mode = "next_open"
+    exit_on_close_below_75dma = _truthy_param(form.getlist("exit_on_close_below_75dma"), default=False)
+
+    params = [
+        f"start_date={quote(start_date)}",
+        f"as_of_date={quote(as_of_date)}",
+        f"warmup_months={warmup_months}",
+        f"max_reclaim_sessions={max_reclaim_sessions}",
+        f"current_signal_lookback_sessions={current_signal_lookback_sessions}",
+        f"holding_sessions={holding_sessions}",
+        f"profit_target_pct={quote(str(profit_target_pct))}",
+        f"stop_loss_pct={quote(str(stop_loss_pct))}",
+        f"stop_buffer_pct={quote(str(stop_buffer_pct))}",
+        f"round_trip_cost_pct={quote(str(round_trip_cost_pct))}",
+        f"entry_price_mode={quote(entry_price_mode)}",
+        f"exit_on_close_below_75dma={'1' if exit_on_close_below_75dma else '0'}",
+        f"pivot_order={pivot_order}",
+    ]
+    for universe in selected_universes:
+        params.append(f"universe={quote(universe)}")
+    if custom_symbols:
+        params.append(f"custom_symbols={quote(custom_symbols)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _submit_scan_job(
+            job_id,
+            "75DMA Reclaim Strategy",
+            _run_dma_reclaim_strategy_job,
+            data_root,
+            query_suffix,
+            start_date,
+            warmup_months,
+            max_reclaim_sessions,
+            current_signal_lookback_sessions,
+            holding_sessions,
+            profit_target_pct,
+            stop_loss_pct,
+            stop_buffer_pct,
+            round_trip_cost_pct,
+            entry_price_mode,
+            exit_on_close_below_75dma,
+            pivot_order,
+            as_of_date,
+            selected_universes,
+            custom_symbols,
+        )
+        redirect_url = f"/dma-reclaim-strategy?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/dma-reclaim-strategy?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/dma-reclaim-strategy/candidates.csv")
+def download_dma_reclaim_candidates(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    path = _dma_reclaim_strategy_dir(get_data_root(load_config())) / "latest_candidates.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the 75DMA reclaim strategy first")
+    return FileResponse(path, media_type="text/csv", filename="dma_reclaim_current_candidates.csv")
+
+
+@app.get("/dma-reclaim-strategy/trades.csv")
+def download_dma_reclaim_trades(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    path = _dma_reclaim_strategy_dir(get_data_root(load_config())) / "trades.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the 75DMA reclaim strategy first")
+    return FileResponse(path, media_type="text/csv", filename="dma_reclaim_backtest_trades.csv")
+
+
+@app.get("/dma-reclaim-strategy/report.xlsx")
+def download_dma_reclaim_report(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    data_root = get_data_root(load_config())
+    output_dir = _dma_reclaim_strategy_dir(data_root)
+    result = load_dma_reclaim_strategy_outputs(output_dir)
+    if not result.summary and result.candidates.empty and result.trades.empty:
+        raise HTTPException(status_code=404, detail="Run the 75DMA reclaim strategy first")
+    workbook_path = output_dir / "dma_reclaim_strategy_report.xlsx"
+    write_dma_reclaim_strategy_workbook(result, workbook_path)
+    return FileResponse(
+        workbook_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="dma_reclaim_strategy_report.xlsx",
+    )
+
+
+@app.get("/roi-journal-dma", response_class=HTMLResponse)
+def roi_journal_dma_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    latest = load_roi_journal_dma_outputs(_roi_journal_dma_dir(data_root))
+    summary = dict(latest.summary)
+    stock_search = request.query_params.get("stock_search", "").strip()
+    pivot_filter = request.query_params.get("last_low_pivot_structure", "").strip().upper()
+    recovering_dma_filter = request.query_params.get("recovering_dma", "").strip().lower()
+    dma_trend_filter = request.query_params.get("dma_trend", "").strip().upper()
+    min_dma_reduction = _optional_float(request.query_params.get("min_dma_reduction_pct_points"))
+    min_swings = _optional_int(request.query_params.get("min_swings"))
+    max_swings = _optional_int(request.query_params.get("max_swings"))
+    selected_signal_id = str(request.query_params.get("signal_id", "")).strip()
+    manual_exchange = request.query_params.get("manual_exchange", "NSE").strip().upper() or "NSE"
+    if manual_exchange not in {"AUTO", "NSE", "BSE"}:
+        manual_exchange = "NSE"
+    manual_symbol = request.query_params.get("manual_symbol", summary.get("manual_symbol", "")).strip().upper()
+    manual_start_date = request.query_params.get("manual_start_date", summary.get("manual_start_date", "")).strip()
+    manual_latest_stock_date = request.query_params.get(
+        "manual_latest_stock_date",
+        summary.get("manual_latest_stock_date", summary.get("requested_latest_stock_date", "")),
+    ).strip()
+    symbol_lookback_months = _int_query_param(
+        request,
+        summary,
+        "symbol_lookback_months",
+        ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS,
+        minimum=ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS,
+        maximum=24,
+    )
+
+    rows = latest.signal_rows.copy()
+    stock_options: list[dict[str, str]] = []
+    if not rows.empty:
+        if "symbol" in rows.columns:
+            rows["symbol"] = rows["symbol"].fillna("").astype(str).str.upper().str.strip()
+            option_frame = rows[rows["symbol"].ne("")].copy()
+            if not option_frame.empty:
+                counts = option_frame.groupby("symbol", dropna=True).size().sort_index()
+                stock_options = [
+                    {
+                        "value": str(symbol),
+                        "label": f"{symbol} ({int(count)} rows)" if int(count) != 1 else str(symbol),
+                    }
+                    for symbol, count in counts.items()
+                ]
+        rows = _filter_roi_journal_signal_rows(
+            rows,
+            stock_search=stock_search,
+            pivot_filter=pivot_filter,
+            recovering_dma_filter=recovering_dma_filter,
+            dma_trend_filter=dma_trend_filter,
+            min_dma_reduction=min_dma_reduction,
+            min_swings=min_swings,
+            max_swings=max_swings,
+        )
+        rows = _apply_roi_journal_column_filters(rows, request.query_params)
+
+    if not selected_signal_id and not rows.empty and "signal_id" in rows.columns:
+        selected_signal_id = str(rows.iloc[0]["signal_id"])
+    if selected_signal_id and not rows.empty and "signal_id" in rows.columns:
+        visible_signal_ids = set(rows["signal_id"].astype(str))
+        if selected_signal_id not in visible_signal_ids:
+            selected_signal_id = str(rows.iloc[0]["signal_id"])
+
+    selected_row: dict[str, Any] = {}
+    if selected_signal_id and not rows.empty and "signal_id" in rows.columns:
+        selected_matches = rows[rows["signal_id"].astype(str).eq(selected_signal_id)]
+        if not selected_matches.empty:
+            selected_row = _records(selected_matches.head(1))[0]
+
+    chart_html = ""
+    chart_message = "Upload and run an ROI Journal file, then select a row to draw DMA distance."
+    if selected_signal_id:
+        chart_html = build_roi_journal_dma_distance_chart(
+            latest.distance_history,
+            signal_id=selected_signal_id,
+            reclaim_date=selected_row.get("dma75_reclaim_date", ""),
+            entry_date=selected_row.get("dma75_entry_date", ""),
+        )
+        chart_message = "" if chart_html else "No DMA distance history is available for the selected row."
+
+    signal_options = []
+    if not rows.empty and "signal_id" in rows.columns:
+        for _, row in rows.iterrows():
+            label = f"{row.get('signal_id')} · {row.get('symbol', '')} · {row.get('date_identifier', '')}"
+            signal_options.append({"value": str(row.get("signal_id")), "label": label})
+
+    return templates.TemplateResponse(
+        "roi_journal_dma.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "rows": _records(rows),
+            "rows_count": len(rows),
+            "stock_search": stock_search,
+            "stock_options": stock_options,
+            "pivot_filter": pivot_filter,
+            "recovering_dma_filter": recovering_dma_filter,
+            "dma_trend_filter": dma_trend_filter,
+            "min_dma_reduction": "" if min_dma_reduction is None else str(min_dma_reduction),
+            "min_swings": "" if min_swings is None else str(min_swings),
+            "max_swings": "" if max_swings is None else str(max_swings),
+            "signal_options": signal_options,
+            "selected_signal_id": selected_signal_id,
+            "selected_row": selected_row,
+            "chart_html": chart_html,
+            "chart_message": chart_message,
+            "sheet_name": request.query_params.get("sheet_name", summary.get("sheet_name", ROI_JOURNAL_DEFAULT_SHEET_NAME)),
+            "latest_stock_date": request.query_params.get("latest_stock_date", summary.get("requested_latest_stock_date", "2026-09-04")),
+            "manual_exchange": manual_exchange,
+            "manual_symbol": manual_symbol,
+            "manual_start_date": manual_start_date,
+            "manual_latest_stock_date": manual_latest_stock_date,
+            "symbol_lookback_months": symbol_lookback_months,
+            "lookback_months": _int_query_param(request, summary, "lookback_months", ROI_JOURNAL_DEFAULT_LOOKBACK_MONTHS, minimum=1, maximum=24),
+            "pivot_order": _int_query_param(request, summary, "pivot_order", ROI_JOURNAL_DEFAULT_PIVOT_ORDER, minimum=1, maximum=10),
+            "pre_signal_sessions": _int_query_param(request, summary, "pre_signal_sessions", ROI_JOURNAL_DEFAULT_PRE_SIGNAL_SESSIONS, minimum=1, maximum=60),
+            "recovery_threshold_pct": _float_query_param(request, summary, "recovery_threshold_pct", ROI_JOURNAL_DEFAULT_RECOVERY_THRESHOLD, minimum=0.0, maximum=100.0),
+            "analysis_ran": request.query_params.get("analysis_ran", ""),
+            "analysis_error": request.query_params.get("analysis_error", ""),
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.get("/roi-journal-dma/download.xlsx")
+def download_roi_journal_dma_excel(request: Request) -> StreamingResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    config = load_config()
+    data_root = get_data_root(config)
+    latest = load_roi_journal_dma_outputs(_roi_journal_dma_dir(data_root))
+    rows = latest.signal_rows.copy()
+    stock_search = request.query_params.get("stock_search", "").strip()
+    pivot_filter = request.query_params.get("last_low_pivot_structure", "").strip().upper()
+    recovering_dma_filter = request.query_params.get("recovering_dma", "").strip().lower()
+    dma_trend_filter = request.query_params.get("dma_trend", "").strip().upper()
+    min_dma_reduction = _optional_float(request.query_params.get("min_dma_reduction_pct_points"))
+    min_swings = _optional_int(request.query_params.get("min_swings"))
+    max_swings = _optional_int(request.query_params.get("max_swings"))
+
+    rows = _filter_roi_journal_signal_rows(
+        rows,
+        stock_search=stock_search,
+        pivot_filter=pivot_filter,
+        recovering_dma_filter=recovering_dma_filter,
+        dma_trend_filter=dma_trend_filter,
+        min_dma_reduction=min_dma_reduction,
+        min_swings=min_swings,
+        max_swings=max_swings,
+    )
+    rows = _apply_roi_journal_column_filters(rows, request.query_params)
+    export_frame = _roi_journal_export_frame(rows)
+
+    summary = dict(latest.summary)
+    summary["exported_rows"] = int(len(export_frame))
+    summary["stock_filter"] = stock_search
+    summary["last_low_pivot_filter"] = pivot_filter
+    summary["recovering_dma_filter"] = recovering_dma_filter
+    summary["dma_trend_filter"] = dma_trend_filter
+    summary["min_dma_reduction_pct_points"] = "" if min_dma_reduction is None else min_dma_reduction
+    summary["min_swings"] = "" if min_swings is None else min_swings
+    summary["max_swings"] = "" if max_swings is None else max_swings
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export_frame.to_excel(writer, sheet_name="Signal Analysis", index=False)
+        pd.DataFrame([summary]).to_excel(writer, sheet_name="Summary", index=False)
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="roi_journal_dma_filtered.xlsx"'},
+    )
+
+
+@app.post("/roi-journal-dma/upload")
+async def upload_roi_journal_dma(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    sheet_name = str(form.get("sheet_name", ROI_JOURNAL_DEFAULT_SHEET_NAME)).strip() or ROI_JOURNAL_DEFAULT_SHEET_NAME
+    latest_stock_date = str(form.get("latest_stock_date", "")).strip()
+
+    def form_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    def form_float(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    lookback_months = form_int("lookback_months", ROI_JOURNAL_DEFAULT_LOOKBACK_MONTHS, 1, 24)
+    pivot_order = form_int("pivot_order", ROI_JOURNAL_DEFAULT_PIVOT_ORDER, 1, 10)
+    pre_signal_sessions = form_int("pre_signal_sessions", ROI_JOURNAL_DEFAULT_PRE_SIGNAL_SESSIONS, 1, 60)
+    recovery_threshold_pct = form_float("recovery_threshold_pct", ROI_JOURNAL_DEFAULT_RECOVERY_THRESHOLD, 0.0, 100.0)
+
+    params = [
+        f"sheet_name={quote(sheet_name)}",
+        f"lookback_months={lookback_months}",
+        f"pivot_order={pivot_order}",
+        f"pre_signal_sessions={pre_signal_sessions}",
+        f"recovery_threshold_pct={quote(str(recovery_threshold_pct))}",
+    ]
+    if latest_stock_date:
+        params.append(f"latest_stock_date={quote(latest_stock_date)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        upload = form.get("journal_file")
+        filename = str(getattr(upload, "filename", "") or "").strip()
+        if not upload or not filename:
+            raise ValueError("Choose a CSV or Excel file to upload.")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).name).strip("_") or "roi_journal.csv"
+        upload_dir = _roi_journal_upload_dir(data_root)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_path = upload_dir / f"{uuid4().hex}_{safe_name}"
+        content = await upload.read()
+        if not content:
+            raise ValueError("Uploaded file is empty.")
+        upload_path.write_bytes(content)
+
+        journal = load_roi_journal_input(upload_path, sheet_name=sheet_name)
+        result = run_roi_journal_dma_analysis(
+            Storage(data_root),
+            journal,
+            latest_stock_date=latest_stock_date,
+            lookback_months=lookback_months,
+            pivot_order=pivot_order,
+            pre_signal_sessions=pre_signal_sessions,
+            recovery_threshold_pct=recovery_threshold_pct,
+        )
+        result.summary["source_file"] = str(upload_path)
+        result.summary["source_filename"] = filename
+        result.summary["sheet_name"] = sheet_name
+        save_roi_journal_dma_outputs(result, _roi_journal_dma_dir(data_root))
+        redirect_url = f"/roi-journal-dma?analysis_ran=1{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/roi-journal-dma?analysis_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.post("/roi-journal-dma/symbol")
+async def run_roi_journal_symbol_dma(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    storage = Storage(data_root)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    raw_symbol = str(form.get("manual_symbol", "")).strip()
+    raw_exchange = str(form.get("manual_exchange", "NSE")).strip().upper() or "NSE"
+    raw_start_date = str(form.get("manual_start_date", "")).strip()
+    raw_latest_stock_date = str(form.get("manual_latest_stock_date", "")).strip()
+
+    def form_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    def form_float(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    lookback_months = form_int(
+        "symbol_lookback_months",
+        ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS,
+        ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS,
+        24,
+    )
+    pivot_order = form_int("pivot_order", ROI_JOURNAL_DEFAULT_PIVOT_ORDER, 1, 10)
+    pre_signal_sessions = form_int("pre_signal_sessions", ROI_JOURNAL_DEFAULT_PRE_SIGNAL_SESSIONS, 1, 60)
+    recovery_threshold_pct = form_float("recovery_threshold_pct", ROI_JOURNAL_DEFAULT_RECOVERY_THRESHOLD, 0.0, 100.0)
+
+    params = [
+        f"manual_exchange={quote(raw_exchange)}",
+        f"manual_symbol={quote(raw_symbol.upper())}",
+        f"manual_start_date={quote(raw_start_date)}",
+        f"symbol_lookback_months={lookback_months}",
+        f"pivot_order={pivot_order}",
+        f"pre_signal_sessions={pre_signal_sessions}",
+        f"recovery_threshold_pct={quote(str(recovery_threshold_pct))}",
+    ]
+    if raw_latest_stock_date:
+        params.append(f"manual_latest_stock_date={quote(raw_latest_stock_date)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        requested_exchange, requested_symbol = _parse_roi_journal_manual_symbol(raw_symbol, raw_exchange)
+        start_ts = _parse_ohlcv_date(raw_start_date, "start")
+        if start_ts is None:
+            raise ValueError("Enter a start date.")
+        latest_ts = _parse_ohlcv_date(raw_latest_stock_date, "latest stock") if raw_latest_stock_date else None
+        latest_date = latest_ts.date() if latest_ts is not None else _latest_completed_nse_calendar_date()
+        latest_completed = _latest_completed_nse_calendar_date()
+        if latest_date > latest_completed:
+            raise ValueError(f"Latest stock date cannot be after the latest completed NSE session ({latest_completed.isoformat()}).")
+
+        resolved_exchange, resolved_symbol, refresh_audit = _refresh_roi_journal_symbol_history(
+            storage,
+            requested_exchange=requested_exchange,
+            symbol=requested_symbol,
+            start_date=start_ts.date(),
+            latest_stock_date=latest_date,
+            lookback_months=lookback_months,
+        )
+        journal = pd.DataFrame(
+            [
+                {
+                    "Date_Identifier": start_ts.strftime("%Y-%m-%d"),
+                    "Strategy": "Manual Symbol",
+                    "Top_5": "",
+                    "Stocks": f"{resolved_exchange}:{resolved_symbol}",
+                    "Price_Asof": "",
+                    "Price_Latest": "",
+                    "Signal_Days": "",
+                    "Profit_Loss": "",
+                    "Actual_Return": "",
+                }
+            ]
+        )
+        result = run_roi_journal_dma_analysis(
+            storage,
+            journal,
+            latest_stock_date=latest_date.isoformat(),
+            lookback_months=lookback_months,
+            pivot_order=pivot_order,
+            pre_signal_sessions=pre_signal_sessions,
+            recovery_threshold_pct=recovery_threshold_pct,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["rows_uploaded"] = 1
+        result.summary["source_file"] = ""
+        result.summary["source_filename"] = f"Manual symbol: {resolved_exchange}:{resolved_symbol}"
+        result.summary["sheet_name"] = "Manual Symbol"
+        result.summary["symbol_lookback_months"] = lookback_months
+        save_roi_journal_dma_outputs(result, _roi_journal_dma_dir(data_root))
+
+        success_params = [
+            "analysis_ran=1",
+            f"manual_exchange={quote(resolved_exchange)}",
+            f"manual_symbol={quote(resolved_symbol)}",
+            f"manual_start_date={quote(start_ts.strftime('%Y-%m-%d'))}",
+            f"manual_latest_stock_date={quote(latest_date.isoformat())}",
+            f"symbol_lookback_months={lookback_months}",
+            f"lookback_months={lookback_months}",
+            f"pivot_order={pivot_order}",
+            f"pre_signal_sessions={pre_signal_sessions}",
+            f"recovery_threshold_pct={quote(str(recovery_threshold_pct))}",
+        ]
+        if dashboard_token:
+            success_params.append(f"token={quote(dashboard_token)}")
+        redirect_url = "/roi-journal-dma?" + "&".join(success_params)
+    except Exception as exc:
+        redirect_url = f"/roi-journal-dma?analysis_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
 
 

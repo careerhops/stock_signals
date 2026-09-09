@@ -1,0 +1,537 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">ROI JOURNAL ANALYSIS</p>
+      <h1>ROI Journal DMA review</h1>
+      <p class="lede">Upload the ROI Journal sheet, then inspect 75DMA/100DMA distance, LL/HL pivot context, six-month swings, and return from the actual 75DMA reclaim entry.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/roi-journal-dma/upload" method="post" enctype="multipart/form-data" class="filter-panel" id="roi-journal-upload-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <label class="wide-field">
+        CSV or Excel file
+        <input type="file" name="journal_file" accept=".csv,.xlsx,.xlsm,.xls" required id="roi-journal-file-input">
+      </label>
+      <label>
+        Sheet name
+        <input type="text" name="sheet_name" value="{{ sheet_name }}" placeholder="ROI Journal">
+      </label>
+      <label>
+        Latest stock date
+        <input type="date" name="latest_stock_date" value="{{ latest_stock_date }}">
+      </label>
+      <label>
+        Lookback months
+        <input type="number" name="lookback_months" min="1" max="24" value="{{ lookback_months }}">
+      </label>
+      <label>
+        Pivot order
+        <input type="number" name="pivot_order" min="1" max="10" value="{{ pivot_order }}">
+      </label>
+      <label>
+        Observation sessions
+        <input type="number" name="pre_signal_sessions" min="1" max="60" value="{{ pre_signal_sessions }}">
+      </label>
+      <label>
+        LL recovery threshold %
+        <input type="number" name="recovery_threshold_pct" min="0" max="100" step="0.1" value="{{ recovery_threshold_pct }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit" id="roi-journal-upload-button">Upload + Run ROI Journal Analysis</button>
+      </div>
+      <p class="status" id="roi-journal-upload-status" hidden>Uploading file and running ROI Journal analysis. This can take 10-20 seconds for the full workbook.</p>
+    </form>
+
+    <div class="panel-heading">
+      <h2>Run one symbol</h2>
+    </div>
+    <form action="/roi-journal-dma/symbol" method="post" class="filter-panel" id="roi-journal-symbol-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="pivot_order" value="{{ pivot_order }}">
+      <input type="hidden" name="pre_signal_sessions" value="{{ pre_signal_sessions }}">
+      <input type="hidden" name="recovery_threshold_pct" value="{{ recovery_threshold_pct }}">
+      <label>
+        Exchange
+        <select name="manual_exchange">
+          <option value="NSE" {% if manual_exchange == "NSE" %}selected{% endif %}>NSE</option>
+          <option value="BSE" {% if manual_exchange == "BSE" %}selected{% endif %}>BSE</option>
+          <option value="AUTO" {% if manual_exchange == "AUTO" %}selected{% endif %}>Auto</option>
+        </select>
+      </label>
+      <label>
+        Symbol
+        <input type="search" name="manual_symbol" value="{{ manual_symbol }}" placeholder="OFSS" required>
+      </label>
+      <label>
+        Start date
+        <input type="date" name="manual_start_date" value="{{ manual_start_date }}" required>
+      </label>
+      <label>
+        Latest stock date
+        <input type="date" name="manual_latest_stock_date" value="{{ manual_latest_stock_date }}">
+      </label>
+      <label>
+        History months before start
+        <input type="number" name="symbol_lookback_months" min="8" max="24" value="{{ symbol_lookback_months }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button secondary" type="submit" id="roi-journal-symbol-button">Download + Run Symbol Analysis</button>
+      </div>
+      <p class="status" id="roi-journal-symbol-status" hidden>Downloading daily candles and running the symbol analysis.</p>
+    </form>
+
+    {% if analysis_error %}
+      <p class="status error">{{ analysis_error }}</p>
+    {% elif analysis_ran %}
+      <p class="status success">ROI Journal DMA analysis completed.</p>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Rows Uploaded</span><strong>{{ summary.get("rows_uploaded", 0) }}</strong></article>
+    <article class="stat-card"><span>Rows Visible</span><strong>{{ rows_count }}</strong></article>
+    <article class="stat-card"><span>Unique Stocks</span><strong>{{ summary.get("unique_stocks", 0) }}</strong></article>
+    <article class="stat-card"><span>Ready Rows</span><strong>{{ summary.get("ready_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Ranked Candidates</span><strong>{{ summary.get("ranked_candidate_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Next-Day Long Candidates</span><strong>{{ summary.get("next_day_long_candidate_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Long Caution Rows</span><strong>{{ summary.get("next_day_long_caution_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Long Trend Aligned</span><strong>{{ summary.get("long_trend_aligned_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Both DMAs Reducing</span><strong>{{ summary.get("all_dma_reducing_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>75DMA Reclaim Rows</span><strong>{{ summary.get("dma75_reclaim_signal_window_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>75DMA Entry Returns</span><strong>{{ summary.get("dma75_reclaim_entry_return_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>75DMA Avg Return</span><strong>{{ summary.get("dma75_reclaim_avg_return_pct", "")|number(2) }}%</strong></article>
+    <article class="stat-card"><span>Bullish/Improving DMA</span><strong>{{ summary.get("positive_dma_trend_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Bearish/Weakening DMA</span><strong>{{ summary.get("bearish_dma_trend_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Recovering To DMA</span><strong>{{ summary.get("recovering_toward_dma_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>LL Recovery >= Threshold</span><strong>{{ summary.get("ll_recovery_10pct_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Latest Stock Date</span><strong>{{ summary.get("latest_stock_date", "-") or "-" }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Filters</h2>
+      <p>Filter the uploaded signal rows by stock, last low-pivot structure, and six-month swing count.</p>
+    </div>
+    <form method="get" action="/roi-journal-dma" class="filter-panel compact-form" id="roi-journal-filter-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <label>
+        Stock
+        <select name="stock_search" id="roi-journal-stock-select">
+          <option value="" {% if not stock_search %}selected{% endif %}>All stocks</option>
+          {% for option in stock_options %}
+            <option value="{{ option.value }}" {% if option.value == stock_search|upper %}selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Last low pivot
+        <select name="last_low_pivot_structure">
+          <option value="" {% if not pivot_filter %}selected{% endif %}>Any</option>
+          <option value="LL" {% if pivot_filter == "LL" %}selected{% endif %}>LL</option>
+          <option value="HL" {% if pivot_filter == "HL" %}selected{% endif %}>HL</option>
+        </select>
+      </label>
+      <label>
+        Recovering to DMA
+        <select name="recovering_dma">
+          <option value="" {% if not recovering_dma_filter %}selected{% endif %}>Any</option>
+          <option value="yes" {% if recovering_dma_filter == "yes" %}selected{% endif %}>Yes</option>
+          <option value="no" {% if recovering_dma_filter == "no" %}selected{% endif %}>No</option>
+        </select>
+      </label>
+      <label>
+        DMA trend
+        <select name="dma_trend">
+          <option value="" {% if not dma_trend_filter %}selected{% endif %}>Any</option>
+          <option value="BULLISH" {% if dma_trend_filter == "BULLISH" %}selected{% endif %}>Bullish</option>
+          <option value="IMPROVING" {% if dma_trend_filter == "IMPROVING" %}selected{% endif %}>Improving</option>
+          <option value="MIXED" {% if dma_trend_filter == "MIXED" %}selected{% endif %}>Mixed</option>
+          <option value="WEAKENING" {% if dma_trend_filter == "WEAKENING" %}selected{% endif %}>Weakening</option>
+          <option value="BEARISH" {% if dma_trend_filter == "BEARISH" %}selected{% endif %}>Bearish</option>
+          <option value="UNKNOWN" {% if dma_trend_filter == "UNKNOWN" %}selected{% endif %}>Unknown</option>
+        </select>
+      </label>
+      <label>
+        Min DMA distance reduction
+        <input type="number" name="min_dma_reduction_pct_points" min="0" step="0.1" value="{{ min_dma_reduction }}" placeholder="10">
+      </label>
+      <label>
+        Min swings
+        <input type="number" name="min_swings" min="0" value="{{ min_swings }}">
+      </label>
+      <label>
+        Max swings
+        <input type="number" name="max_swings" min="0" value="{{ max_swings }}">
+      </label>
+      <label>
+        Chart row
+        <select name="signal_id" id="roi-journal-signal-select">
+          <option value="">Auto</option>
+          {% for option in signal_options %}
+            <option value="{{ option.value }}" {% if option.value == selected_signal_id %}selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Apply Filters</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="workspace-header signature-workspace-header">
+      <div>
+        <h2>{{ selected_row.get("exchange", "-") }}:{{ selected_row.get("symbol", "-") }}</h2>
+        <p>
+          Date {{ selected_row.get("date_identifier", "-") or "-" }}
+          · {{ selected_row.get("next_day_long_bias", "-") or "-" }}
+          · 75DMA reclaim {{ selected_row.get("dma75_reclaim_date", "-") or "-" }}
+          · entry {{ selected_row.get("dma75_entry_date", "-") or "-" }}
+          · reclaim return {{ selected_row.get("dma75_return_pct", "")|number(2) or "-" }}%
+          · Last low {{ selected_row.get("last_low_pivot_structure", "-") or "-" }}
+          · Closest {{ selected_row.get("closest_hh_hl_reference", "-") or "-" }} {{ selected_row.get("closest_hh_hl_gap_pct", "")|number(2) or "-" }}%
+          · Pullback {{ selected_row.get("current_pullback_abs_pct", "")|number(2) or "-" }}% vs avg {{ selected_row.get("average_pullback_pct", "")|number(2) or "-" }}%
+          · DMA trend {{ selected_row.get("dma_trend_20d_label", "-") or "-" }}
+          (75 {{ selected_row.get("dma_75_trend_20d_pct", "")|number(2) or "-" }}%, 100 {{ selected_row.get("dma_100_trend_20d_pct", "")|number(2) or "-" }}%)
+          · Forward return {{ selected_row.get("forward_return_pct", "")|number(2) or "-" }}%
+        </p>
+      </div>
+      <div class="token-pill">{{ lookback_months }}M setup window</div>
+    </div>
+    {% if chart_message %}
+      <p class="empty">{{ chart_message }}</p>
+    {% endif %}
+    {% if chart_html %}
+      <div class="chart-frame signature-chart-full">{{ chart_html|safe }}</div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Signal analysis table</h2>
+      <p>Each row is one uploaded ROI Journal signal evaluated against local daily OHLC data.</p>
+    </div>
+    <div class="table-actions">
+      <p class="status" id="roi-journal-table-filter-status">Showing {{ rows_count }} rows.</p>
+      <div class="filter-actions">
+        <button class="button secondary" type="button" id="roi-journal-clear-column-filters">Clear Table Filters</button>
+        <a class="button secondary" id="roi-journal-download-xlsx" href="/roi-journal-dma/download.xlsx{% if request.url.query %}?{{ request.url.query }}{% endif %}">Download Excel</a>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table id="roi-journal-analysis-table" data-column-filterable>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Score</th><th>Setup Case</th><th>Next-Day Long Bias</th><th>Trend Around Date</th><th>ID</th><th>Stock</th><th>Strategy</th><th>Top 5</th><th>Date Identifier</th><th>Setup Date</th>
+            <th>75DMA Reclaim Window</th><th>75DMA Reclaim Timing</th><th>Break Below 75DMA Date</th><th>Reclaim Above 75DMA Date</th><th>Reclaim Offset Sessions</th><th>Sessions To Reclaim</th><th>Entry Date After Reclaim</th><th>Entry Close After Reclaim</th><th>75DMA Exit Date</th><th>75DMA Exit Close</th><th>75DMA Hold Sessions</th><th>75DMA Hold Days</th><th>75DMA Reclaim Return %</th><th>75DMA Entry Status</th>
+            <th>Setup Close</th><th>DMA Trend</th><th>75DMA 20D Trend %</th><th>100DMA 20D Trend %</th><th>DMA Stack</th><th>Both DMA Trends Positive</th><th>Both DMA Trends Non-Negative</th><th>Both DMA Distances Reducing</th><th>Price Above Both DMAs</th><th>Long Trend Aligned</th><th>Best DMA Reduced</th><th>Nearest DMA Gap</th><th>75DMA Dist %</th><th>100DMA Dist %</th><th>Obs 75 Dist %</th><th>Obs 100 Dist %</th>
+            <th>75 Dist Reduced</th><th>100 Dist Reduced</th><th>Recovering DMA</th><th>Last Pivot</th><th>Last High</th><th>Last High Date</th><th>Last High Price</th><th>Last HH Date</th><th>Last HH Price</th><th>Distance To Last HH %</th><th>Last HL Date</th><th>Last HL Price</th><th>Distance To Last HL %</th><th>Closest HH/HL</th><th>Closest HH/HL Gap %</th><th>Last Low</th>
+            <th>Last LL Date</th><th>LL Recovery %</th><th>LL Age</th><th>Swings Window</th><th>Low-High Swings Window</th><th>Pullback Events Window</th><th>Average Pullback %</th><th>Median Pullback %</th><th>Current Pullback From High %</th><th>Current Pullback Abs %</th><th>Current Pullback / Avg</th><th>Pullback Context</th>
+            <th>Next Date</th><th>Latest Date</th><th>Forward Return %</th><th>Actual Return</th><th>Status</th><th>Rank Reason</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr class="{% if row.get("signal_id", "")|string == selected_signal_id %}selected-row{% endif %}">
+              <td>{{ row.get("candidate_rank", "")|number(0) }}</td>
+              <td>{{ row.get("research_score", "")|number(2) }}</td>
+              <td>{{ row.get("research_setup_case", "") }}</td>
+              <td>{{ row.get("next_day_long_bias", "") }}</td>
+              <td>{{ row.get("trend_around_date_identifier", "") }}</td>
+              <td>{{ row.get("signal_id", "")|number(0) }}</td>
+              <td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("strategy", "") }}</td>
+              <td>{{ row.get("top_5", "") }}</td>
+              <td>{{ row.get("date_identifier", "") }}</td>
+              <td>{{ row.get("setup_date", "") }}</td>
+              <td>{{ row.get("dma75_reclaim_signal_window_pass")|yes_no }}</td>
+              <td>{{ row.get("dma75_reclaim_timing", "") }}</td>
+              <td>{{ row.get("dma75_break_below_date", "") }}</td>
+              <td>{{ row.get("dma75_reclaim_date", "") }}</td>
+              <td>{{ row.get("dma75_reclaim_offset_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("dma75_sessions_to_reclaim_after_break", "")|number(0) }}</td>
+              <td>{{ row.get("dma75_entry_date", "") }}</td>
+              <td>{{ row.get("dma75_entry_close", "")|number(2) }}</td>
+              <td>{{ row.get("dma75_exit_date", "") }}</td>
+              <td>{{ row.get("dma75_exit_close", "")|number(2) }}</td>
+              <td>{{ row.get("dma75_hold_trading_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("dma75_hold_calendar_days", "")|number(0) }}</td>
+              <td>{{ row.get("dma75_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma75_entry_status", "") }}</td>
+              <td>{{ row.get("setup_close", "")|number(2) }}</td>
+              <td>{{ row.get("dma_trend_20d_label", "") }}</td>
+              <td>{{ row.get("dma_75_trend_20d_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_100_trend_20d_pct", "")|number(2) }}</td>
+              <td>{{ row.get("dma_stack", "") }}</td>
+              <td>{{ row.get("all_dma_trend_positive")|yes_no }}</td>
+              <td>{{ row.get("all_dma_trend_non_negative")|yes_no }}</td>
+              <td>{{ row.get("all_dma_distance_reducing")|yes_no }}</td>
+              <td>{{ row.get("price_above_all_dma")|yes_no }}</td>
+              <td>{{ row.get("long_trend_aligned")|yes_no }}</td>
+              <td>{{ row.get("best_dma_reduction_pct_points", "")|number(2) }}</td>
+              <td>{{ row.get("nearest_dma_distance_abs_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_75dma_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_100dma_pct", "")|number(2) }}</td>
+              <td>{{ row.get("observation_distance_75dma_pct", "")|number(2) }}</td>
+              <td>{{ row.get("observation_distance_100dma_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_reduction_75dma_pct_points", "")|number(2) }}</td>
+              <td>{{ row.get("distance_reduction_100dma_pct_points", "")|number(2) }}</td>
+              <td>{{ row.get("recovering_toward_any_dma")|yes_no }}</td>
+              <td>{{ row.get("last_pivot_structure", "") }} {{ row.get("last_pivot_type", "") }}</td>
+              <td>{{ row.get("last_high_pivot_structure", "") }} HIGH</td>
+              <td>{{ row.get("last_high_pivot_date", "") }}</td>
+              <td>{{ row.get("last_high_pivot_price", "")|number(2) }}</td>
+              <td>{{ row.get("last_hh_pivot_date", "") }}</td>
+              <td>{{ row.get("last_hh_pivot_price", "")|number(2) }}</td>
+              <td>{{ row.get("distance_to_last_hh_pct", "")|number(2) }}</td>
+              <td>{{ row.get("last_hl_pivot_date", "") }}</td>
+              <td>{{ row.get("last_hl_pivot_price", "")|number(2) }}</td>
+              <td>{{ row.get("distance_to_last_hl_pct", "")|number(2) }}</td>
+              <td>{{ row.get("closest_hh_hl_reference", "") }}</td>
+              <td>{{ row.get("closest_hh_hl_gap_pct", "")|number(2) }}</td>
+              <td>{{ row.get("last_low_pivot_structure", "") }}</td>
+              <td>{{ row.get("last_ll_pivot_date", "") }}</td>
+              <td>{{ row.get("ll_recovery_pct", "")|number(2) }}</td>
+              <td>{{ row.get("ll_pivot_age_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("swing_count_6m", "")|number(0) }}</td>
+              <td>{{ row.get("low_high_swings_6m", "")|number(0) }}</td>
+              <td>{{ row.get("pullback_events_6m", "")|number(0) }}</td>
+              <td>{{ row.get("average_pullback_pct", "")|number(2) }}</td>
+              <td>{{ row.get("median_pullback_pct", "")|number(2) }}</td>
+              <td>{{ row.get("current_pullback_from_last_high_pct", "")|number(2) }}</td>
+              <td>{{ row.get("current_pullback_abs_pct", "")|number(2) }}</td>
+              <td>{{ row.get("current_pullback_vs_avg", "")|number(2) }}</td>
+              <td>{{ row.get("pullback_context", "") }}</td>
+              <td>{{ row.get("next_trade_date", "") }}</td>
+              <td>{{ row.get("latest_return_date", "") }}</td>
+              <td>{{ row.get("forward_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("actual_return_input", "") }}</td>
+              <td>{{ row.get("data_status", "") }}</td>
+              <td>{{ row.get("ranking_reason", "") }}</td>
+              <td>{{ row.get("reason", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="76">Upload the ROI Journal CSV/XLSX or run one symbol to load the analysis.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    (() => {
+      const form = document.getElementById("roi-journal-upload-form");
+      const fileInput = document.getElementById("roi-journal-file-input");
+      const submitButton = document.getElementById("roi-journal-upload-button");
+      const status = document.getElementById("roi-journal-upload-status");
+
+      if (form && fileInput && submitButton && status) {
+        const showRunningState = () => {
+          submitButton.disabled = true;
+          submitButton.textContent = "Running ROI Journal Analysis...";
+          status.hidden = false;
+        };
+
+        fileInput.addEventListener("change", () => {
+          if (!fileInput.files || fileInput.files.length === 0) return;
+          showRunningState();
+          form.requestSubmit();
+        });
+
+        fileInput.addEventListener("click", () => {
+          fileInput.value = "";
+        });
+
+        form.addEventListener("submit", () => {
+          showRunningState();
+        });
+      }
+
+      const symbolForm = document.getElementById("roi-journal-symbol-form");
+      const symbolButton = document.getElementById("roi-journal-symbol-button");
+      const symbolStatus = document.getElementById("roi-journal-symbol-status");
+      if (symbolForm && symbolButton && symbolStatus) {
+        symbolForm.addEventListener("submit", () => {
+          symbolButton.disabled = true;
+          symbolButton.textContent = "Downloading + Running...";
+          symbolStatus.hidden = false;
+        });
+      }
+
+      const filterForm = document.getElementById("roi-journal-filter-form");
+      const stockSelect = document.getElementById("roi-journal-stock-select");
+      const signalSelect = document.getElementById("roi-journal-signal-select");
+      const submitFilter = () => {
+        if (!filterForm) return;
+        filterForm.requestSubmit();
+      };
+      if (stockSelect) {
+        stockSelect.addEventListener("change", () => {
+          if (signalSelect) signalSelect.value = "";
+          submitFilter();
+        });
+      }
+      if (signalSelect) {
+        signalSelect.addEventListener("change", submitFilter);
+      }
+      if (filterForm) {
+        filterForm.querySelectorAll("select").forEach((select) => {
+          if (select === signalSelect || select === stockSelect) return;
+          select.addEventListener("change", submitFilter);
+        });
+      }
+
+      const setupColumnFilters = () => {
+        const table = document.getElementById("roi-journal-analysis-table");
+        const statusText = document.getElementById("roi-journal-table-filter-status");
+        const downloadLink = document.getElementById("roi-journal-download-xlsx");
+        const clearButton = document.getElementById("roi-journal-clear-column-filters");
+        if (!table || !table.tHead || !table.tBodies.length || table.dataset.filtersReady === "1") return;
+        const headerRow = table.tHead.rows[0];
+        const tbody = table.tBodies[0];
+        if (!headerRow || !tbody) return;
+
+        table.dataset.filtersReady = "1";
+        const filterRow = document.createElement("tr");
+        filterRow.className = "column-filter-row";
+        Array.from(headerRow.cells).forEach((header, index) => {
+          const cell = document.createElement("th");
+          const input = document.createElement("input");
+          input.type = "search";
+          input.placeholder = "Filter";
+          input.setAttribute("aria-label", `Filter ${header.textContent.trim()}`);
+          input.dataset.columnIndex = String(index);
+          const params = new URLSearchParams(window.location.search);
+          input.value = params.get(`col_${index}`) || "";
+          input.addEventListener("click", (event) => event.stopPropagation());
+          input.addEventListener("keydown", (event) => event.stopPropagation());
+          cell.appendChild(input);
+          filterRow.appendChild(cell);
+        });
+        table.tHead.appendChild(filterRow);
+
+        const inputs = Array.from(filterRow.querySelectorAll("input"));
+        const rows = Array.from(tbody.rows);
+        const baseDownloadHref = downloadLink ? downloadLink.getAttribute("href").split("?")[0] : "";
+
+        const cellText = (row, index) => {
+          const cell = row.cells[index];
+          return cell ? cell.textContent.trim() : "";
+        };
+
+        const parseComparable = (text) => {
+          const trimmed = String(text || "").trim();
+          if (!trimmed) return null;
+          if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
+            const dateValue = Date.parse(trimmed.slice(0, 10));
+            return Number.isNaN(dateValue) ? null : dateValue;
+          }
+          const numeric = Number(trimmed.replace(/,/g, "").replace(/%/g, "").replace(/x$/i, ""));
+          return Number.isNaN(numeric) ? null : numeric;
+        };
+
+        const parseQueryNumber = (text) => {
+          const trimmed = String(text || "").trim();
+          if (!trimmed) return null;
+          if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+            const dateValue = Date.parse(trimmed);
+            return Number.isNaN(dateValue) ? null : dateValue;
+          }
+          const numeric = Number(trimmed.replace(/,/g, "").replace(/%/g, "").replace(/x$/i, ""));
+          return Number.isNaN(numeric) ? null : numeric;
+        };
+
+        const numericMatch = (value, query) => {
+          if (value === null) return null;
+          if (query.includes("..")) {
+            const [startText, endText] = query.split("..", 2);
+            const start = parseQueryNumber(startText);
+            const end = parseQueryNumber(endText);
+            if (start === null && end === null) return null;
+            if (start !== null && value < start) return false;
+            if (end !== null && value > end) return false;
+            return true;
+          }
+          for (const operator of [">=", "<=", "!=", ">", "<", "="]) {
+            if (!query.startsWith(operator)) continue;
+            const threshold = parseQueryNumber(query.slice(operator.length));
+            if (threshold === null) return null;
+            if (operator === ">=") return value >= threshold;
+            if (operator === "<=") return value <= threshold;
+            if (operator === "!=") return value !== threshold;
+            if (operator === ">") return value > threshold;
+            if (operator === "<") return value < threshold;
+            return value === threshold;
+          }
+          const exact = parseQueryNumber(query);
+          return exact === null ? null : value === exact;
+        };
+
+        const matchesFilter = (text, rawFilter) => {
+          const query = String(rawFilter || "").trim().toLowerCase();
+          if (!query) return true;
+          const normalizedText = String(text || "").trim().toLowerCase();
+          if (query.startsWith("!")) return !normalizedText.includes(query.slice(1));
+          const numeric = numericMatch(parseComparable(normalizedText), query);
+          if (numeric !== null) return numeric;
+          return normalizedText.includes(query);
+        };
+
+        const updateDownloadLink = () => {
+          if (!downloadLink || !baseDownloadHref) return;
+          const params = new URLSearchParams(window.location.search);
+          params.delete("analysis_ran");
+          params.delete("analysis_error");
+          inputs.forEach((input) => {
+            const key = `col_${input.dataset.columnIndex}`;
+            const value = input.value.trim();
+            if (value) params.set(key, value);
+            else params.delete(key);
+          });
+          const query = params.toString();
+          downloadLink.href = query ? `${baseDownloadHref}?${query}` : baseDownloadHref;
+        };
+
+        const applyFilters = () => {
+          let visible = 0;
+          rows.forEach((row) => {
+            const keep = inputs.every((input) => matchesFilter(cellText(row, Number(input.dataset.columnIndex)), input.value));
+            row.hidden = !keep;
+            if (keep) visible += 1;
+          });
+          if (statusText) statusText.textContent = `Showing ${visible} of ${rows.length} rows.`;
+          updateDownloadLink();
+        };
+
+        inputs.forEach((input) => input.addEventListener("input", applyFilters));
+        if (clearButton) {
+          clearButton.addEventListener("click", () => {
+            const params = new URLSearchParams(window.location.search);
+            let hadUrlFilters = false;
+            inputs.forEach((input) => {
+              const key = `col_${input.dataset.columnIndex}`;
+              if (params.has(key)) hadUrlFilters = true;
+              params.delete(key);
+            });
+            if (hadUrlFilters) {
+              const query = params.toString();
+              window.location.href = query ? `${window.location.pathname}?${query}` : window.location.pathname;
+              return;
+            }
+            inputs.forEach((input) => { input.value = ""; });
+            applyFilters();
+          });
+        }
+        applyFilters();
+      };
+
+      document.addEventListener("DOMContentLoaded", () => {
+        window.setTimeout(setupColumnFilters, 0);
+      });
+    })();
+  </script>
+{% endblock %}

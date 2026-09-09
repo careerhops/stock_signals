@@ -15,10 +15,14 @@ DEFAULT_HISTORY_MONTHS = 24
 DEFAULT_PRIOR_HIGH_LOOKBACK_SESSIONS = 420
 DEFAULT_MIN_DRAWDOWN_FLOOR_PCT = 20.0
 DEFAULT_TARGET_RECOVERY_PCT = 10.0
+DEFAULT_DMA_WINDOWS = (75, 100, 200)
 DEFAULT_DMA_WINDOW = 200
 DEFAULT_VOLUME_BASELINE_SESSIONS = 60
 DEFAULT_MIN_VOLUME_MULTIPLE = 3.0
 DEFAULT_MIN_DMA_IMPROVEMENT_PCT_POINTS = 5.0
+DEFAULT_MIN_DMA_DISTANCE_REDUCTION_PCT_POINTS = 10.0
+DEFAULT_DMA_TOUCH_ZONE_PCT = 3.0
+DEFAULT_MIN_BOUNCE_RECOVERY_PCT = 2.0
 DEFAULT_MAX_CURRENT_AGE_SESSIONS = 90
 DEFAULT_TROUGH_ORDER = 3
 RECOVERY_WINDOW_OPTIONS = (5, 10, 15, 20, 30, 40, 60, 90)
@@ -44,18 +48,23 @@ def run_drawdown_recovery_study(
     min_drawdown_floor_pct: float = DEFAULT_MIN_DRAWDOWN_FLOOR_PCT,
     target_recovery_pct: float = DEFAULT_TARGET_RECOVERY_PCT,
     dma_window: int = DEFAULT_DMA_WINDOW,
+    dma_windows: Iterable[int] | None = None,
     volume_baseline_sessions: int = DEFAULT_VOLUME_BASELINE_SESSIONS,
     min_volume_multiple: float = DEFAULT_MIN_VOLUME_MULTIPLE,
     min_dma_improvement_pct_points: float = DEFAULT_MIN_DMA_IMPROVEMENT_PCT_POINTS,
+    min_dma_distance_reduction_pct_points: float = DEFAULT_MIN_DMA_DISTANCE_REDUCTION_PCT_POINTS,
+    dma_touch_zone_pct: float = DEFAULT_DMA_TOUCH_ZONE_PCT,
+    min_bounce_recovery_pct: float = DEFAULT_MIN_BOUNCE_RECOVERY_PCT,
     max_current_age_sessions: int = DEFAULT_MAX_CURRENT_AGE_SESSIONS,
     trough_order: int = DEFAULT_TROUGH_ORDER,
     as_of_date: Any | None = None,
     required_latest_date: Any | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> DrawdownRecoveryResult:
-    symbols = _universe_symbols(universe)
-    metadata = _universe_metadata(universe)
+    entries = _universe_entries(universe, default_exchange=exchange)
+    metadata = _universe_metadata(universe, default_exchange=exchange)
     required_latest_ts = _coerce_normalized_timestamp(required_latest_date)
+    windows = _normalize_dma_windows(dma_windows, fallback=dma_window)
     rows: list[dict[str, Any]] = []
     event_frames: list[pd.DataFrame] = []
     latest_dates: list[pd.Timestamp] = []
@@ -64,34 +73,38 @@ def run_drawdown_recovery_study(
         progress_callback,
         phase="Scanning deep drawdown recoveries",
         completed=0,
-        total=len(symbols),
+        total=len(entries),
         current_symbol="",
         current_exchange=exchange,
     )
 
-    for index, symbol in enumerate(symbols, start=1):
-        daily = storage.load_candles(exchange, symbol, "1D")
+    for index, (entry_exchange, symbol) in enumerate(entries, start=1):
+        daily = storage.load_candles(entry_exchange, symbol, "1D")
         stock_events, row = analyze_drawdown_recovery(
             daily,
-            exchange=exchange,
+            exchange=entry_exchange,
             symbol=symbol,
             history_months=history_months,
             prior_high_lookback_sessions=prior_high_lookback_sessions,
             min_drawdown_floor_pct=min_drawdown_floor_pct,
             target_recovery_pct=target_recovery_pct,
             dma_window=dma_window,
+            dma_windows=windows,
             volume_baseline_sessions=volume_baseline_sessions,
             min_volume_multiple=min_volume_multiple,
             min_dma_improvement_pct_points=min_dma_improvement_pct_points,
+            min_dma_distance_reduction_pct_points=min_dma_distance_reduction_pct_points,
+            dma_touch_zone_pct=dma_touch_zone_pct,
+            min_bounce_recovery_pct=min_bounce_recovery_pct,
             max_current_age_sessions=max_current_age_sessions,
             trough_order=trough_order,
             as_of_date=as_of_date,
             required_latest_date=required_latest_ts,
         )
-        row.update(metadata.get(symbol, {}))
+        row.update(metadata.get((entry_exchange, symbol), {}))
         rows.append(row)
         if not stock_events.empty:
-            for key, value in metadata.get(symbol, {}).items():
+            for key, value in metadata.get((entry_exchange, symbol), {}).items():
                 if key not in stock_events.columns:
                     stock_events[key] = value
             event_frames.append(stock_events)
@@ -100,11 +113,11 @@ def run_drawdown_recovery_study(
             latest_dates.append(latest_date.normalize())
         _emit_progress(
             progress_callback,
-            phase="Scanning deep drawdown recoveries",
-            completed=index,
-            total=len(symbols),
-            current_symbol=symbol,
-            current_exchange=exchange,
+        phase="Scanning deep drawdown recoveries",
+        completed=index,
+        total=len(entries),
+        current_symbol=symbol,
+        current_exchange=entry_exchange,
         )
 
     stock_stats = pd.DataFrame(rows)
@@ -145,7 +158,7 @@ def run_drawdown_recovery_study(
         "logic_version": DRAWDOWN_RECOVERY_LOGIC_VERSION,
         "exchange": str(exchange).upper(),
         "universe": str(universe_name or "CUSTOM").upper(),
-        "symbols_requested": int(len(symbols)),
+        "symbols_requested": int(len(entries)),
         "symbols_processed": int(len(stock_stats)),
         "stocks_with_ready_history": ready_count,
         "current_candidates": current_count,
@@ -156,9 +169,13 @@ def run_drawdown_recovery_study(
         "min_drawdown_floor_pct": max(float(min_drawdown_floor_pct), 0.0),
         "target_recovery_pct": max(float(target_recovery_pct), 0.0),
         "dma_window": max(int(dma_window), 2),
+        "dma_windows": ",".join(str(value) for value in windows),
         "volume_baseline_sessions": max(int(volume_baseline_sessions), 5),
         "min_volume_multiple": max(float(min_volume_multiple), 0.0),
         "min_dma_improvement_pct_points": max(float(min_dma_improvement_pct_points), 0.0),
+        "min_dma_distance_reduction_pct_points": max(float(min_dma_distance_reduction_pct_points), 0.0),
+        "dma_touch_zone_pct": max(float(dma_touch_zone_pct), 0.0),
+        "min_bounce_recovery_pct": max(float(min_bounce_recovery_pct), 0.0),
         "max_current_age_sessions": max(int(max_current_age_sessions), 1),
         "trough_order": max(int(trough_order), 1),
         "requested_as_of_date": "" if as_of_date is None else str(as_of_date),
@@ -182,9 +199,13 @@ def analyze_drawdown_recovery(
     min_drawdown_floor_pct: float = DEFAULT_MIN_DRAWDOWN_FLOOR_PCT,
     target_recovery_pct: float = DEFAULT_TARGET_RECOVERY_PCT,
     dma_window: int = DEFAULT_DMA_WINDOW,
+    dma_windows: Iterable[int] | None = None,
     volume_baseline_sessions: int = DEFAULT_VOLUME_BASELINE_SESSIONS,
     min_volume_multiple: float = DEFAULT_MIN_VOLUME_MULTIPLE,
     min_dma_improvement_pct_points: float = DEFAULT_MIN_DMA_IMPROVEMENT_PCT_POINTS,
+    min_dma_distance_reduction_pct_points: float = DEFAULT_MIN_DMA_DISTANCE_REDUCTION_PCT_POINTS,
+    dma_touch_zone_pct: float = DEFAULT_DMA_TOUCH_ZONE_PCT,
+    min_bounce_recovery_pct: float = DEFAULT_MIN_BOUNCE_RECOVERY_PCT,
     max_current_age_sessions: int = DEFAULT_MAX_CURRENT_AGE_SESSIONS,
     trough_order: int = DEFAULT_TROUGH_ORDER,
     as_of_date: Any | None = None,
@@ -192,6 +213,7 @@ def analyze_drawdown_recovery(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     exchange_text = str(exchange).upper()
     symbol_text = str(symbol).upper()
+    windows = _normalize_dma_windows(dma_windows, fallback=dma_window)
     frame = _prepare_daily(daily)
     frame = _clip_analysis_window(
         frame,
@@ -219,7 +241,7 @@ def analyze_drawdown_recovery(
         row["reason"] = f"Latest candle is {latest_date.strftime('%Y-%m-%d')}, expected {required_latest_ts.strftime('%Y-%m-%d')}."
         return _empty_events(), row
 
-    min_rows = max(min(int(prior_high_lookback_sessions), 80), int(volume_baseline_sessions) + 10, int(dma_window) + 5)
+    min_rows = max(min(int(prior_high_lookback_sessions), 80), int(volume_baseline_sessions) + 10, max(windows) + 5)
     if len(frame) < min_rows:
         row["data_status"] = "INSUFFICIENT_HISTORY"
         row["reason"] = f"Need at least {min_rows} daily candles after the selected date filter."
@@ -227,7 +249,7 @@ def analyze_drawdown_recovery(
 
     frame = _add_features(
         frame,
-        dma_window=max(int(dma_window), 2),
+        dma_windows=windows,
         volume_baseline_sessions=max(int(volume_baseline_sessions), 5),
     )
     events = _detect_drawdown_events(
@@ -237,9 +259,11 @@ def analyze_drawdown_recovery(
         prior_high_lookback_sessions=max(int(prior_high_lookback_sessions), 20),
         min_drawdown_floor_pct=max(float(min_drawdown_floor_pct), 0.0),
         target_recovery_pct=max(float(target_recovery_pct), 0.0),
-        dma_window=max(int(dma_window), 2),
+        dma_windows=windows,
         min_volume_multiple=max(float(min_volume_multiple), 0.0),
         min_dma_improvement_pct_points=max(float(min_dma_improvement_pct_points), 0.0),
+        min_dma_distance_reduction_pct_points=max(float(min_dma_distance_reduction_pct_points), 0.0),
+        dma_touch_zone_pct=max(float(dma_touch_zone_pct), 0.0),
         trough_order=max(int(trough_order), 1),
     )
     if events.empty:
@@ -258,6 +282,8 @@ def analyze_drawdown_recovery(
         optimized,
         min_volume_multiple=max(float(min_volume_multiple), 0.0),
         min_dma_improvement_pct_points=max(float(min_dma_improvement_pct_points), 0.0),
+        min_dma_distance_reduction_pct_points=max(float(min_dma_distance_reduction_pct_points), 0.0),
+        min_bounce_recovery_pct=max(float(min_bounce_recovery_pct), 0.0),
         max_current_age_sessions=max(int(max_current_age_sessions), 1),
     )
     row.update(optimized)
@@ -337,12 +363,14 @@ def _clip_analysis_window(
 def _add_features(
     frame: pd.DataFrame,
     *,
-    dma_window: int,
+    dma_windows: tuple[int, ...],
     volume_baseline_sessions: int,
 ) -> pd.DataFrame:
     enriched = frame.copy().reset_index(drop=True)
-    enriched[f"dma_{dma_window}"] = enriched["close"].rolling(dma_window, min_periods=dma_window).mean()
-    enriched["dma_distance_pct"] = (enriched["close"] / enriched[f"dma_{dma_window}"] - 1.0) * 100.0
+    for window in dma_windows:
+        enriched[f"dma_{window}"] = enriched["close"].rolling(window, min_periods=window).mean()
+        enriched[f"dma_distance_{window}_pct"] = (enriched["close"] / enriched[f"dma_{window}"] - 1.0) * 100.0
+        enriched[f"dma_slope_{window}_20pct"] = (enriched[f"dma_{window}"] / enriched[f"dma_{window}"].shift(20) - 1.0) * 100.0
     enriched["volume_median_baseline"] = (
         enriched["volume"].shift(1).rolling(volume_baseline_sessions, min_periods=max(5, volume_baseline_sessions // 2)).median()
     )
@@ -357,15 +385,18 @@ def _detect_drawdown_events(
     prior_high_lookback_sessions: int,
     min_drawdown_floor_pct: float,
     target_recovery_pct: float,
-    dma_window: int,
+    dma_windows: tuple[int, ...],
     min_volume_multiple: float,
     min_dma_improvement_pct_points: float,
+    min_dma_distance_reduction_pct_points: float,
+    dma_touch_zone_pct: float,
     trough_order: int,
 ) -> pd.DataFrame:
     if frame.empty:
         return _empty_events()
 
     working = frame.copy().reset_index(drop=True)
+    primary_dma_window = max(dma_windows)
     prior_high_prices = np.full(len(working), np.nan)
     prior_high_indexes = np.full(len(working), np.nan)
     min_prior_rows = min(60, max(int(prior_high_lookback_sessions) // 4, 20))
@@ -417,9 +448,9 @@ def _detect_drawdown_events(
             sessions_to_target = target_idx - low_idx
             target_date = pd.Timestamp(target_row["date"]).strftime("%Y-%m-%d")
             target_close = _finite_float(target_row.get("close")) or np.nan
-            target_dma_distance = _finite_float(target_row.get("dma_distance_pct")) or np.nan
+            target_dma_distance = _finite_float(target_row.get(f"dma_distance_{primary_dma_window}_pct")) or np.nan
 
-        low_dma_distance = _finite_float(low.get("dma_distance_pct"))
+        low_dma_distance = _finite_float(low.get(f"dma_distance_{primary_dma_window}_pct"))
         max_volume_multiple = _window_volume_multiple(
             working,
             start_idx=low_idx + 1,
@@ -458,7 +489,7 @@ def _detect_drawdown_events(
                 "target_date": target_date,
                 "target_close": target_close,
                 "sessions_to_target": sessions_to_target if sessions_to_target is not None else np.nan,
-                "dma_window": int(dma_window),
+                "dma_window": int(primary_dma_window),
                 "dma_distance_at_low_pct": low_dma_distance if low_dma_distance is not None else np.nan,
                 "dma_distance_at_target_pct": target_dma_distance,
                 "dma_improvement_to_target_pct_points": dma_improvement_to_target,
@@ -527,14 +558,17 @@ def _current_setup_row(
     *,
     min_volume_multiple: float,
     min_dma_improvement_pct_points: float,
+    min_dma_distance_reduction_pct_points: float,
+    min_bounce_recovery_pct: float,
     max_current_age_sessions: int,
 ) -> dict[str, Any]:
     latest = frame.iloc[-1]
     latest_idx = len(frame) - 1
     current = events.sort_values("_low_idx").iloc[-1]
     low_idx = int(current["_low_idx"])
+    primary_dma_window = int(current.get("dma_window") or DEFAULT_DMA_WINDOW)
     low_dma_distance = _finite_float(current.get("dma_distance_at_low_pct"))
-    current_dma_distance = _finite_float(latest.get("dma_distance_pct"))
+    current_dma_distance = _finite_float(latest.get(f"dma_distance_{primary_dma_window}_pct"))
     sessions_since_low = int(latest_idx - low_idx)
     low_price = float(current["low_price"])
     latest_close = float(latest["close"])
@@ -600,6 +634,9 @@ def _current_setup_row(
         "max_volume_multiple_to_current": volume_multiple_current,
         "min_volume_multiple": float(min_volume_multiple),
         "min_dma_improvement_pct_points": float(min_dma_improvement_pct_points),
+        "min_dma_distance_reduction_pct_points": float(min_dma_distance_reduction_pct_points),
+        "min_bounce_recovery_pct": float(min_bounce_recovery_pct),
+        "max_current_age_sessions": int(max_current_age_sessions),
         "candidate_pass": candidate_pass,
         "setup_score": setup_score,
     }
@@ -694,6 +731,9 @@ def _setup_reason(row: dict[str, Any]) -> str:
         checks.append("fall below stock-specific threshold")
     if not bool(row.get("target_reached_within_optimized_y")):
         checks.append("target recovery not reached inside optimized sessions")
+    if _is_finite(row.get("sessions_since_low")) and _is_finite(row.get("max_current_age_sessions")):
+        if float(row.get("sessions_since_low") or 0.0) > float(row.get("max_current_age_sessions") or 0.0):
+            checks.append("latest trough is older than current age window")
     if (
         not _is_finite(row.get("dma_improvement_current_pct_points"))
         or float(row.get("dma_improvement_current_pct_points") or 0.0)
@@ -713,6 +753,13 @@ def _nearest_recovery_window(value: float) -> int:
         if value <= window:
             return int(window)
     return int(RECOVERY_WINDOW_OPTIONS[-1])
+
+
+def _normalize_dma_windows(values: Iterable[int] | None, *, fallback: int) -> tuple[int, ...]:
+    if values is None:
+        values = DEFAULT_DMA_WINDOWS if int(fallback) == DEFAULT_DMA_WINDOW else (fallback,)
+    windows = tuple(sorted({max(int(value), 2) for value in values}))
+    return windows or (max(int(fallback), 2),)
 
 
 def _base_stock_row(exchange: str, symbol: str) -> dict[str, Any]:
@@ -757,20 +804,34 @@ def _base_stock_row(exchange: str, symbol: str) -> dict[str, Any]:
     }
 
 
-def _universe_symbols(universe: pd.DataFrame) -> list[str]:
+def _universe_entries(universe: pd.DataFrame, *, default_exchange: str = "NSE") -> list[tuple[str, str]]:
     if universe.empty:
         return []
     symbol_column = next((column for column in ("Symbol", "symbol", "tradingsymbol") if column in universe.columns), "")
     if not symbol_column:
         return []
-    symbols = universe[symbol_column].dropna().astype(str).str.upper().str.strip()
-    return sorted(dict.fromkeys(symbol for symbol in symbols if symbol))
+    exchanges = (
+        universe["exchange"].fillna(default_exchange).astype(str).str.upper().str.strip()
+        if "exchange" in universe.columns
+        else pd.Series(str(default_exchange).upper(), index=universe.index)
+    )
+    symbols = universe[symbol_column].fillna("").astype(str).str.upper().str.strip()
+    entries = [
+        (exchange or str(default_exchange).upper(), symbol)
+        for exchange, symbol in zip(exchanges, symbols, strict=False)
+        if symbol
+    ]
+    return sorted(dict.fromkeys(entries))
 
 
-def _universe_metadata(universe: pd.DataFrame) -> dict[str, dict[str, Any]]:
+def _universe_symbols(universe: pd.DataFrame) -> list[str]:
+    return [symbol for _, symbol in _universe_entries(universe)]
+
+
+def _universe_metadata(universe: pd.DataFrame, *, default_exchange: str = "NSE") -> dict[tuple[str, str], dict[str, Any]]:
     if universe.empty:
         return {}
-    metadata: dict[str, dict[str, Any]] = {}
+    metadata: dict[tuple[str, str], dict[str, Any]] = {}
     symbol_column = next((column for column in ("Symbol", "symbol", "tradingsymbol") if column in universe.columns), "")
     if not symbol_column:
         return metadata
@@ -778,7 +839,8 @@ def _universe_metadata(universe: pd.DataFrame) -> dict[str, dict[str, Any]]:
         symbol = str(row.get(symbol_column, "")).strip().upper()
         if not symbol:
             continue
-        metadata[symbol] = {
+        exchange = str(row.get("exchange", default_exchange) or default_exchange).strip().upper()
+        metadata[(exchange, symbol)] = {
             "name": str(row.get("Company Name", row.get("name", symbol)) or symbol),
             "industry": str(row.get("Industry", row.get("industry", "")) or ""),
             "source_universe": str(row.get("source_universe", "") or ""),

@@ -422,6 +422,19 @@ h1 {
   overflow-x: auto;
 }
 
+.table-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.table-actions .status {
+  margin: 0;
+}
+
 table {
   border-collapse: separate;
   border-spacing: 0;
@@ -467,6 +480,33 @@ th.sortable-header[aria-sort="ascending"]::after {
 th.sortable-header[aria-sort="descending"]::after {
   content: " ↓";
   color: var(--accent);
+}
+
+.column-filter-row th {
+  background: #ffffff;
+  padding: 6px 8px;
+  top: 38px;
+  z-index: 2;
+}
+
+.column-filter-row th::after {
+  content: "";
+}
+
+.column-filter-row input {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  min-width: 80px;
+  padding: 6px 7px;
+  width: 100%;
+}
+
+.column-filter-row input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 124, 186, 0.12);
+  outline: none;
 }
 
 th.sortable-header:focus {

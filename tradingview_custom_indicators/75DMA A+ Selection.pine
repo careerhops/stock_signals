@@ -1,0 +1,722 @@
+//@version=6
+indicator("75DMA A+ Reclaim BUY HOLD", overlay=true, max_labels_count=500)
+
+// ==========================================================
+// INPUTS
+// ==========================================================
+
+groupSelection = "1. Stock Selection"
+
+dma75Length = input.int(75, "75DMA Length", minval=20, group=groupSelection)
+dma100Length = input.int(100, "100DMA Length", minval=50, group=groupSelection)
+
+minDistance100 = input.float(
+     6.0,
+     "Minimum % Above 100DMA",
+     minval=0.0,
+     step=0.25,
+     group=groupSelection)
+
+trendLookback = input.int(
+     20,
+     "DMA Trend Lookback",
+     minval=5,
+     group=groupSelection)
+
+recentHighLookback = input.int(
+     20,
+     "Recent High Lookback",
+     minval=5,
+     group=groupSelection)
+
+recentHighTolerance = input.float(
+     1.0,
+     "Recent High Tolerance %",
+     minval=0.0,
+     step=0.25,
+     group=groupSelection)
+
+allowCoreEntries = input.bool(
+     false,
+     "Allow CORE-only Entries",
+     group=groupSelection)
+
+
+// ==========================================================
+// EXIT INPUTS
+// ==========================================================
+
+groupExit = "2. HOLD / Exit Management"
+
+hardStopPct = input.float(
+     10.0,
+     "Initial Stop Loss %",
+     minval=1.0,
+     step=0.5,
+     group=groupExit)
+
+breakevenTriggerPct = input.float(
+     10.0,
+     "Move SL to Breakeven at Profit %",
+     minval=1.0,
+     step=0.5,
+     group=groupExit)
+
+trailPct = input.float(
+     10.0,
+     "Trailing Stop %",
+     minval=1.0,
+     step=0.5,
+     group=groupExit)
+
+exitBelow75 = input.bool(
+     true,
+     "Exit After 2 Closes Below 75DMA",
+     group=groupExit)
+
+maxHoldSessions = input.int(
+     30,
+     "Maximum Holding Sessions",
+     minval=1,
+     group=groupExit)
+
+
+// ==========================================================
+// MOVING AVERAGES
+// ==========================================================
+
+dma75 = ta.sma(close, dma75Length)
+dma100 = ta.sma(close, dma100Length)
+
+
+// ==========================================================
+// DISTANCE ABOVE 100DMA
+// ==========================================================
+
+distance100 = ((close - dma100) / dma100) * 100.0
+
+distance100OK = distance100 >= minDistance100
+
+
+// ==========================================================
+// FAST 1-SESSION 75DMA RECLAIM
+//
+// Day -2 = Above 75DMA
+// Day -1 = Below 75DMA
+// Today  = Back above 75DMA
+// ==========================================================
+
+aboveBeforeBreak = close[2] >= dma75[2]
+
+belowYesterday = close[1] < dma75[1]
+
+aboveToday = close > dma75
+
+fastReclaim =
+     aboveBeforeBreak and
+     belowYesterday and
+     aboveToday
+
+
+// ==========================================================
+// LEVEL 1 — CORE
+// ==========================================================
+
+coreSetup =
+     barstate.isconfirmed and
+     fastReclaim and
+     distance100OK
+
+
+// ==========================================================
+// LEVEL 2 STRUCTURE
+//
+// Long-term bullish structure
+// ==========================================================
+
+dma75Rising = dma75 > dma75[trendLookback]
+
+dma100Rising = dma100 > dma100[trendLookback]
+
+dmaStackBullish = dma75 > dma100
+
+longTrendPullback =
+     dmaStackBullish and
+     dma75Rising and
+     dma100Rising
+
+
+// ==========================================================
+// NEAR RECENT HIGH
+// ==========================================================
+
+previousRecentHigh =
+     ta.highest(close, recentHighLookback)[1]
+
+recentHighThreshold =
+     previousRecentHigh *
+     (1.0 - recentHighTolerance / 100.0)
+
+nearRecentHigh =
+     close >= recentHighThreshold
+
+
+// ==========================================================
+// LEVEL 2 — A+
+// ==========================================================
+
+structuralConfirmation =
+     longTrendPullback or
+     nearRecentHigh
+
+aPlusSetup =
+     coreSetup and
+     structuralConfirmation
+
+
+// ==========================================================
+// ENTRY RULE
+//
+// Setup today
+// BUY at NEXT trading day's close
+// ==========================================================
+
+aPlusEntryTrigger =
+     barstate.isconfirmed and
+     aPlusSetup[1]
+
+coreEntryTrigger =
+     barstate.isconfirmed and
+     coreSetup[1] and
+     not aPlusSetup[1]
+
+
+// ==========================================================
+// TRADE VARIABLES
+// ==========================================================
+
+var bool inTrade = false
+
+var bool breakevenArmed = false
+
+var float entryPrice = na
+
+var float highestSinceEntry = na
+
+var float stopPrice = na
+
+var int barsHeld = 0
+
+var string activeTier = ""
+
+var string lastExitReason = ""
+
+
+bool buySignal = false
+
+bool exitSignal = false
+
+
+buySignal := false
+
+exitSignal := false
+
+
+// ==========================================================
+// MANAGE EXISTING POSITION
+// ==========================================================
+
+if inTrade
+
+    barsHeld += 1
+
+    highestSinceEntry :=
+         math.max(
+              highestSinceEntry,
+              high)
+
+    triggerPrice =
+         entryPrice *
+         (1.0 + breakevenTriggerPct / 100.0)
+
+    if highestSinceEntry >= triggerPrice
+        breakevenArmed := true
+
+
+    initialStop =
+         entryPrice *
+         (1.0 - hardStopPct / 100.0)
+
+
+    trailingStop =
+         highestSinceEntry *
+         (1.0 - trailPct / 100.0)
+
+
+    if breakevenArmed
+
+        newStop =
+             math.max(
+                  entryPrice,
+                  trailingStop)
+
+        stopPrice :=
+             math.max(
+                  stopPrice,
+                  newStop)
+
+    else
+
+        stopPrice :=
+             initialStop
+
+
+    stopExit =
+         close <= stopPrice
+
+
+    structuralExit =
+         exitBelow75 and
+         close < dma75 and
+         close[1] < dma75[1]
+
+
+    timeExit =
+         barsHeld >= maxHoldSessions
+
+
+    if stopExit or structuralExit or timeExit
+
+        exitSignal := true
+
+        if stopExit
+            lastExitReason := "STOP"
+
+        else if structuralExit
+            lastExitReason := "LOST 75DMA"
+
+        else
+            lastExitReason := "TIME"
+
+        inTrade := false
+
+
+// ==========================================================
+// NEW ENTRY
+// ==========================================================
+
+if not inTrade and not exitSignal
+
+    validAPlusEntry =
+         aPlusEntryTrigger
+
+    validCoreEntry =
+         allowCoreEntries and
+         coreEntryTrigger
+
+
+    if validAPlusEntry or validCoreEntry
+
+        buySignal := true
+
+        inTrade := true
+
+        entryPrice := close
+
+        highestSinceEntry := high
+
+        stopPrice :=
+             entryPrice *
+             (1.0 - hardStopPct / 100.0)
+
+        barsHeld := 1
+
+        breakevenArmed := false
+
+
+        if validAPlusEntry
+            activeTier := "A+"
+        else
+            activeTier := "CORE"
+
+
+// ==========================================================
+// PROFIT
+// ==========================================================
+
+float currentProfitPct = na
+
+
+if inTrade
+
+    currentProfitPct :=
+         ((close / entryPrice) - 1.0) * 100.0
+
+
+// ==========================================================
+// STATUS
+// ==========================================================
+
+string currentStatus = "WAIT"
+
+
+if exitSignal
+
+    currentStatus :=
+         "EXIT - " +
+         lastExitReason
+
+else if buySignal
+
+    currentStatus :=
+         "BUY " +
+         activeTier
+
+else if inTrade
+
+    currentStatus :=
+         "HOLD " +
+         activeTier
+
+else if aPlusSetup
+
+    currentStatus :=
+         "A+ SETUP"
+
+else if coreSetup
+
+    currentStatus :=
+         "CORE WATCH"
+
+else
+
+    currentStatus :=
+         "WAIT"
+
+
+// ==========================================================
+// PRICE CHART PLOTS
+//
+// force_overlay=true guarantees that everything appears
+// directly on the stock/candlestick chart.
+// ==========================================================
+
+
+// 75DMA
+plot(
+     dma75,
+     title="75DMA",
+     color=color.orange,
+     linewidth=2,
+     force_overlay=true)
+
+
+// 100DMA
+plot(
+     dma100,
+     title="100DMA",
+     color=color.blue,
+     linewidth=2,
+     force_overlay=true)
+
+
+// Active stop
+plot(
+     inTrade ? stopPrice : na,
+     title="Active Stop",
+     color=color.red,
+     linewidth=2,
+     style=plot.style_linebr,
+     force_overlay=true)
+
+
+// ==========================================================
+// A+ SETUP
+// ==========================================================
+
+plotshape(
+     aPlusSetup,
+     title="A+ Setup",
+     style=shape.diamond,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.small,
+     text="A+",
+     textcolor=color.black,
+     force_overlay=true)
+
+
+// ==========================================================
+// CORE WATCH
+// ==========================================================
+
+plotshape(
+     coreSetup and not aPlusSetup,
+     title="CORE Watch",
+     style=shape.circle,
+     location=location.belowbar,
+     color=color.blue,
+     size=size.tiny,
+     text="C",
+     textcolor=color.white,
+     force_overlay=true)
+
+
+// ==========================================================
+// BUY
+// ==========================================================
+
+plotshape(
+     buySignal,
+     title="BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.green,
+     textcolor=color.white,
+     size=size.small,
+     text="BUY",
+     force_overlay=true)
+
+
+// ==========================================================
+// EXIT
+// ==========================================================
+
+plotshape(
+     exitSignal,
+     title="EXIT",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.red,
+     textcolor=color.white,
+     size=size.small,
+     text="EXIT",
+     force_overlay=true)
+
+
+// ==========================================================
+// HOLD BACKGROUND
+// ==========================================================
+
+bgcolor(
+     inTrade ?
+     color.new(color.green, 93) :
+     na,
+     force_overlay=true)
+
+
+// ==========================================================
+// STATUS DASHBOARD
+// ==========================================================
+
+var table dashboard =
+     table.new(
+          position.top_right,
+          2,
+          11,
+          border_width=1,
+          force_overlay=true)
+
+
+if barstate.islast
+
+    table.cell(
+         dashboard,
+         0,
+         0,
+         "75DMA MODEL",
+         text_color=color.white,
+         bgcolor=color.black)
+
+
+    table.cell(
+         dashboard,
+         1,
+         0,
+         currentStatus,
+         text_color=color.white,
+         bgcolor=color.black)
+
+
+    table.cell(
+         dashboard,
+         0,
+         1,
+         "Fast Reclaim")
+
+
+    table.cell(
+         dashboard,
+         1,
+         1,
+         fastReclaim ?
+         "YES" :
+         "NO")
+
+
+    table.cell(
+         dashboard,
+         0,
+         2,
+         "Above 100DMA")
+
+
+    table.cell(
+         dashboard,
+         1,
+         2,
+         str.tostring(
+              distance100,
+              "#.##") + "%")
+
+
+    table.cell(
+         dashboard,
+         0,
+         3,
+         "CORE")
+
+
+    table.cell(
+         dashboard,
+         1,
+         3,
+         coreSetup ?
+         "PASS" :
+         "FAIL")
+
+
+    table.cell(
+         dashboard,
+         0,
+         4,
+         "75 > 100")
+
+
+    table.cell(
+         dashboard,
+         1,
+         4,
+         dmaStackBullish ?
+         "YES" :
+         "NO")
+
+
+    table.cell(
+         dashboard,
+         0,
+         5,
+         "75DMA Rising")
+
+
+    table.cell(
+         dashboard,
+         1,
+         5,
+         dma75Rising ?
+         "YES" :
+         "NO")
+
+
+    table.cell(
+         dashboard,
+         0,
+         6,
+         "100DMA Rising")
+
+
+    table.cell(
+         dashboard,
+         1,
+         6,
+         dma100Rising ?
+         "YES" :
+         "NO")
+
+
+    table.cell(
+         dashboard,
+         0,
+         7,
+         "Near High")
+
+
+    table.cell(
+         dashboard,
+         1,
+         7,
+         nearRecentHigh ?
+         "YES" :
+         "NO")
+
+
+    table.cell(
+         dashboard,
+         0,
+         8,
+         "Entry")
+
+
+    table.cell(
+         dashboard,
+         1,
+         8,
+         na(entryPrice) ?
+         "-" :
+         str.tostring(
+              entryPrice,
+              "#.##"))
+
+
+    table.cell(
+         dashboard,
+         0,
+         9,
+         "Sessions")
+
+
+    table.cell(
+         dashboard,
+         1,
+         9,
+         inTrade ?
+         str.tostring(barsHeld) :
+         "-")
+
+
+    table.cell(
+         dashboard,
+         0,
+         10,
+         "Return")
+
+
+    table.cell(
+         dashboard,
+         1,
+         10,
+         na(currentProfitPct) ?
+         "-" :
+         str.tostring(
+              currentProfitPct,
+              "#.##") + "%")
+
+
+// ==========================================================
+// ALERTS
+// ==========================================================
+
+alertcondition(
+     aPlusSetup,
+     title="A+ Setup",
+     message="A+ 75DMA reclaim confirmed.")
+
+alertcondition(
+     buySignal,
+     title="BUY",
+     message="75DMA A+ BUY signal.")
+
+alertcondition(
+     exitSignal,
+     title="EXIT",
+     message="75DMA A+ EXIT signal.")

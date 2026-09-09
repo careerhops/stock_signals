@@ -255,14 +255,11 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
             )
         )
 
-    if not frame.empty:
-        latest_date = frame["date"].max()
-        default_start = latest_date - pd.Timedelta(weeks=104)
-        if default_start < frame["date"].min():
-            default_start = frame["date"].min()
-        default_range = [default_start, latest_date + pd.Timedelta(days=7)]
-    else:
-        default_range = None
+    latest_date = frame["date"].max()
+    default_start = latest_date - pd.Timedelta(weeks=104)
+    if default_start < frame["date"].min():
+        default_start = frame["date"].min()
+    default_range = [default_start, latest_date + pd.Timedelta(days=7)]
 
     for row in buy_rows.itertuples():
         fig.add_vline(
@@ -338,6 +335,91 @@ def build_signal_chart(strategy_output: pd.DataFrame, exchange: str, symbol: str
         "if (el) { requestAnimationFrame(() => { el.parentElement.scrollLeft = el.parentElement.scrollWidth; }); }"
         "</script>"
     )
+
+
+def build_roi_journal_dma_distance_chart(
+    distance_history: pd.DataFrame,
+    *,
+    signal_id: int | str,
+    reclaim_date: Any | None = None,
+    entry_date: Any | None = None,
+    height: int = 520,
+) -> str:
+    frame = distance_history.copy()
+    if frame.empty or "signal_id" not in frame.columns:
+        return ""
+    frame = frame[frame["signal_id"].astype(str) == str(signal_id)].copy()
+    if frame.empty:
+        return ""
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce", format="mixed")
+    frame = frame.dropna(subset=["date"]).sort_values("date")
+    if frame.empty:
+        return ""
+    for column in ("distance_75dma_pct", "distance_100dma_pct"):
+        frame[column] = pd.to_numeric(frame.get(column), errors="coerce")
+
+    symbol = str(frame["symbol"].dropna().astype(str).iloc[0]) if "symbol" in frame.columns and frame["symbol"].notna().any() else ""
+    exchange = str(frame["exchange"].dropna().astype(str).iloc[0]) if "exchange" in frame.columns and frame["exchange"].notna().any() else ""
+    signal_date = pd.to_datetime(frame["date_identifier"].iloc[0], errors="coerce") if "date_identifier" in frame.columns else pd.NaT
+    reclaim_ts = pd.to_datetime(reclaim_date, errors="coerce") if reclaim_date else pd.NaT
+    entry_ts = pd.to_datetime(entry_date, errors="coerce") if entry_date else pd.NaT
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["distance_75dma_pct"],
+            mode="lines",
+            name="Distance to 75DMA %",
+            line={"color": "#2563eb", "width": 2},
+            hovertemplate="Date: %{x|%d %b %Y}<br>75DMA distance: %{y:.2f}%<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=frame["distance_100dma_pct"],
+            mode="lines",
+            name="Distance to 100DMA %",
+            line={"color": "#7c3aed", "width": 2},
+            hovertemplate="Date: %{x|%d %b %Y}<br>100DMA distance: %{y:.2f}%<extra></extra>",
+        )
+    )
+    fig.add_hline(y=0.0, line_width=1, line_dash="dash", line_color="rgba(75,85,99,0.55)")
+    if pd.notna(signal_date):
+        fig.add_vline(
+            x=pd.Timestamp(signal_date),
+            line_width=2,
+            line_dash="solid",
+            line_color="rgba(220, 38, 38, 0.72)",
+        )
+    if pd.notna(reclaim_ts):
+        fig.add_vline(
+            x=pd.Timestamp(reclaim_ts),
+            line_width=2,
+            line_dash="dash",
+            line_color="rgba(22, 138, 117, 0.80)",
+        )
+    if pd.notna(entry_ts):
+        fig.add_vline(
+            x=pd.Timestamp(entry_ts),
+            line_width=2,
+            line_dash="dot",
+            line_color="rgba(79, 142, 207, 0.86)",
+        )
+    title_prefix = f"{exchange}:{symbol}" if symbol else "Selected signal"
+    fig.update_layout(
+        title=f"{title_prefix} Decision-Window DMA Distance",
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        margin={"l": 52, "r": 44, "t": 84, "b": 44},
+        height=height,
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+    )
+    fig.update_yaxes(title_text="DMA distance %", zeroline=False)
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(217, 225, 234, 0.7)")
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def build_gtt_opportunity_chart(stock_stats: pd.DataFrame, height: int = 540) -> str:
