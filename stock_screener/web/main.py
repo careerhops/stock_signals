@@ -93,7 +93,10 @@ from stock_screener.google_sheets import (
     save_google_sheet_target,
 )
 from stock_screener.jobs.daily_scan import daily_signal_config, run_daily_scan
-from stock_screener.symbols import is_excluded_weekly_screener_instrument
+from stock_screener.symbols import (
+    is_excluded_weekly_screener_instrument,
+    is_nse_debt_like_symbol,
+)
 from stock_screener.knox_envelope_study import (
     CMF_CONDITIONS as KNOX_ENV_CMF_CONDITIONS,
     CONFIRMATION_MODES as KNOX_ENV_CONFIRMATION_MODES,
@@ -912,6 +915,8 @@ def _is_non_stock_or_etf_instrument(symbol: Any, name: Any) -> bool:
         return True
     if is_excluded_weekly_screener_instrument(symbol_text, name_text):
         return True
+    if is_nse_debt_like_symbol(symbol_text):
+        return True
     return bool(
         symbol_text.endswith(("-IV", "-RR", "-E1", "-P1", "INAV"))
         or "ETF" in symbol_text
@@ -972,29 +977,49 @@ def _stock_signature_universe_options(
 
 
 def _parse_stock_signature_custom_symbols(raw_symbols: Any, maximum: int | None = None) -> list[str]:
+    return [
+        symbol if exchange == "NSE" else f"{exchange}:{symbol}"
+        for exchange, symbol in _parse_stock_signature_custom_pairs(raw_symbols, maximum=maximum)
+    ]
+
+
+def _parse_stock_signature_custom_pairs(raw_symbols: Any, maximum: int | None = None) -> list[tuple[str, str]]:
     tokens = re.split(r"[\s,;]+", str(raw_symbols or "").strip())
-    symbols: list[str] = []
-    seen: set[str] = set()
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for token in tokens:
-        symbol = token.strip().strip("'\"").upper()
+        text = token.strip().strip("'\"").upper()
+        exchange = "NSE"
+        if ":" in text:
+            prefix, text = text.split(":", 1)
+            if prefix in {"NSE", "BSE"}:
+                exchange = prefix
+        symbol = text.strip()
         if symbol.startswith(("NSE:", "BSE:")):
-            symbol = symbol[4:]
-        if symbol.endswith((".NS", ".BO")):
+            prefix, symbol = symbol.split(":", 1)
+            if prefix in {"NSE", "BSE"}:
+                exchange = prefix
+        if symbol.endswith(".NS"):
             symbol = symbol[:-3]
-        if not symbol or symbol in seen:
+            exchange = "NSE"
+        elif symbol.endswith(".BO"):
+            symbol = symbol[:-3]
+            exchange = "BSE"
+        pair = (exchange, symbol)
+        if not symbol or pair in seen:
             continue
         if ".." in symbol or not re.fullmatch(r"[A-Z0-9&._-]+", symbol):
             raise ValueError(f"Invalid stock symbol: {symbol}")
-        seen.add(symbol)
-        symbols.append(symbol)
-        if maximum is not None and len(symbols) > int(maximum):
+        seen.add(pair)
+        pairs.append(pair)
+        if maximum is not None and len(pairs) > int(maximum):
             raise ValueError(f"Enter no more than {int(maximum)} symbols per Stock Signature scan.")
-    return symbols
+    return pairs
 
 
 def _stock_signature_custom_symbols_frame(raw_symbols: str) -> pd.DataFrame:
-    symbols = _parse_stock_signature_custom_symbols(raw_symbols)
-    if not symbols:
+    pairs = _parse_stock_signature_custom_pairs(raw_symbols)
+    if not pairs:
         return pd.DataFrame(columns=["Company Name", "Industry", "Symbol", "exchange", "source_universe"])
     return pd.DataFrame(
         [
@@ -1002,10 +1027,10 @@ def _stock_signature_custom_symbols_frame(raw_symbols: str) -> pd.DataFrame:
                 "Company Name": symbol,
                 "Industry": "Custom",
                 "Symbol": symbol,
-                "exchange": "NSE",
+                "exchange": exchange,
                 "source_universe": "Custom list",
             }
-            for symbol in symbols
+            for exchange, symbol in pairs
         ]
     )
 
@@ -9360,12 +9385,13 @@ async def run_dma_reclaim_strategy_from_dashboard(request: Request) -> RedirectR
     run_scope = str(form.get("run_scope", "selected")).strip()
     raw_custom_symbols = str(form.get("custom_symbols", "")).strip()
     custom_symbols = ",".join(_parse_stock_signature_custom_symbols(raw_custom_symbols)) if raw_custom_symbols else ""
-    if run_scope == "custom_only" and not custom_symbols:
+    custom_only_run = run_scope in {"custom_only", "custom_aplus"}
+    if custom_only_run and not custom_symbols:
         return RedirectResponse(
-            f"/dma-reclaim-strategy?study_error={quote('Enter at least one custom stock for Custom List Only.')}",
+            f"/dma-reclaim-strategy?study_error={quote('Enter at least one custom stock for the custom list run.')}",
             status_code=303,
         )
-    selected_universes = [] if run_scope == "custom_only" else _stock_signature_selected_universes(
+    selected_universes = [] if custom_only_run else _stock_signature_selected_universes(
         form.getlist("universe"),
         custom_symbols=custom_symbols,
     )
@@ -9430,6 +9456,9 @@ async def run_dma_reclaim_strategy_from_dashboard(request: Request) -> RedirectR
         params.append(f"universe={quote(universe)}")
     if custom_symbols:
         params.append(f"custom_symbols={quote(custom_symbols)}")
+    if run_scope == "custom_aplus":
+        params.append("candidate_tier=Strict%20Long")
+        params.append("strategy=Strict%20Long%2075DMA%20Reclaim")
     if dashboard_token:
         params.append(f"token={quote(dashboard_token)}")
     query_suffix = "&" + "&".join(params)

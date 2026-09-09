@@ -80,11 +80,12 @@
       </label>
       <label class="wide-field">
         Custom stocks
-        <textarea name="custom_symbols" rows="3" placeholder="OFSS, RELIANCE, HDFCBANK">{{ custom_symbols }}</textarea>
+        <textarea name="custom_symbols" rows="3" placeholder="OFSS, RELIANCE, BSE:500325, HDFCBANK.NS">{{ custom_symbols }}</textarea>
       </label>
       <div class="filter-actions">
         <button class="button" type="submit" name="run_scope" value="selected">Download History + Run Strategy</button>
         <button class="button secondary" type="submit" name="run_scope" value="custom_only">Run Custom List Only</button>
+        <button class="button secondary" type="submit" name="run_scope" value="custom_aplus">Run A+ Custom List</button>
       </div>
     </form>
 
@@ -123,7 +124,10 @@
               if (!response.ok) throw new Error("Status unavailable");
               const status = await response.json();
               const value = Number(status.percent || 0);
-              title.textContent = status.status === "queued" ? "75DMA reclaim strategy is queued" : (status.phase || "75DMA reclaim strategy is running");
+              const phase = status.phase || "";
+              title.textContent = status.status === "queued"
+                ? (phase && phase !== "Queued" ? phase : "75DMA reclaim strategy is queued")
+                : (phase || "75DMA reclaim strategy is running");
               percent.textContent = `${value}%`;
               fill.style.width = `${value}%`;
               const completed = Number(status.completed || 0);
