@@ -1,0 +1,256 @@
+//@version=6
+indicator("EMA20 Strict 2-Bar IB EB v3", overlay=true)
+
+// ============================================================
+// INPUTS
+// ============================================================
+
+emaLength = input.int(20, "EMA Length", minval=1)
+
+showBandFill = input.bool(true, "Fill EMA High-Low Band")
+showIB = input.bool(true, "Show Bullish Inside Bar")
+showEB = input.bool(true, "Show Bullish Engulfing Bar")
+
+
+// ============================================================
+// EMA 20
+// ============================================================
+
+emaHigh  = ta.ema(high, emaLength)
+emaLow   = ta.ema(low, emaLength)
+emaClose = ta.ema(close, emaLength)
+
+
+// ============================================================
+// PLOT EMA BAND
+// ============================================================
+
+emaHighPlot = plot(
+     emaHigh,
+     title="EMA20 High",
+     color=color.red,
+     linewidth=2
+)
+
+emaLowPlot = plot(
+     emaLow,
+     title="EMA20 Low",
+     color=color.green,
+     linewidth=2
+)
+
+plot(
+     emaClose,
+     title="EMA20 Close",
+     color=color.yellow,
+     linewidth=2
+)
+
+fill(
+     emaHighPlot,
+     emaLowPlot,
+     title="EMA20 Band",
+     color=showBandFill ? color.new(color.blue, 90) : na
+)
+
+
+// ============================================================
+// STEP 1
+// EXACTLY TWO CONSECUTIVE CANDLES
+//
+// [1] = immediately previous candle
+// [0] = current candle
+// ============================================================
+
+
+// Previous candle MUST be RED
+previousIsRed =
+     close[1] < open[1]
+
+
+// Current candle MUST be GREEN
+currentIsGreen =
+     close > open
+
+
+// ============================================================
+// STEP 2
+// BOTH CANDLES MUST BE COMPLETELY BELOW EMA20 LOW
+//
+// We check HIGH because HIGH is the highest point
+// of the entire candle including wick.
+//
+// If:
+//
+// HIGH < EMA20 LOW
+//
+// then the complete candle is below the band.
+// ============================================================
+
+
+// Previous RED candle completely below EMA20 Low
+previousBelowBand =
+     high[1] < emaLow[1]
+
+
+// Current GREEN candle completely below EMA20 Low
+currentBelowBand =
+     high < emaLow
+
+
+// Both consecutive candles below band
+bothBelowBand =
+     previousBelowBand and
+     currentBelowBand
+
+
+// ============================================================
+// BASIC VALID 2-CANDLE SEQUENCE
+//
+// RED immediately followed by GREEN
+// AND both completely below EMA20 Low
+// ============================================================
+
+validRedGreenPair =
+     previousIsRed and
+     currentIsGreen and
+     bothBelowBand
+
+
+// ============================================================
+// BULLISH INSIDE BAR - IB
+//
+// GREEN candle is completely INSIDE
+// previous RED candle.
+//
+// Wicks included.
+//
+//        RED
+//     ┌────────┐
+//     │        │
+//     │ ┌────┐ │
+//     │ │GREEN│ │
+//     │ └────┘ │
+//     │        │
+//     └────────┘
+//
+// GREEN high < RED high
+// GREEN low  > RED low
+// ============================================================
+
+greenInsideRed =
+     high < high[1] and
+     low > low[1]
+
+
+bullishInsideBar =
+     barstate.isconfirmed and
+     validRedGreenPair and
+     greenInsideRed
+
+
+// ============================================================
+// BULLISH ENGULFING BAR - EB
+//
+// GREEN candle completely ENGULFS
+// previous RED candle.
+//
+// Wicks included.
+//
+//       GREEN
+//    ┌──────────┐
+//    │  ┌────┐  │
+//    │  │RED │  │
+//    │  └────┘  │
+//    └──────────┘
+//
+// GREEN high > RED high
+// GREEN low  < RED low
+// ============================================================
+
+greenEngulfsRed =
+     high > high[1] and
+     low < low[1]
+
+
+bullishEngulfingBar =
+     barstate.isconfirmed and
+     validRedGreenPair and
+     greenEngulfsRed
+
+
+// ============================================================
+// PLOT IB
+// ============================================================
+
+plotshape(
+     showIB and bullishInsideBar,
+     title="Bullish Inside Bar",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.aqua,
+     text="IB",
+     textcolor=color.black,
+     size=size.small
+)
+
+
+// ============================================================
+// PLOT EB
+// ============================================================
+
+plotshape(
+     showEB and bullishEngulfingBar,
+     title="Bullish Engulfing Bar",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.lime,
+     text="EB",
+     textcolor=color.black,
+     size=size.small
+)
+
+
+// ============================================================
+// DATA WINDOW - DEBUG ONLY
+//
+// These do NOT appear on the chart.
+// Useful if you hover over a candle and want to understand
+// why it did/didn't qualify.
+// ============================================================
+
+plot(
+     previousIsRed ? 1 : 0,
+     title="Previous Candle Red",
+     display=display.data_window
+)
+
+plot(
+     currentIsGreen ? 1 : 0,
+     title="Current Candle Green",
+     display=display.data_window
+)
+
+plot(
+     previousBelowBand ? 1 : 0,
+     title="Previous Red Fully Below Band",
+     display=display.data_window
+)
+
+plot(
+     currentBelowBand ? 1 : 0,
+     title="Current Green Fully Below Band",
+     display=display.data_window
+)
+
+plot(
+     bullishInsideBar ? 1 : 0,
+     title="Valid IB",
+     display=display.data_window
+)
+
+plot(
+     bullishEngulfingBar ? 1 : 0,
+     title="Valid EB",
+     display=display.data_window
+)

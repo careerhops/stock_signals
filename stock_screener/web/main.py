@@ -69,6 +69,20 @@ from stock_screener.dma_reclaim_strategy_study import (
     save_dma_reclaim_strategy_outputs,
     write_dma_reclaim_strategy_workbook,
 )
+from stock_screener.ema20_band_strategy_study import (
+    DEFAULT_CURRENT_SIGNAL_LOOKBACK_SESSIONS as EMA20_BAND_DEFAULT_CURRENT_LOOKBACK,
+    DEFAULT_EMA_LENGTH as EMA20_BAND_DEFAULT_EMA_LENGTH,
+    DEFAULT_HOLDING_SESSIONS as EMA20_BAND_DEFAULT_HOLDING_SESSIONS,
+    DEFAULT_PROFIT_TARGET_PCT as EMA20_BAND_DEFAULT_TARGET_PCT,
+    DEFAULT_ROUND_TRIP_COST_PCT as EMA20_BAND_DEFAULT_COST_PCT,
+    DEFAULT_STOP_BUFFER_PCT as EMA20_BAND_DEFAULT_STOP_BUFFER_PCT,
+    DEFAULT_STOP_LOSS_PCT as EMA20_BAND_DEFAULT_STOP_PCT,
+    DEFAULT_WARMUP_MONTHS as EMA20_BAND_DEFAULT_WARMUP_MONTHS,
+    load_ema20_band_strategy_outputs,
+    run_ema20_band_strategy_study,
+    save_ema20_band_strategy_outputs,
+    write_ema20_band_strategy_workbook,
+)
 from stock_screener.gtt_gain_report import write_gtt_gain_workbook
 from stock_screener.gtt_gain_study import (
     _latest_signal_context,
@@ -1213,6 +1227,10 @@ def _drawdown_recovery_dir(data_root: Path) -> Path:
 
 def _dma_reclaim_strategy_dir(data_root: Path) -> Path:
     return data_root / "dma_reclaim_strategy"
+
+
+def _ema20_band_strategy_dir(data_root: Path) -> Path:
+    return data_root / "ema20_band_strategy"
 
 
 def _roi_journal_dma_dir(data_root: Path) -> Path:
@@ -6128,6 +6146,134 @@ def _filter_constituents_to_pair_texts(constituents: pd.DataFrame, pair_texts: I
     return working[pd.Series(mask, index=working.index)].copy()
 
 
+def _run_ema20_band_strategy_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    start_date: str,
+    ema_length: int,
+    warmup_months: int,
+    current_signal_lookback_sessions: int,
+    holding_sessions: int,
+    profit_target_pct: float,
+    stop_loss_pct: float,
+    stop_buffer_pct: float,
+    round_trip_cost_pct: float,
+    entry_price_mode: str,
+    exit_on_ema_close_reclaim: bool,
+    requested_as_of_date: str = "",
+    selected_universes: list[str] | None = None,
+    custom_symbols: str = "",
+) -> None:
+    storage = Storage(data_root)
+
+    def refresh_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 45) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 45)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    def scan_progress_callback(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 45 + (int((completed / total) * 55) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running"),
+            completed=completed,
+            total=total,
+            percent=max(45, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        universe_keys = list(STOCK_SIGNATURE_DEFAULT_UNIVERSES if selected_universes is None else selected_universes)
+        constituents, universe_meta = _build_stock_signature_universe(
+            data_root,
+            universe_keys,
+            custom_symbols,
+            allow_remote_fetch=True,
+        )
+        if constituents.empty:
+            raise RuntimeError(
+                "The selected EMA20 band universe is empty. Choose Nifty 100, Nifty 500, All NSE EQ, BSE-only EQ, or enter comma-separated symbols."
+            )
+        start_ts = pd.Timestamp(start_date).normalize()
+        requested_date, analysis_date = _resolve_stock_signature_required_date(requested_as_of_date)
+        refresh_months = _dma_reclaim_fetch_months(start_ts, analysis_date, warmup_months)
+        refreshed_symbols, refresh_audit = _refresh_stock_signature_candles(
+            storage,
+            constituents,
+            required_date=analysis_date,
+            lookback_months=refresh_months,
+            progress_callback=refresh_progress_callback,
+            progress_phase="Downloading EMA20 band OHLC",
+            provider_label="EMA20 Band Strategy",
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh daily candles were available for the selected EMA20 band universe.")
+        run_constituents = _filter_constituents_to_pair_texts(constituents, refreshed_symbols)
+        result = run_ema20_band_strategy_study(
+            storage,
+            run_constituents,
+            universe_name=str(universe_meta["universe_summary"]),
+            start_date=start_ts,
+            as_of_date=analysis_date,
+            ema_length=ema_length,
+            warmup_months=warmup_months,
+            current_signal_lookback_sessions=current_signal_lookback_sessions,
+            holding_sessions=holding_sessions,
+            profit_target_pct=profit_target_pct,
+            stop_loss_pct=stop_loss_pct,
+            stop_buffer_pct=stop_buffer_pct,
+            round_trip_cost_pct=round_trip_cost_pct,
+            entry_price_mode=entry_price_mode,
+            exit_on_ema_close_reclaim=exit_on_ema_close_reclaim,
+            required_latest_date=analysis_date,
+            progress_callback=scan_progress_callback,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
+        result.summary["selected_universes"] = list(universe_meta["selected_universes"])
+        result.summary["custom_symbols"] = str(universe_meta["custom_symbols"])
+        result.summary["universe_label"] = str(universe_meta["universe_label"])
+        result.summary["constituent_source_url"] = ", ".join(universe_meta["source_urls"])
+        result.summary["constituent_source_file"] = ", ".join(universe_meta["source_files"])
+        save_ema20_band_strategy_outputs(result, _ema20_band_strategy_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_with_history", 0)),
+            total=int(result.summary.get("symbols_requested", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/ema20-band-strategy?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/ema20-band-strategy?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
 def _run_dma_reclaim_strategy_job(
     job_id: str,
     data_root: Path,
@@ -9209,6 +9355,328 @@ async def run_stock_signature_from_dashboard(request: Request) -> RedirectRespon
     except Exception as exc:
         redirect_url = f"/stock-signature?study_error={quote(str(exc)[:500])}{query_suffix}"
     return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/ema20-band-strategy", response_class=HTMLResponse)
+def ema20_band_strategy_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    latest = load_ema20_band_strategy_outputs(_ema20_band_strategy_dir(data_root))
+    summary = dict(latest.summary)
+    default_as_of = str(summary.get("requested_as_of_date") or _latest_completed_nse_calendar_date().isoformat())
+    as_of_date = _as_of_date_input(request, summary) or default_as_of
+    try:
+        as_of_ts = pd.Timestamp(as_of_date)
+    except (TypeError, ValueError):
+        as_of_ts = pd.Timestamp(default_as_of)
+        as_of_date = default_as_of
+    default_start = (as_of_ts - pd.DateOffset(months=18)).strftime("%Y-%m-%d")
+    start_date_default = default_start if request.query_params.get("as_of_date") else str(summary.get("start_date") or default_start)
+    start_date = str(request.query_params.get("start_date", start_date_default) or start_date_default).strip()
+
+    ema_length = _int_query_param(request, summary, "ema_length", EMA20_BAND_DEFAULT_EMA_LENGTH, minimum=1, maximum=200)
+    warmup_months = _int_query_param(request, summary, "warmup_months", EMA20_BAND_DEFAULT_WARMUP_MONTHS, minimum=1, maximum=36)
+    current_signal_lookback_sessions = _int_query_param(
+        request,
+        summary,
+        "current_signal_lookback_sessions",
+        EMA20_BAND_DEFAULT_CURRENT_LOOKBACK,
+        minimum=1,
+        maximum=60,
+    )
+    holding_sessions = _int_query_param(request, summary, "holding_sessions", EMA20_BAND_DEFAULT_HOLDING_SESSIONS, minimum=1, maximum=120)
+    profit_target_pct = _float_query_param(request, summary, "profit_target_pct", EMA20_BAND_DEFAULT_TARGET_PCT, minimum=0.0, maximum=100.0)
+    stop_loss_pct = _float_query_param(request, summary, "stop_loss_pct", EMA20_BAND_DEFAULT_STOP_PCT, minimum=0.1, maximum=50.0)
+    stop_buffer_pct = _float_query_param(request, summary, "stop_buffer_pct", EMA20_BAND_DEFAULT_STOP_BUFFER_PCT, minimum=0.0, maximum=10.0)
+    round_trip_cost_pct = _float_query_param(request, summary, "round_trip_cost_pct", EMA20_BAND_DEFAULT_COST_PCT, minimum=0.0, maximum=5.0)
+    entry_price_mode = str(request.query_params.get("entry_price_mode", summary.get("entry_price_mode", "next_open")) or "next_open").strip().lower()
+    if entry_price_mode not in {"next_open", "next_close"}:
+        entry_price_mode = "next_open"
+    exit_on_ema_close_reclaim = _truthy_param(
+        request.query_params.get("exit_on_ema_close_reclaim", summary.get("exit_on_ema_close_reclaim", True)),
+        default=True,
+    )
+
+    raw_custom_symbols = str(request.query_params.get("custom_symbols", summary.get("custom_symbols", "")) or "").strip()
+    universe_error = ""
+    try:
+        custom_symbols = ",".join(_parse_stock_signature_custom_symbols(raw_custom_symbols)) if raw_custom_symbols else ""
+    except ValueError as exc:
+        custom_symbols = ""
+        universe_error = str(exc)
+    try:
+        selected_universes = _stock_signature_selected_universes(request.query_params.getlist("universe"), custom_symbols=custom_symbols)
+        constituents, universe_meta = _build_stock_signature_universe(
+            data_root,
+            selected_universes,
+            custom_symbols,
+            allow_remote_fetch=False,
+        )
+    except Exception as exc:
+        constituents = pd.DataFrame()
+        universe_error = str(exc)
+        selected_universes = list(STOCK_SIGNATURE_DEFAULT_UNIVERSES if not custom_symbols else [])
+        universe_meta = {
+            "selected_universes": selected_universes,
+            "custom_symbols": custom_symbols,
+            "universe_label": "",
+            "universe_summary": "",
+            "missing_universes": [],
+            "source_urls": [],
+            "source_files": [],
+        }
+
+    stock_search = request.query_params.get("stock_search", "").strip()
+    pattern_filter = request.query_params.get("pattern", "").strip()
+    strategy_filter = request.query_params.get("strategy", "").strip()
+
+    candidates = latest.candidates.copy()
+    if not candidates.empty:
+        candidates = _apply_stock_search(candidates, stock_search)
+        if pattern_filter and "pattern" in candidates.columns:
+            candidates = candidates[candidates["pattern"].astype(str).eq(pattern_filter)].copy()
+        sort_cols = [column for column in ("candidate_score", "sessions_since_signal", "symbol") if column in candidates.columns]
+        if sort_cols:
+            candidates = candidates.sort_values(sort_cols, ascending=[False, True, True][: len(sort_cols)], na_position="last")
+
+    strategy_stats = latest.strategy_stats.copy()
+    yearly_stats = latest.yearly_stats.copy()
+    stock_stats = latest.stock_stats.copy()
+    trades = latest.trades.copy()
+    if strategy_filter:
+        if not stock_stats.empty and "strategy" in stock_stats.columns:
+            stock_stats = stock_stats[stock_stats["strategy"].astype(str).eq(strategy_filter)].copy()
+        if not trades.empty and "strategy" in trades.columns:
+            trades = trades[trades["strategy"].astype(str).eq(strategy_filter)].copy()
+    if not stock_stats.empty:
+        stock_stats = _apply_stock_search(stock_stats, stock_search)
+        sort_cols = [column for column in ("profit_factor", "win_rate_pct", "avg_return_pct", "trades") if column in stock_stats.columns]
+        if sort_cols:
+            stock_stats = stock_stats.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+    if not trades.empty:
+        trades = _apply_stock_search(trades, stock_search)
+        trades = trades.sort_values(
+            [column for column in ("entry_date", "strategy", "symbol") if column in trades.columns],
+            ascending=[False, True, True][: len([column for column in ("entry_date", "strategy", "symbol") if column in trades.columns])],
+            na_position="last",
+        )
+    if not yearly_stats.empty and "year" in yearly_stats.columns:
+        yearly_stats = yearly_stats.sort_values(["year", "strategy"], ascending=[False, True], na_position="last")
+
+    return templates.TemplateResponse(
+        "ema20_band_strategy.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "candidates": _records(candidates.head(500)),
+            "candidates_count": len(candidates),
+            "candidate_symbols_csv": _comma_separated_symbols(candidates),
+            "strategy_stats": _records(strategy_stats),
+            "yearly_stats": _records(yearly_stats.head(100)),
+            "stock_stats": _records(stock_stats.head(300)),
+            "trades": _records(trades.head(500)),
+            "stock_search": stock_search,
+            "pattern_filter": pattern_filter,
+            "pattern_options": ["Bullish Inside Bar", "Bullish Engulfing", "Inside + Engulfing"],
+            "strategy_filter": strategy_filter,
+            "strategy_options": [
+                "Any EMA20 Band Bullish Pattern",
+                "Bullish Inside Bar Below EMA20 Band",
+                "Bullish Engulfing Below EMA20 Band",
+            ],
+            "start_date": start_date,
+            "as_of_date": as_of_date,
+            "ema_length": ema_length,
+            "warmup_months": warmup_months,
+            "current_signal_lookback_sessions": current_signal_lookback_sessions,
+            "holding_sessions": holding_sessions,
+            "profit_target_pct": profit_target_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "stop_buffer_pct": stop_buffer_pct,
+            "round_trip_cost_pct": round_trip_cost_pct,
+            "entry_price_mode": entry_price_mode,
+            "exit_on_ema_close_reclaim": exit_on_ema_close_reclaim,
+            "selected_universes": list(universe_meta["selected_universes"]),
+            "universe_options": _stock_signature_universe_options(universe_meta["selected_universes"], include_full_market=True),
+            "custom_symbols": str(universe_meta["custom_symbols"]),
+            "missing_universes": universe_meta.get("missing_universes", []),
+            "universe_error": universe_error,
+            "constituents_count": len(constituents),
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/ema20-band-strategy/run")
+async def run_ema20_band_strategy_from_dashboard(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    run_scope = str(form.get("run_scope", "selected")).strip().lower()
+    raw_custom_symbols = str(form.get("custom_symbols", "")).strip()
+    try:
+        custom_symbols = ",".join(_parse_stock_signature_custom_symbols(raw_custom_symbols)) if raw_custom_symbols else ""
+    except ValueError as exc:
+        redirect_url = f"/ema20-band-strategy?study_error={quote(str(exc)[:500])}"
+        if dashboard_token:
+            redirect_url += f"&token={quote(dashboard_token)}"
+        return RedirectResponse(redirect_url, status_code=303)
+    custom_only_run = run_scope == "custom_only"
+    if custom_only_run and not custom_symbols:
+        return RedirectResponse(
+            f"/ema20-band-strategy?study_error={quote('Enter at least one custom stock for the custom list run.')}",
+            status_code=303,
+        )
+    selected_universes = [] if custom_only_run else _stock_signature_selected_universes(
+        form.getlist("universe"),
+        custom_symbols=custom_symbols,
+    )
+
+    def form_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    def form_float(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    default_as_of = _latest_completed_nse_calendar_date().isoformat()
+    as_of_date = str(form.get("as_of_date", default_as_of)).strip() or default_as_of
+    try:
+        as_of_ts = pd.Timestamp(as_of_date)
+    except (TypeError, ValueError):
+        as_of_date = default_as_of
+        as_of_ts = pd.Timestamp(default_as_of)
+    default_start = (as_of_ts - pd.DateOffset(months=18)).strftime("%Y-%m-%d")
+    start_date = str(form.get("start_date", default_start)).strip() or default_start
+    try:
+        pd.Timestamp(start_date)
+    except (TypeError, ValueError):
+        start_date = default_start
+
+    ema_length = form_int("ema_length", EMA20_BAND_DEFAULT_EMA_LENGTH, 1, 200)
+    warmup_months = form_int("warmup_months", EMA20_BAND_DEFAULT_WARMUP_MONTHS, 1, 36)
+    current_signal_lookback_sessions = form_int("current_signal_lookback_sessions", EMA20_BAND_DEFAULT_CURRENT_LOOKBACK, 1, 60)
+    holding_sessions = form_int("holding_sessions", EMA20_BAND_DEFAULT_HOLDING_SESSIONS, 1, 120)
+    profit_target_pct = form_float("profit_target_pct", EMA20_BAND_DEFAULT_TARGET_PCT, 0.0, 100.0)
+    stop_loss_pct = form_float("stop_loss_pct", EMA20_BAND_DEFAULT_STOP_PCT, 0.1, 50.0)
+    stop_buffer_pct = form_float("stop_buffer_pct", EMA20_BAND_DEFAULT_STOP_BUFFER_PCT, 0.0, 10.0)
+    round_trip_cost_pct = form_float("round_trip_cost_pct", EMA20_BAND_DEFAULT_COST_PCT, 0.0, 5.0)
+    entry_price_mode = str(form.get("entry_price_mode", "next_open")).strip().lower()
+    if entry_price_mode not in {"next_open", "next_close"}:
+        entry_price_mode = "next_open"
+    exit_on_ema_close_reclaim = str(form.get("exit_on_ema_close_reclaim", "")).strip().lower() in {"1", "true", "on", "yes"}
+
+    params = [
+        f"start_date={quote(start_date)}",
+        f"as_of_date={quote(as_of_date)}",
+        f"ema_length={ema_length}",
+        f"warmup_months={warmup_months}",
+        f"current_signal_lookback_sessions={current_signal_lookback_sessions}",
+        f"holding_sessions={holding_sessions}",
+        f"profit_target_pct={quote(str(profit_target_pct))}",
+        f"stop_loss_pct={quote(str(stop_loss_pct))}",
+        f"stop_buffer_pct={quote(str(stop_buffer_pct))}",
+        f"round_trip_cost_pct={quote(str(round_trip_cost_pct))}",
+        f"entry_price_mode={quote(entry_price_mode)}",
+        f"exit_on_ema_close_reclaim={'1' if exit_on_ema_close_reclaim else '0'}",
+    ]
+    for universe in selected_universes:
+        params.append(f"universe={quote(universe)}")
+    if custom_symbols:
+        params.append(f"custom_symbols={quote(custom_symbols)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+
+    try:
+        job_id = uuid4().hex
+        _submit_scan_job(
+            job_id,
+            "EMA20 Band Strategy",
+            _run_ema20_band_strategy_job,
+            data_root,
+            query_suffix,
+            start_date,
+            ema_length,
+            warmup_months,
+            current_signal_lookback_sessions,
+            holding_sessions,
+            profit_target_pct,
+            stop_loss_pct,
+            stop_buffer_pct,
+            round_trip_cost_pct,
+            entry_price_mode,
+            exit_on_ema_close_reclaim,
+            as_of_date,
+            selected_universes,
+            custom_symbols,
+        )
+        redirect_url = f"/ema20-band-strategy?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/ema20-band-strategy?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/ema20-band-strategy/candidates.csv")
+def download_ema20_band_candidates(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    path = _ema20_band_strategy_dir(get_data_root(load_config())) / "latest_candidates.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the EMA20 band strategy first")
+    return FileResponse(path, media_type="text/csv", filename="ema20_band_current_candidates.csv")
+
+
+@app.get("/ema20-band-strategy/trades.csv")
+def download_ema20_band_trades(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    path = _ema20_band_strategy_dir(get_data_root(load_config())) / "trades.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the EMA20 band strategy first")
+    return FileResponse(path, media_type="text/csv", filename="ema20_band_backtest_trades.csv")
+
+
+@app.get("/ema20-band-strategy/report.xlsx")
+def download_ema20_band_report(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    data_root = get_data_root(load_config())
+    output_dir = _ema20_band_strategy_dir(data_root)
+    result = load_ema20_band_strategy_outputs(output_dir)
+    if not result.summary and result.candidates.empty and result.trades.empty:
+        raise HTTPException(status_code=404, detail="Run the EMA20 band strategy first")
+    workbook_path = output_dir / "ema20_band_strategy_report.xlsx"
+    write_ema20_band_strategy_workbook(result, workbook_path)
+    return FileResponse(
+        workbook_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="ema20_band_strategy_report.xlsx",
+    )
 
 
 @app.get("/dma-reclaim-strategy", response_class=HTMLResponse)

@@ -1,0 +1,342 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">EMA20 BAND REVERSAL SETUP</p>
+      <h1>EMA20 band strategy</h1>
+      <p class="lede">Screen and backtest the Pine Script logic: bullish inside bars or bullish engulfing candles where both the current and prior candles are fully below the EMA20 low band.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/ema20-band-strategy/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <div class="filter-fieldset">
+        <span>Research universe</span>
+        <div class="inline-choice-row">
+          {% for option in universe_options %}
+            <label class="inline-checkbox">
+              <input type="checkbox" name="universe" value="{{ option.value }}" {% if option.selected %}checked{% endif %}>
+              {{ option.label }}
+            </label>
+          {% endfor %}
+        </div>
+      </div>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+      </label>
+      <label>
+        Backtest start
+        <input type="date" name="start_date" value="{{ start_date }}">
+      </label>
+      <label>
+        EMA length
+        <input type="number" name="ema_length" min="1" max="200" value="{{ ema_length }}">
+      </label>
+      <label>
+        Warmup months
+        <input type="number" name="warmup_months" min="1" max="36" value="{{ warmup_months }}">
+      </label>
+      <label>
+        Current signal lookback
+        <input type="number" name="current_signal_lookback_sessions" min="1" max="60" value="{{ current_signal_lookback_sessions }}">
+      </label>
+      <label>
+        Max hold sessions
+        <input type="number" name="holding_sessions" min="1" max="120" value="{{ holding_sessions }}">
+      </label>
+      <label>
+        Profit target %
+        <input type="number" name="profit_target_pct" min="0" max="100" step="0.1" value="{{ profit_target_pct }}">
+      </label>
+      <label>
+        Stop loss %
+        <input type="number" name="stop_loss_pct" min="0.1" max="50" step="0.1" value="{{ stop_loss_pct }}">
+      </label>
+      <label>
+        Pattern-low buffer %
+        <input type="number" name="stop_buffer_pct" min="0" max="10" step="0.1" value="{{ stop_buffer_pct }}">
+      </label>
+      <label>
+        Round-trip cost %
+        <input type="number" name="round_trip_cost_pct" min="0" max="5" step="0.01" value="{{ round_trip_cost_pct }}">
+      </label>
+      <label>
+        Entry price
+        <select name="entry_price_mode">
+          <option value="next_open" {% if entry_price_mode == "next_open" %}selected{% endif %}>Next open</option>
+          <option value="next_close" {% if entry_price_mode == "next_close" %}selected{% endif %}>Next close</option>
+        </select>
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="exit_on_ema_close_reclaim" value="1" {% if exit_on_ema_close_reclaim %}checked{% endif %}>
+        Exit on close above EMA close
+      </label>
+      <label class="wide-field">
+        Custom stocks
+        <textarea name="custom_symbols" rows="3" placeholder="OFSS, RELIANCE, BSE:500325, HDFCBANK.NS">{{ custom_symbols }}</textarea>
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit" name="run_scope" value="selected">Download History + Run Strategy</button>
+        <button class="button secondary" type="submit" name="run_scope" value="custom_only">Run Custom List Only</button>
+      </div>
+    </form>
+
+    {% if missing_universes %}
+      <p class="status error">Constituent lists not cached locally: {{ missing_universes|join(", ") }}. The run button will try the official NSE Indices CSV or Kite instruments.</p>
+    {% endif %}
+    {% if universe_error %}
+      <p class="status error">{{ universe_error }}</p>
+    {% endif %}
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">EMA20 band strategy completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="ema20-band-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="ema20-band-progress-title">EMA20 band strategy is queued</strong>
+          <span id="ema20-band-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="ema20-band-progress-fill" style="width: 0%"></div></div>
+        <p id="ema20-band-progress-detail">Preparing selected universe...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("ema20-band-progress");
+          if (!box) return;
+          const title = document.getElementById("ema20-band-progress-title");
+          const percent = document.getElementById("ema20-band-progress-percent");
+          const fill = document.getElementById("ema20-band-progress-fill");
+          const detail = document.getElementById("ema20-band-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`, { cache: "no-store" });
+              if (!response.ok) throw new Error("Status unavailable");
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              const phase = status.phase || "";
+              title.textContent = status.status === "queued"
+                ? (phase && phase !== "Queued" ? phase : "EMA20 band strategy is queued")
+                : (phase || "EMA20 band strategy is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              const completed = Number(status.completed || 0);
+              const total = Number(status.total || 0);
+              const current = status.current_symbol ? `: ${status.current_exchange || ""}:${status.current_symbol}` : "";
+              detail.textContent = `${status.phase || "Running"} · ${completed}/${total}${current}`;
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/ema20-band-strategy";
+                return;
+              }
+              window.setTimeout(poll, 1200);
+            } catch (_error) {
+              title.textContent = "EMA20 band status unavailable";
+              detail.textContent = "Refresh this page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 700);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Current Candidates</span><strong>{{ summary.get("current_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Inside Bars</span><strong>{{ summary.get("current_inside_bar_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Engulfing</span><strong>{{ summary.get("current_engulfing_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Total Trades</span><strong>{{ summary.get("total_trades", 0) }}</strong></article>
+    <article class="stat-card"><span>Best Strategy</span><strong>{{ summary.get("best_strategy", "-") or "-" }}</strong></article>
+    <article class="stat-card"><span>Best Win Rate</span><strong>{{ summary.get("best_strategy_win_rate_pct", "")|number(2) }}%</strong></article>
+    <article class="stat-card"><span>Best Avg Return</span><strong>{{ summary.get("best_strategy_avg_return_pct", "")|number(2) }}%</strong></article>
+    <article class="stat-card"><span>Profit Factor</span><strong>{{ summary.get("best_strategy_profit_factor", "")|number(2) }}</strong></article>
+    <article class="stat-card"><span>Symbols With History</span><strong>{{ summary.get("symbols_with_history", 0) }}</strong></article>
+    <article class="stat-card"><span>As Of</span><strong>{{ summary.get("requested_as_of_date", "-") or "-" }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/ema20-band-strategy" class="filter-panel compact-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      {% for universe in selected_universes %}<input type="hidden" name="universe" value="{{ universe }}">{% endfor %}
+      {% if custom_symbols %}<input type="hidden" name="custom_symbols" value="{{ custom_symbols }}">{% endif %}
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
+      <input type="hidden" name="ema_length" value="{{ ema_length }}">
+      <input type="hidden" name="warmup_months" value="{{ warmup_months }}">
+      <input type="hidden" name="current_signal_lookback_sessions" value="{{ current_signal_lookback_sessions }}">
+      <input type="hidden" name="holding_sessions" value="{{ holding_sessions }}">
+      <input type="hidden" name="profit_target_pct" value="{{ profit_target_pct }}">
+      <input type="hidden" name="stop_loss_pct" value="{{ stop_loss_pct }}">
+      <input type="hidden" name="stop_buffer_pct" value="{{ stop_buffer_pct }}">
+      <input type="hidden" name="round_trip_cost_pct" value="{{ round_trip_cost_pct }}">
+      <input type="hidden" name="entry_price_mode" value="{{ entry_price_mode }}">
+      <input type="hidden" name="exit_on_ema_close_reclaim" value="{{ 1 if exit_on_ema_close_reclaim else 0 }}">
+      <label>Search stock<input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company"></label>
+      <label>
+        Pattern
+        <select name="pattern">
+          <option value="">All</option>
+          {% for pattern in pattern_options %}
+            <option value="{{ pattern }}" {% if pattern_filter == pattern %}selected{% endif %}>{{ pattern }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Strategy
+        <select name="strategy">
+          <option value="">All</option>
+          {% for strategy in strategy_options %}
+            <option value="{{ strategy }}" {% if strategy_filter == strategy %}selected{% endif %}>{{ strategy }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="filter-actions"><button class="button secondary" type="submit">Apply Table Filters</button></div>
+    </form>
+
+    <div class="table-actions">
+      <p class="status">Showing {{ candidates_count }} current candidates.</p>
+      <div class="filter-actions">
+        <a class="button secondary" href="/ema20-band-strategy/candidates.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Candidates CSV</a>
+        <a class="button secondary" href="/ema20-band-strategy/trades.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Trades CSV</a>
+        <a class="button secondary" href="/ema20-band-strategy/report.xlsx{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Excel</a>
+      </div>
+    </div>
+
+    {% if candidate_symbols_csv %}
+      <div class="copy-block">
+        <div class="copy-row">
+          <div><h2>Candidate symbols</h2><p>{{ candidate_symbols_csv.split(',')|length }} stocks match the current signal window.</p></div>
+          <button class="button secondary" type="button" data-copy-target="ema20-band-candidate-symbols">Copy Symbols</button>
+        </div>
+        <textarea id="ema20-band-candidate-symbols" readonly rows="3">{{ candidate_symbols_csv }}</textarea>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Current candidates</h2>
+      <p>Signals exactly match the Pine Script condition, ranked by pattern quality, close location, volume, EMA trend, and distance below the EMA band.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Score</th><th>Pattern</th><th>Stock</th><th>Name</th><th>Signal Date</th><th>Entry</th><th>As Of</th><th>CMP</th>
+            <th>Stop</th><th>Target</th><th>EMA Trend</th><th>Band Gap %</th><th>Dist EMA Low %</th><th>Dist EMA Close %</th>
+            <th>Body %</th><th>Close Loc %</th><th>Vol Ratio</th><th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in candidates %}
+            <tr>
+              <td>{{ row.get("candidate_rank", "")|number(0) }}</td>
+              <td>{{ row.get("candidate_score", "")|number(2) }}</td>
+              <td>{{ row.get("pattern", "") }}</td>
+              <td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("signal_date", "") }}</td>
+              <td>{{ row.get("entry_status", "") }} {{ row.get("entry_date", "") }}</td>
+              <td>{{ row.get("as_of_date", "") }}</td>
+              <td>{{ row.get("as_of_close", "")|number(2) }}</td>
+              <td>{{ row.get("planned_stop_price", "")|number(2) }}</td>
+              <td>{{ row.get("planned_target_price", "")|number(2) }}</td>
+              <td>{{ row.get("ema_trend_20d_label", "") }} {{ row.get("ema_close_trend_20d_pct", "")|number(2) }}%</td>
+              <td>{{ row.get("band_gap_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_to_ema_low_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_to_ema_close_pct", "")|number(2) }}</td>
+              <td>{{ row.get("body_to_range_pct", "")|number(2) }}</td>
+              <td>{{ row.get("close_location_pct", "")|number(2) }}</td>
+              <td>{{ row.get("volume_ratio_50", "")|number(2) }}x</td>
+              <td>{{ row.get("source_universe", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="19">Run the strategy or broaden the current signal lookback to find candidates.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Backtest summary</h2>
+      <p>Entry is the next selected session price after the signal. Exits use stop, target, optional EMA close reclaim, or max hold.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Avg %</th><th>Median %</th><th>Avg Win</th><th>Avg Loss</th><th>Payoff</th><th>Profit Factor</th><th>Avg Hold</th></tr>
+        </thead>
+        <tbody>
+          {% for row in strategy_stats %}
+            <tr>
+              <td>{{ row.get("strategy", "") }}</td><td>{{ row.get("trades", 0)|number(0) }}</td><td>{{ row.get("wins", 0)|number(0) }}</td><td>{{ row.get("losses", 0)|number(0) }}</td>
+              <td>{{ row.get("win_rate_pct", "")|number(2) }}</td><td>{{ row.get("avg_return_pct", "")|number(2) }}</td><td>{{ row.get("median_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("avg_win_pct", "")|number(2) }}</td><td>{{ row.get("avg_loss_pct", "")|number(2) }}</td><td>{{ row.get("payoff_ratio", "")|number(2) }}</td>
+              <td>{{ row.get("profit_factor", "")|number(2) }}</td><td>{{ row.get("avg_hold_sessions", "")|number(2) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="12">Run the strategy to calculate backtest statistics.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Stock-level edge</h2>
+      <p>Grouped by strategy and stock, ordered by profit factor, win rate, and average return.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Strategy</th><th>Stock</th><th>Name</th><th>Trades</th><th>Win %</th><th>Avg %</th><th>Median %</th><th>Profit Factor</th><th>Avg MFE</th><th>Avg MAE</th></tr>
+        </thead>
+        <tbody>
+          {% for row in stock_stats %}
+            <tr>
+              <td>{{ row.get("strategy", "") }}</td><td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td><td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("trades", 0)|number(0) }}</td><td>{{ row.get("win_rate_pct", "")|number(2) }}</td><td>{{ row.get("avg_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("median_return_pct", "")|number(2) }}</td><td>{{ row.get("profit_factor", "")|number(2) }}</td>
+              <td>{{ row.get("avg_mfe_pct", "")|number(2) }}</td><td>{{ row.get("avg_mae_pct", "")|number(2) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10">No stock-level backtest rows yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Recent trades</h2>
+      <p>Most recent simulated entries through the selected as-of date.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Signal</th><th>Stock</th><th>Strategy</th><th>Pattern</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net %</th><th>MFE %</th><th>MAE %</th><th>Hold</th></tr>
+        </thead>
+        <tbody>
+          {% for row in trades %}
+            <tr>
+              <td>{{ row.get("signal_date", "") }}</td><td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td><td>{{ row.get("strategy", "") }}</td><td>{{ row.get("pattern", "") }}</td>
+              <td>{{ row.get("entry_date", "") }} @ {{ row.get("entry_price", "")|number(2) }}</td><td>{{ row.get("exit_date", "") }} @ {{ row.get("exit_price", "")|number(2) }}</td>
+              <td>{{ row.get("exit_reason", "") }}</td><td>{{ row.get("net_return_pct", "")|number(2) }}</td><td>{{ row.get("mfe_pct", "")|number(2) }}</td><td>{{ row.get("mae_pct", "")|number(2) }}</td>
+              <td>{{ row.get("hold_trading_sessions", "")|number(0) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="11">No trades found for the current filters.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}
