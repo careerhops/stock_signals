@@ -1,5 +1,5 @@
 //@version=6
-indicator("EMA20 Strict 2-Bar IB EB v3", overlay=true)
+indicator("EMA20 Exact Red-Green IB EB v6", overlay=true)
 
 // ============================================================
 // INPUTS
@@ -7,250 +7,252 @@ indicator("EMA20 Strict 2-Bar IB EB v3", overlay=true)
 
 emaLength = input.int(20, "EMA Length", minval=1)
 
-showBandFill = input.bool(true, "Fill EMA High-Low Band")
-showIB = input.bool(true, "Show Bullish Inside Bar")
-showEB = input.bool(true, "Show Bullish Engulfing Bar")
+showBandFill = input.bool(true, "Fill EMA Band")
+showIB = input.bool(true, "Show IB")
+showEB = input.bool(true, "Show EB")
+
+forceStandardColors = input.bool(
+     true,
+     "Force Red/Green Candle Colors")
+
+showPairMarkers = input.bool(
+     false,
+     "Debug: Mark Red-Green Pair")
 
 
 // ============================================================
-// EMA 20
+// EMA 20 HIGH / LOW / CLOSE
 // ============================================================
 
-emaHigh  = ta.ema(high, emaLength)
-emaLow   = ta.ema(low, emaLength)
+emaHigh = ta.ema(high, emaLength)
+emaLow = ta.ema(low, emaLength)
 emaClose = ta.ema(close, emaLength)
 
 
 // ============================================================
-// PLOT EMA BAND
+// EMA PLOTS
 // ============================================================
 
-emaHighPlot = plot(
+pHigh = plot(
      emaHigh,
      title="EMA20 High",
      color=color.red,
-     linewidth=2
-)
+     linewidth=2)
 
-emaLowPlot = plot(
+pLow = plot(
      emaLow,
      title="EMA20 Low",
      color=color.green,
-     linewidth=2
-)
+     linewidth=2)
 
 plot(
      emaClose,
      title="EMA20 Close",
      color=color.yellow,
-     linewidth=2
-)
+     linewidth=2)
 
 fill(
-     emaHighPlot,
-     emaLowPlot,
-     title="EMA20 Band",
-     color=showBandFill ? color.new(color.blue, 90) : na
-)
+     pHigh,
+     pLow,
+     color=showBandFill ? color.new(color.blue, 90) : na)
 
 
 // ============================================================
-// STEP 1
-// EXACTLY TWO CONSECUTIVE CANDLES
+// FORCE STANDARD CANDLE COLORS
 //
-// [1] = immediately previous candle
-// [0] = current candle
+// GREEN = Close > Open
+// RED   = Close < Open
 // ============================================================
 
+standardColor =
+     close > open ? color.teal :
+     close < open ? color.red :
+     color.gray
 
-// Previous candle MUST be RED
-previousIsRed =
+barcolor(
+     forceStandardColors ?
+     standardColor :
+     na)
+
+
+// ============================================================
+// EXACT 2-BAR PATTERN
+//
+// [1] = IMMEDIATELY PREVIOUS BAR
+// [0] = CURRENT BAR
+// ============================================================
+
+// Previous bar MUST be RED
+prevRed =
      close[1] < open[1]
 
-
-// Current candle MUST be GREEN
-currentIsGreen =
+// Current bar MUST be GREEN
+currGreen =
      close > open
 
 
 // ============================================================
-// STEP 2
-// BOTH CANDLES MUST BE COMPLETELY BELOW EMA20 LOW
+// BOTH BARS MUST BE ENTIRELY BELOW EMA20 LOW
 //
-// We check HIGH because HIGH is the highest point
-// of the entire candle including wick.
-//
-// If:
+// Entire candle including wick:
 //
 // HIGH < EMA20 LOW
-//
-// then the complete candle is below the band.
 // ============================================================
 
-
-// Previous RED candle completely below EMA20 Low
-previousBelowBand =
+prevFullyBelow =
      high[1] < emaLow[1]
 
-
-// Current GREEN candle completely below EMA20 Low
-currentBelowBand =
+currFullyBelow =
      high < emaLow
 
-
-// Both consecutive candles below band
-bothBelowBand =
-     previousBelowBand and
-     currentBelowBand
+bothFullyBelow =
+     prevFullyBelow and
+     currFullyBelow
 
 
 // ============================================================
-// BASIC VALID 2-CANDLE SEQUENCE
+// MASTER CONDITION
 //
-// RED immediately followed by GREEN
-// AND both completely below EMA20 Low
+// EXACTLY:
+//
+// Previous candle RED
+// Immediately next candle GREEN
+// Both completely below EMA20 Low
 // ============================================================
 
 validRedGreenPair =
-     previousIsRed and
-     currentIsGreen and
-     bothBelowBand
+     prevRed and
+     currGreen and
+     bothFullyBelow
 
 
 // ============================================================
-// BULLISH INSIDE BAR - IB
+// INSIDE BAR
 //
-// GREEN candle is completely INSIDE
-// previous RED candle.
+// Green bar fully INSIDE previous red bar.
 //
-// Wicks included.
-//
-//        RED
-//     ┌────────┐
-//     │        │
-//     │ ┌────┐ │
-//     │ │GREEN│ │
-//     │ └────┘ │
-//     │        │
-//     └────────┘
-//
-// GREEN high < RED high
-// GREEN low  > RED low
+// Current High < Previous High
+// Current Low  > Previous Low
 // ============================================================
 
-greenInsideRed =
+rangeInside =
      high < high[1] and
      low > low[1]
 
-
-bullishInsideBar =
+IB =
      barstate.isconfirmed and
      validRedGreenPair and
-     greenInsideRed
+     rangeInside
 
 
 // ============================================================
-// BULLISH ENGULFING BAR - EB
+// ENGULFING BAR
 //
-// GREEN candle completely ENGULFS
-// previous RED candle.
+// Green bar fully OUTSIDE previous red bar.
 //
-// Wicks included.
-//
-//       GREEN
-//    ┌──────────┐
-//    │  ┌────┐  │
-//    │  │RED │  │
-//    │  └────┘  │
-//    └──────────┘
-//
-// GREEN high > RED high
-// GREEN low  < RED low
+// Current High > Previous High
+// Current Low  < Previous Low
 // ============================================================
 
-greenEngulfsRed =
+rangeEngulf =
      high > high[1] and
      low < low[1]
 
-
-bullishEngulfingBar =
+EB =
      barstate.isconfirmed and
      validRedGreenPair and
-     greenEngulfsRed
+     rangeEngulf
 
 
 // ============================================================
-// PLOT IB
+// SIGNAL MARKERS
+//
+// Marker is attached to CURRENT GREEN candle.
 // ============================================================
 
 plotshape(
-     showIB and bullishInsideBar,
+     showIB and IB,
      title="Bullish Inside Bar",
      style=shape.labelup,
      location=location.belowbar,
      color=color.aqua,
      text="IB",
      textcolor=color.black,
-     size=size.small
-)
-
-
-// ============================================================
-// PLOT EB
-// ============================================================
+     size=size.small)
 
 plotshape(
-     showEB and bullishEngulfingBar,
+     showEB and EB,
      title="Bullish Engulfing Bar",
      style=shape.labelup,
      location=location.belowbar,
      color=color.lime,
      text="EB",
      textcolor=color.black,
-     size=size.small
-)
+     size=size.small)
 
 
 // ============================================================
-// DATA WINDOW - DEBUG ONLY
+// OPTIONAL DEBUG
 //
-// These do NOT appear on the chart.
-// Useful if you hover over a candle and want to understand
-// why it did/didn't qualify.
+// RED triangle = previous red candle
+// GREEN triangle = current green candle
+//
+// These appear ONLY when a valid pair exists.
+// ============================================================
+
+plotshape(
+     showPairMarkers and validRedGreenPair,
+     title="Current Green Pattern Bar",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.tiny)
+
+plotshape(
+     showPairMarkers and validRedGreenPair,
+     title="Previous Red Pattern Bar",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     size=size.tiny,
+     offset=-1)
+
+
+// ============================================================
+// DATA WINDOW DEBUG
 // ============================================================
 
 plot(
-     previousIsRed ? 1 : 0,
-     title="Previous Candle Red",
-     display=display.data_window
-)
+     prevRed ? 1 : 0,
+     title="Previous = RED",
+     display=display.data_window)
 
 plot(
-     currentIsGreen ? 1 : 0,
-     title="Current Candle Green",
-     display=display.data_window
-)
+     currGreen ? 1 : 0,
+     title="Current = GREEN",
+     display=display.data_window)
 
 plot(
-     previousBelowBand ? 1 : 0,
-     title="Previous Red Fully Below Band",
-     display=display.data_window
-)
+     prevFullyBelow ? 1 : 0,
+     title="Previous Fully Below EMA Low",
+     display=display.data_window)
 
 plot(
-     currentBelowBand ? 1 : 0,
-     title="Current Green Fully Below Band",
-     display=display.data_window
-)
+     currFullyBelow ? 1 : 0,
+     title="Current Fully Below EMA Low",
+     display=display.data_window)
 
 plot(
-     bullishInsideBar ? 1 : 0,
-     title="Valid IB",
-     display=display.data_window
-)
+     validRedGreenPair ? 1 : 0,
+     title="Valid Red-Green Pair",
+     display=display.data_window)
 
 plot(
-     bullishEngulfingBar ? 1 : 0,
-     title="Valid EB",
-     display=display.data_window
-)
+     IB ? 1 : 0,
+     title="IB",
+     display=display.data_window)
+
+plot(
+     EB ? 1 : 0,
+     title="EB",
+     display=display.data_window)
