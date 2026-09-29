@@ -248,6 +248,82 @@
 
   <section class="panel">
     <div class="panel-heading">
+      <h2>Weekly BUY Research</h2>
+      <p>Current Weekly BUY predictions with promoter holding and market cap for quick first-pass screening.</p>
+    </div>
+
+    <form action="/promoter-holdings/refresh" method="post" class="action-row">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
+      <input type="hidden" name="return_query" value="{{ full_filter_query }}">
+      <button class="button secondary" type="submit">Refresh Promoter Holding From NSE</button>
+      <span>Updates the local promoter holding cache used by this table.</span>
+    </form>
+
+    {% if promoter_refreshed %}
+      <p class="success-note">Promoter holding refreshed for {{ promoter_rows }} NSE symbols.</p>
+    {% endif %}
+    {% if promoter_error %}
+      <p class="warning-note">Promoter holding refresh failed: {{ promoter_error }}</p>
+    {% endif %}
+
+    {% if not promoter_holdings_available %}
+      <p class="warning-note">Promoter holding data is not loaded yet. Add a CSV at {{ promoter_holdings_path }} with columns: symbol, promoter_holding_pct, as_on_date.</p>
+    {% elif promoter_holdings_missing_count %}
+      <p class="warning-note">Promoter holding is missing for {{ promoter_holdings_missing_count }} of {{ weekly_buy_research_count }} stocks.</p>
+    {% endif %}
+
+    {% if weekly_buy_research %}
+      <div class="table-wrap">
+        <table id="weekly-buy-research-table">
+          <thead>
+            <tr>
+              <th>Signal Date</th>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Promoter %</th>
+              <th>Promoter As Of</th>
+              <th>Market Cap (₹ Cr)</th>
+              <th>Bucket</th>
+              <th>CMP</th>
+              <th>Signal Close</th>
+              <th>Volume x</th>
+              <th>Trend</th>
+              <th>OBV</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in weekly_buy_research %}
+              <tr>
+                <td>{{ row.get("date", "") }}</td>
+                <td>
+                  <a class="table-link" href="/?exchange={{ row.get('exchange', '') }}&symbol={{ row.get('symbol', '') }}{{ filter_link_suffix }}">
+                    {{ row.get("symbol", "") }}
+                  </a>
+                </td>
+                <td>{{ row.get("name", "") }}</td>
+                <td>{{ row.get("promoter_holding_pct")|number(2) }}</td>
+                <td>{{ row.get("promoter_holding_as_of", "") }}</td>
+                <td>{{ row.get("market_cap_cr")|number(0) }}</td>
+                <td>{{ row.get("market_cap_bucket", "") }}</td>
+                <td>{{ row.get("latest_close")|number(2) }}</td>
+                <td>{{ row.get("close")|number(2) }}</td>
+                <td>{{ row.get("volume_confirmation_ratio")|number(2) }}</td>
+                <td>{{ row.get("trend_confirmation", "") }}</td>
+                <td>{{ row.get("obv_confirmation", "") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No Weekly BUY predictions are available for the current filters. Run the weekly screener first.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
       <h2>Weekly BUY Signals</h2>
       <p>Stocks that passed the selected universe filters and current strategy rules.</p>
     </div>

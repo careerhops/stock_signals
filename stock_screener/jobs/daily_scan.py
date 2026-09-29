@@ -59,12 +59,15 @@ def _drop_excluded_weekly_rows(frame: pd.DataFrame, symbol_column: str) -> pd.Da
 def run_daily_scan(
     config: dict[str, Any] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     config = config or load_config()
     data_root = get_data_root(config)
     storage = Storage(data_root)
 
     def emit_progress(**payload: Any) -> None:
+        if cancel_check:
+            cancel_check()
         if progress_callback:
             progress_callback(payload)
 
@@ -127,6 +130,8 @@ def run_daily_scan(
     daily_config = daily_signal_config(config)
 
     for completed, (_, instrument) in enumerate(universe.iterrows(), start=1):
+        if cancel_check:
+            cancel_check()
         exchange = str(instrument["exchange"])
         symbol = str(instrument["tradingsymbol"])
         token = int(instrument["instrument_token"])
@@ -330,6 +335,8 @@ def run_daily_scan(
         )
 
     emit_progress(phase="Saving results", completed=len(universe), total=len(universe), current_symbol="")
+    if cancel_check:
+        cancel_check()
     raw_signals = pd.concat(all_signal_rows, ignore_index=True) if all_signal_rows else pd.DataFrame()
     raw_daily_signals = (
         pd.concat(all_daily_signal_rows, ignore_index=True)

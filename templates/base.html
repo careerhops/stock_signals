@@ -20,9 +20,12 @@
       <a class="brand" href="/{{ _qs }}">{{ app_name or "Investment Screener" }}</a>
       <nav class="topnav" aria-label="Primary">
         <a class="{% if request.url.path == '/' %}active{% endif %}" href="/{{ _qs }}">Dashboard</a>
+        <a class="{% if request.url.path == '/morningstar-fair-value' %}active{% endif %}" href="/morningstar-fair-value{{ _qs }}">Fair Value</a>
         <a class="{% if request.url.path == '/gtt-gain-study' %}active{% endif %}" href="/gtt-gain-study{{ _qs }}">GTT</a>
+        <a class="{% if request.url.path == '/backtest' %}active{% endif %}" href="/backtest{{ _qs }}">BUY/SELL Backtest</a>
         <a class="{% if request.url.path == '/trader-setup-backtest' %}active{% endif %}" href="/trader-setup-backtest{{ _qs }}">Trader Backtest</a>
         <a class="{% if request.url.path == '/adx-di' %}active{% endif %}" href="/adx-di{{ _qs }}">ADX / DI</a>
+        <a class="{% if request.url.path == '/order-block-retest' %}active{% endif %}" href="/order-block-retest{{ _qs }}">Order Block Retest</a>
         <a class="{% if request.url.path == '/knox-envelope' %}active{% endif %}" href="/knox-envelope{{ _qs }}">Knox + Envelope</a>
         <a class="{% if request.url.path == '/knox-recovery' %}active{% endif %}" href="/knox-recovery{{ _qs }}">Knox Recovery</a>
         <a class="{% if request.url.path == '/minervini-quality' %}active{% endif %}" href="/minervini-quality{{ _qs }}">Minervini Quality</a>
@@ -30,6 +33,7 @@
         <a class="{% if request.url.path == '/dma-pullback' %}active{% endif %}" href="/dma-pullback{{ _qs }}">DMA Pullback</a>
         <a class="{% if request.url.path == '/stock-signature' %}active{% endif %}" href="/stock-signature{{ _qs }}">Stock Signature</a>
         <a class="{% if request.url.path == '/drawdown-recovery' %}active{% endif %}" href="/drawdown-recovery{{ _qs }}">Drawdown Recovery</a>
+        <a class="{% if request.url.path == '/emax-band-strategy' %}active{% endif %}" href="/emax-band-strategy{{ _qs }}">EMAX Band</a>
         <a class="{% if request.url.path == '/ema20-band-strategy' %}active{% endif %}" href="/ema20-band-strategy{{ _qs }}">EMA20 Band</a>
         <a class="{% if request.url.path == '/dma-reclaim-strategy' %}active{% endif %}" href="/dma-reclaim-strategy{{ _qs }}">75DMA Reclaim</a>
         <a class="{% if request.url.path == '/roi-journal-dma' %}active{% endif %}" href="/roi-journal-dma{{ _qs }}">ROI Journal DMA</a>

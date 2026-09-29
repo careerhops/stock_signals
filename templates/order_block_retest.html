@@ -1,0 +1,290 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">ORDER BLOCK RETEST</p>
+      <h1>Find retests with relevant history</h1>
+      <p class="lede">Screen POC-anchored order-block retests and compare each setup with the stock's earlier matching observations.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/order-block-retest/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <label>
+        Symbols
+        <input type="text" name="symbols" value="{{ symbols_text }}" placeholder="Blank for all NSE stocks">
+        <small>Optional comma-separated NSE symbols.</small>
+      </label>
+      <label>
+        Backtest Start
+        <input type="date" name="start_date" value="{{ start_date }}" required>
+      </label>
+      <label>
+        As of Date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+        <small>Blank uses the latest completed NSE session.</small>
+      </label>
+      <label>
+        Direction
+        <select name="signal_direction">
+          <option value="bullish" {% if signal_direction == "bullish" %}selected{% endif %}>Green Tick + Green Block</option>
+          <option value="bearish" {% if signal_direction == "bearish" %}selected{% endif %}>Red Tick + Red Block</option>
+          <option value="either" {% if signal_direction == "either" %}selected{% endif %}>Either Matched Retest</option>
+        </select>
+      </label>
+      <label>
+        Swing Length
+        <input type="number" name="swing_length" min="1" value="{{ swing_length }}">
+      </label>
+      <label>
+        POC Bins
+        <input type="number" name="poc_bins" min="2" value="{{ poc_bins }}">
+      </label>
+      <label>
+        Invalidation
+        <select name="invalidation_method">
+          <option value="wick" {% if invalidation_method == "wick" %}selected{% endif %}>Wick</option>
+          <option value="close" {% if invalidation_method == "close" %}selected{% endif %}>Close</option>
+        </select>
+      </label>
+      <label>
+        Recent Signal Bars
+        <input type="number" name="recent_signal_bars" min="1" value="{{ recent_signal_bars }}">
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="require_active_zone" value="1" {% if require_active_zone %}checked{% endif %}>
+        Active zones only
+      </label>
+      <label>
+        Profit Target %
+        <input type="number" name="profit_target_pct" min="0.01" step="0.1" value="{{ profit_target_pct }}">
+      </label>
+      <label>
+        Maximum Stop %
+        <input type="number" name="max_stop_loss_pct" min="0.01" step="0.1" value="{{ max_stop_loss_pct }}">
+      </label>
+      <label>
+        Zone Stop Buffer %
+        <input type="number" name="stop_buffer_pct" min="0" step="0.05" value="{{ stop_buffer_pct }}">
+      </label>
+      <label>
+        Maximum Hold Sessions
+        <input type="number" name="holding_sessions" min="1" value="{{ holding_sessions }}">
+      </label>
+      <label>
+        Round-Trip Cost %
+        <input type="number" name="round_trip_cost_pct" min="0" step="0.01" value="{{ round_trip_cost_pct }}">
+      </label>
+      <label>
+        Minimum Prior Samples
+        <input type="number" name="min_historical_samples" min="0" value="{{ min_historical_samples }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run Screener + Backtest</button>
+        {% if summary %}
+          <a class="button secondary" href="/order-block-retest/candidates.csv">Candidates CSV</a>
+          <a class="button secondary" href="/order-block-retest/trades.csv">Trades CSV</a>
+        {% endif %}
+      </div>
+    </form>
+
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">Order-block retest scan and backtest completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="order-block-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="order-block-progress-title">Order-block scan is running</strong>
+          <span id="order-block-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="order-block-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="order-block-progress-detail">Refreshing completed NSE daily candles...</p>
+      </div>
+    {% endif %}
+  </section>
+
+  {% if study_job %}
+    <script>
+      const progressBox = document.getElementById("order-block-progress");
+      const progressTitle = document.getElementById("order-block-progress-title");
+      const progressPercent = document.getElementById("order-block-progress-percent");
+      const progressFill = document.getElementById("order-block-progress-fill");
+      const progressDetail = document.getElementById("order-block-progress-detail");
+
+      async function pollOrderBlockStudy() {
+        if (!progressBox) return;
+        try {
+          const response = await fetch(`/scan-status/${progressBox.dataset.jobId}`, { cache: "no-store" });
+          const status = await response.json();
+          if (!response.ok) throw new Error(status.error || "Status unavailable");
+          const percent = Number(status.percent || 0);
+          progressFill.style.width = `${percent}%`;
+          progressPercent.textContent = `${percent}%`;
+          const current = status.current_symbol ? ` · ${status.current_exchange || "NSE"}:${status.current_symbol}` : "";
+          progressDetail.textContent = `${status.phase || "Running"} · ${Number(status.completed || 0)}/${Number(status.total || 0)} symbols${current}`;
+          if (status.status === "completed") {
+            progressTitle.textContent = "Order-block scan completed";
+            window.location.href = status.redirect_url || "/order-block-retest";
+            return;
+          }
+          if (status.status === "failed") {
+            progressTitle.textContent = "Order-block scan failed";
+            progressDetail.textContent = status.error || "The scan could not complete.";
+            if (status.redirect_url) window.location.href = status.redirect_url;
+            return;
+          }
+        } catch (error) {
+          progressTitle.textContent = "Waiting for scan status";
+          progressDetail.textContent = String(error.message || error);
+        }
+        window.setTimeout(pollOrderBlockStudy, 1000);
+      }
+      pollOrderBlockStudy();
+    </script>
+  {% endif %}
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Aligned Matches</span><strong>{{ candidate_count }}</strong></article>
+    <article class="stat-card"><span>Green Tick Matches</span><strong>{{ green_tick_count }}</strong></article>
+    <article class="stat-card"><span>Historical Retests</span><strong>{{ summary.get("historical_retests", 0) }}</strong></article>
+    <article class="stat-card"><span>Backtest Trades</span><strong>{{ summary.get("backtest_trades", 0) }}</strong></article>
+    <article class="stat-card"><span>Win Rate</span><strong>{% if summary.get("win_rate_pct") is not none %}{{ summary.get("win_rate_pct")|number }}%{% else %}-{% endif %}</strong></article>
+    <article class="stat-card"><span>Target Rate</span><strong>{% if summary.get("target_hit_rate_pct") is not none %}{{ summary.get("target_hit_rate_pct")|number }}%{% else %}-{% endif %}</strong></article>
+    <article class="stat-card"><span>Average Net Return</span><strong>{% if summary.get("avg_net_return_pct") is not none %}{{ summary.get("avg_net_return_pct")|number }}%{% else %}-{% endif %}</strong></article>
+  </section>
+
+  <section class="panel">
+    <details>
+      <summary><strong>How to use this screener</strong></summary>
+      <ol>
+        <li>Leave Symbols blank for the NSE universe, or enter a focused list for a faster run.</li>
+        <li>Start with Bullish, Swing Length 5, Wick invalidation, and the 10% target.</li>
+        <li>Prior Samples, Target Rate, and Average Return show how the same stock and side behaved before the current signal.</li>
+      </ol>
+      <p>The Pine alert is confirmed one bar after the wick retest, so the backtest enters at the following session's open. Daily candle-direction volume is used because lower-timeframe volume is not present in the stored OHLCV.</p>
+    </details>
+  </section>
+
+  <section class="panel">
+    <div class="copy-symbols-panel">
+      <div class="copy-symbols-heading">
+        <div><h2>Current Candidates</h2><p>Recent retests ranked by the stock's earlier matching outcomes.</p></div>
+        <button class="button secondary" type="button" data-copy-target="order-block-symbols">Copy Symbols</button>
+      </div>
+      <textarea id="order-block-symbols" readonly rows="3">{{ candidate_symbols_csv }}</textarea>
+    </div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Symbol</th><th>Match</th><th>Block BOS</th><th>Tick Date</th><th>Confirmed</th><th>Age</th>
+            <th>CMP</th><th>Zone</th><th>From Zone %</th><th>Bull Vol %</th><th>Delta %</th>
+            <th>Prior Samples</th><th>Win Rate %</th><th>Target Rate %</th><th>Avg Return %</th>
+            <th>Entry</th><th>Stop</th><th>Target</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in candidates %}
+            <tr>
+              <td>{{ row.get("rank", "") }}</td>
+              <td><a href="/charts/{{ row.get('exchange', 'NSE') }}/{{ row.get('symbol', '') }}">{{ row.get("symbol", "") }}</a></td>
+              <td><span class="signal {% if row.get('side', '') == 'BULLISH' %}buy{% else %}sell{% endif %}">{{ row.get("signal_match", "") }}</span></td>
+              <td>{{ row.get("block_bos_date", "") }}</td>
+              <td>{{ row.get("tick_date", row.get("retest_date", "")) }}</td>
+              <td>{{ row.get("confirmation_date", row.get("event_date", "")) }}</td>
+              <td>{{ row.get("signal_age_bars", "") }}</td>
+              <td>{{ row.get("latest_close", "")|number }}</td>
+              <td>{{ row.get("zone_bottom", "")|number }} - {{ row.get("zone_top", "")|number }}</td>
+              <td>{{ row.get("distance_to_zone_pct", "")|number }}</td>
+              <td>{{ row.get("bull_volume_pct", "")|number }}</td>
+              <td>{{ row.get("volume_delta_pct", "")|number }}</td>
+              <td>{{ row.get("historical_samples", 0) }}</td>
+              <td>{{ row.get("historical_win_rate_pct", "")|number }}</td>
+              <td>{{ row.get("historical_target_hit_rate_pct", "")|number }}</td>
+              <td>{{ row.get("historical_avg_net_return_pct", "")|number }}</td>
+              <td>{{ row.get("planned_entry_price", "")|number }}</td>
+              <td>{{ row.get("planned_stop_price", "")|number }}</td>
+              <td>{{ row.get("planned_target_price", "")|number }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="19">No recent retest candidates for these settings.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Backtest Summary</h2>
+      <p>Next-open entries, conservative stop-first handling when target and stop touch on the same bar.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Side</th><th>Trades</th><th>Win Rate %</th><th>Target Rate %</th><th>Avg Return %</th><th>Median Return %</th><th>Avg MFE %</th><th>Avg MAE %</th><th>Profit Factor</th></tr>
+        </thead>
+        <tbody>
+          {% for row in backtest_stats %}
+            <tr>
+              <td>{{ row.get("side", "") }}</td><td>{{ row.get("trades", 0) }}</td>
+              <td>{{ row.get("win_rate_pct", "")|number }}</td><td>{{ row.get("target_hit_rate_pct", "")|number }}</td>
+              <td>{{ row.get("avg_net_return_pct", "")|number }}</td><td>{{ row.get("median_net_return_pct", "")|number }}</td>
+              <td>{{ row.get("avg_mfe_pct", "")|number }}</td><td>{{ row.get("avg_mae_pct", "")|number }}</td><td>{{ row.get("profit_factor", "")|number }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="9">Run the study to generate backtest statistics.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading"><h2>Recent Backtest Trades</h2></div>
+    <div class="table-wrap signal-history">
+      <table>
+        <thead>
+          <tr><th>Symbol</th><th>Side</th><th>Signal</th><th>Entry</th><th>Entry Price</th><th>Exit</th><th>Exit Price</th><th>Reason</th><th>Net Return %</th><th>MFE %</th><th>MAE %</th><th>Sessions</th></tr>
+        </thead>
+        <tbody>
+          {% for row in trades %}
+            <tr>
+              <td>{{ row.get("symbol", "") }}</td><td>{{ row.get("side", "") }}</td><td>{{ row.get("signal_date", "") }}</td>
+              <td>{{ row.get("entry_date", "") }}</td><td>{{ row.get("entry_price", "")|number }}</td>
+              <td>{{ row.get("exit_date", "") }}</td><td>{{ row.get("exit_price", "")|number }}</td><td>{{ row.get("exit_reason", "") }}</td>
+              <td>{{ row.get("net_return_pct", "")|number }}</td><td>{{ row.get("mfe_pct", "")|number }}</td><td>{{ row.get("mae_pct", "")|number }}</td><td>{{ row.get("holding_sessions", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="12">No backtest trades have been generated.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const target = document.getElementById(button.dataset.copyTarget || "");
+        if (!target || !String(target.value || "").trim()) return;
+        try {
+          await navigator.clipboard.writeText(target.value);
+          const original = button.textContent;
+          button.textContent = "Copied";
+          window.setTimeout(() => { button.textContent = original; }, 1200);
+        } catch (error) {
+          target.focus();
+          target.select();
+        }
+      });
+    });
+  </script>
+{% endblock %}

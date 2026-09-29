@@ -5,7 +5,7 @@
     <div>
       <p class="eyebrow">EMA20 BAND REVERSAL SETUP</p>
       <h1>EMA20 band strategy</h1>
-      <p class="lede">Screen and backtest the Pine Script logic: bullish inside bars or bullish engulfing candles where both the current and prior candles are fully below the EMA20 low band.</p>
+      <p class="lede">Screen and backtest the Pine Script logic: previous candle red, current candle green, both fully below the EMA20 low band, then current bar is either inside the prior range or fully range-engulfing it.</p>
     </div>
   </section>
 
@@ -149,6 +149,18 @@
     <article class="stat-card"><span>Current Candidates</span><strong>{{ summary.get("current_candidates", 0) }}</strong></article>
     <article class="stat-card"><span>Inside Bars</span><strong>{{ summary.get("current_inside_bar_candidates", 0) }}</strong></article>
     <article class="stat-card"><span>Engulfing</span><strong>{{ summary.get("current_engulfing_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Any Confirmation</span><strong>{{ summary.get("candidates_with_any_confirmation", 0) }}</strong></article>
+    <article class="stat-card"><span>Weekly BUY</span><strong>{{ summary.get("candidates_with_weekly_buy", 0) }}</strong></article>
+    <article class="stat-card"><span>Weekly SELL</span><strong>{{ summary.get("candidates_with_weekly_sell", 0) }}</strong></article>
+    <article class="stat-card"><span>ADX Cross</span><strong>{{ summary.get("candidates_with_adx_crossover", 0) }}</strong></article>
+    <article class="stat-card"><span>Minervini</span><strong>{{ summary.get("candidates_with_minervini_quality", 0) }}</strong></article>
+    <article class="stat-card"><span>Knox</span><strong>{{ summary.get("candidates_with_knox_envelope", 0) }}</strong></article>
+    <article class="stat-card"><span>Agent A+</span><strong>{{ summary.get("agent_top_research_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Agent A</span><strong>{{ summary.get("agent_research_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Agent B</span><strong>{{ summary.get("agent_watchlist_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Operator Watch</span><strong>{{ summary.get("operator_activity_watch_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Strong Footprint</span><strong>{{ summary.get("operator_activity_strong_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Churn Warning</span><strong>{{ summary.get("operator_distribution_watch_candidates", 0) }}</strong></article>
     <article class="stat-card"><span>Total Trades</span><strong>{{ summary.get("total_trades", 0) }}</strong></article>
     <article class="stat-card"><span>Best Strategy</span><strong>{{ summary.get("best_strategy", "-") or "-" }}</strong></article>
     <article class="stat-card"><span>Best Win Rate</span><strong>{{ summary.get("best_strategy_win_rate_pct", "")|number(2) }}%</strong></article>
@@ -186,6 +198,14 @@
         </select>
       </label>
       <label>
+        Confirmations
+        <select name="confirmation">
+          {% for option in confirmation_options %}
+            <option value="{{ option.value }}" {% if confirmation_filter == option.value %}selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
         Strategy
         <select name="strategy">
           <option value="">All</option>
@@ -200,11 +220,18 @@
     <div class="table-actions">
       <p class="status">Showing {{ candidates_count }} current candidates.</p>
       <div class="filter-actions">
-        <a class="button secondary" href="/ema20-band-strategy/candidates.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Candidates CSV</a>
+        <a class="button secondary" href="{{ candidate_download_href }}">Download Current Candidates CSV</a>
         <a class="button secondary" href="/ema20-band-strategy/trades.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Trades CSV</a>
         <a class="button secondary" href="/ema20-band-strategy/report.xlsx{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Excel</a>
       </div>
     </div>
+    {% if confirmation_sources %}
+      <p class="status">Confirmation sources:
+        {% for source in confirmation_sources %}
+          {{ source.label }} {{ source.as_of or source.modified or source.status }}{% if source.status and source.status not in ["loaded"] %} ({{ source.status }}){% endif %}{% if not loop.last %}; {% endif %}
+        {% endfor %}
+      </p>
+    {% endif %}
 
     {% if candidate_symbols_csv %}
       <div class="copy-block">
@@ -219,14 +246,70 @@
 
   <section class="panel">
     <div class="panel-heading">
+      <h2>Agentic research shortlist</h2>
+      <p>Ranked by setup quality, secondary confirmations, trend context, risk/reward, historical backtest edge, liquidity, and operator-activity footprints. Operator footprints are inferential, not proof of manipulation.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Grade</th><th>Score</th><th>Action</th><th>Stock</th><th>Pattern</th><th>Signal Date</th>
+            <th>Entry</th><th>Stop</th><th>Target</th><th>R/R</th><th>Upside %</th><th>Stop Risk %</th>
+            <th>Operator</th><th>Footprint</th><th>Backtest</th><th>Confirmations</th><th>Rationale</th><th>Risks</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in agent_shortlist %}
+            <tr>
+              <td>{{ row.get("agent_rank", loop.index)|number(0) }}</td>
+              <td><span class="badge buy">{{ row.get("agent_grade", "") }}</span></td>
+              <td>{{ row.get("agent_total_score", "")|number(2) }}</td>
+              <td>{{ row.get("agent_action", "") }}</td>
+              <td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("pattern", "") }}</td>
+              <td>{{ row.get("signal_date", "") }}</td>
+              <td>{{ row.get("planned_entry_price", "")|number(2) }}</td>
+              <td>{{ row.get("planned_stop_price", "")|number(2) }}</td>
+              <td>{{ row.get("planned_target_price", "")|number(2) }}</td>
+              <td>{{ row.get("agent_reward_risk_ratio", "")|number(2) }}</td>
+              <td>{{ row.get("agent_remaining_upside_pct", "")|number(2) }}</td>
+              <td>{{ row.get("agent_downside_to_stop_pct", "")|number(2) }}</td>
+              <td>
+                {% if "distribution" in (row.get("operator_activity_label", "")|lower) or "churn" in (row.get("operator_activity_label", "")|lower) %}
+                  <span class="badge hot">{{ row.get("operator_activity_score", "")|number(0) }}</span>
+                {% elif row.get("operator_activity_score", 0)|float >= 60 %}
+                  <span class="badge buy">{{ row.get("operator_activity_score", "")|number(0) }}</span>
+                {% else %}
+                  {{ row.get("operator_activity_score", "")|number(0) }}
+                {% endif %}
+                {{ row.get("operator_activity_label", "") }}
+              </td>
+              <td>{{ row.get("operator_activity_rationale", "") }}</td>
+              <td>{{ row.get("agent_historical_trades", 0)|number(0) }} trades, {{ row.get("agent_historical_win_rate_pct", "")|number(1) }}%, median {{ row.get("agent_historical_median_return_pct", "")|number(2) }}%</td>
+              <td>{{ row.get("confirmation_summary", "") or "-" }}</td>
+              <td>{{ row.get("agent_rationale", "") }}</td>
+              <td>{{ row.get("agent_risks", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="19">No agent-ranked research candidates are available for the current filters.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
       <h2>Current candidates</h2>
-      <p>Signals exactly match the Pine Script condition, ranked by pattern quality, close location, volume, EMA trend, and distance below the EMA band.</p>
+      <p>Signals exactly match the Pine Script condition. The default lookback finds stocks that triggered in the last 5 sessions.</p>
     </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th>Rank</th><th>Score</th><th>Pattern</th><th>Stock</th><th>Name</th><th>Signal Date</th><th>Entry</th><th>As Of</th><th>CMP</th>
+            <th>Agent</th><th>Agent Score</th><th>Action</th><th>Operator</th>
+            <th>Confirmations</th><th>Weekly</th><th>ADX</th><th>Minervini</th><th>Knox</th>
             <th>Stop</th><th>Target</th><th>EMA Trend</th><th>Band Gap %</th><th>Dist EMA Low %</th><th>Dist EMA Close %</th>
             <th>Body %</th><th>Close Loc %</th><th>Vol Ratio</th><th>Source</th>
           </tr>
@@ -243,6 +326,20 @@
               <td>{{ row.get("entry_status", "") }} {{ row.get("entry_date", "") }}</td>
               <td>{{ row.get("as_of_date", "") }}</td>
               <td>{{ row.get("as_of_close", "")|number(2) }}</td>
+              <td>{{ row.get("agent_grade", "") }}</td>
+              <td>{{ row.get("agent_total_score", "")|number(2) }}</td>
+              <td>{{ row.get("agent_action", "") }}</td>
+              <td>{{ row.get("operator_activity_score", "")|number(0) }} {{ row.get("operator_activity_label", "") }}</td>
+              <td>{% if row.get("confirmation_count") %}<span class="badge buy">{{ row.get("confirmation_count", 0)|number(0) }}</span> {{ row.get("confirmation_summary", "") }}{% else %}-{% endif %}</td>
+              <td>
+                {% if row.get("weekly_buy_signal") %}<span class="badge buy">BUY</span>
+                {% elif row.get("weekly_sell_signal") %}<span class="badge hot">SELL</span>
+                {% else %}-{% endif %}
+                {% if row.get("weekly_signal_date") %} {{ row.get("weekly_signal_date") }}{% endif %}
+              </td>
+              <td>{% if row.get("adx_crossover_pass") %}<span class="badge buy">Pass</span>{% else %}-{% endif %} {{ row.get("latest_adx", "")|number(1) }}</td>
+              <td>{% if row.get("minervini_quality_pass") %}<span class="badge buy">Pass</span>{% else %}-{% endif %} {{ row.get("minervini_entry_quality_score", "")|number(0) }}</td>
+              <td>{% if row.get("knox_envelope_pass") %}<span class="badge buy">Pass</span>{% else %}-{% endif %} {% if row.get("knox_signal_age_bars") != "" %}{{ row.get("knox_signal_age_bars", "")|number(0) }} bars{% endif %}</td>
               <td>{{ row.get("planned_stop_price", "")|number(2) }}</td>
               <td>{{ row.get("planned_target_price", "")|number(2) }}</td>
               <td>{{ row.get("ema_trend_20d_label", "") }} {{ row.get("ema_close_trend_20d_pct", "")|number(2) }}%</td>
@@ -255,7 +352,7 @@
               <td>{{ row.get("source_universe", "") }}</td>
             </tr>
           {% else %}
-            <tr><td colspan="19">Run the strategy or broaden the current signal lookback to find candidates.</td></tr>
+            <tr><td colspan="28">Run the strategy or broaden the current signal lookback to find candidates.</td></tr>
           {% endfor %}
         </tbody>
       </table>

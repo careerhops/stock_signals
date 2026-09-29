@@ -4,11 +4,30 @@
   <section class="panel">
     <div class="panel-heading">
       <h2>BUY-to-SELL Backtest</h2>
-      <p>Measures every completed BUY signal followed by the next SELL signal using locally stored weekly OHLC data. Sensitivity and shared stock filters come from the common filter panel above.</p>
+      <p>Measures every completed weekly BUY signal followed by the next SELL signal using locally stored OHLC data. The default split is 2 years in-sample plus a 6-month blind out-of-sample window.</p>
     </div>
 
     <form action="/backtest/run{% if dashboard_token or selected_sensitivity %}?{% if dashboard_token %}token={{ dashboard_token }}{% endif %}{% if dashboard_token and selected_sensitivity %}&{% endif %}{% if selected_sensitivity %}sensitivity={{ selected_sensitivity }}{% endif %}{% endif %}" method="post" class="action-row">
+      {% if dashboard_token %}
+        <input type="hidden" name="token" value="{{ dashboard_token }}">
+      {% endif %}
       <input type="hidden" name="sensitivity" value="{{ selected_sensitivity }}" data-sensitivity-target>
+      <label>
+        As-of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+      </label>
+      <label>
+        In-sample years
+        <input type="number" name="in_sample_years" value="{{ in_sample_years }}" min="1" max="10" step="1">
+      </label>
+      <label>
+        Blind OOS months
+        <input type="number" name="out_of_sample_months" value="{{ out_of_sample_months }}" min="1" max="24" step="1">
+      </label>
+      <label>
+        Min Sharpe
+        <input type="number" name="min_sharpe_ratio" value="{{ min_sharpe_ratio }}" min="0" max="20" step="0.1">
+      </label>
       <label class="inline-checkbox">
         <input type="checkbox" name="fresh_weekly_signal_only" value="1" {% if fresh_weekly_signal_only %}checked{% endif %}>
         Backtest fresh weekly BUY/SELL signals only
@@ -17,10 +36,11 @@
       {% if workbook_exists %}
         <a class="button secondary" href="/backtest/report">Download Excel Report</a>
       {% endif %}
-      <span>Closed trades are counted only when a BUY has a later SELL.</span>
+      <span>Sharpe is calculated on closed trade returns; drawdown uses the closed-trade equity curve.</span>
     </form>
 
     <p class="filter-summary">Active sensitivity: {{ selected_sensitivity }}</p>
+    <p class="filter-summary">As-of date: {% if as_of_date %}{{ as_of_date }}{% else %}latest local candle date{% endif %}</p>
     {% if fresh_weekly_signal_only %}
       <p class="filter-summary">Universe filter: latest weekly BUY and SELL signal symbols only.</p>
     {% endif %}
@@ -41,8 +61,20 @@
         <strong>{{ summary.get("symbols_processed", 0) }}</strong>
       </div>
       <div class="metric">
+        <span>Actual end date</span>
+        <strong>{{ summary.get("backtest_end_date", "") }}</strong>
+      </div>
+      <div class="metric">
         <span>Closed trades</span>
         <strong>{{ summary.get("closed_trades", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>In-sample trades</span>
+        <strong>{{ summary.get("in_sample_closed_trades", 0) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Blind OOS trades</span>
+        <strong>{{ summary.get("out_of_sample_closed_trades", 0) }}</strong>
       </div>
       <div class="metric">
         <span>Winning trades</span>
@@ -59,6 +91,30 @@
       <div class="metric">
         <span>Average return</span>
         <strong>{{ "%.2f"|format(summary.get("avg_return_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Sharpe Ratio</span>
+        <strong>{{ "%.2f"|format(summary.get("sharpe_ratio", 0)) }}</strong>
+      </div>
+      <div class="metric">
+        <span>In-sample Sharpe</span>
+        <strong>{{ "%.2f"|format(summary.get("in_sample_sharpe_ratio", 0)) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Blind OOS Sharpe</span>
+        <strong>{{ "%.2f"|format(summary.get("out_of_sample_sharpe_ratio", 0)) }}</strong>
+      </div>
+      <div class="metric">
+        <span>Max drawdown</span>
+        <strong>{{ "%.2f"|format(summary.get("max_drawdown_pct", 0)) }}%</strong>
+      </div>
+      <div class="metric">
+        <span>Max DD duration</span>
+        <strong>{{ summary.get("max_drawdown_duration_days", 0) }} days</strong>
+      </div>
+      <div class="metric">
+        <span>Blind OOS max DD</span>
+        <strong>{{ "%.2f"|format(summary.get("out_of_sample_max_drawdown_pct", 0)) }}%</strong>
       </div>
       <div class="metric">
         <span>Median return</span>
@@ -89,7 +145,7 @@
     <section class="panel">
       <div class="panel-heading">
         <h2>Stock-Level Accuracy</h2>
-        <p>Top 100 stocks by closed trade count and how often price moved higher after BUY before SELL.</p>
+        <p>Top 100 stocks ranked by Sharpe gate, blind out-of-sample trade count, blind Sharpe, in-sample Sharpe, lower drawdown, and trade count.</p>
       </div>
 
       {% if stock_stats %}
@@ -115,6 +171,18 @@
                 <th>Hit 10% %</th>
                 <th>Hit 15% %</th>
                 <th>Hit 20% %</th>
+                <th>Total Return %</th>
+                <th>Sharpe</th>
+                <th>Max DD %</th>
+                <th>Max DD Days</th>
+                <th>IS Trades</th>
+                <th>IS Sharpe</th>
+                <th>IS Max DD %</th>
+                <th>OOS Trades</th>
+                <th>OOS Sharpe</th>
+                <th>OOS Max DD %</th>
+                <th>OOS Max DD Days</th>
+                <th>Sharpe Gate</th>
               </tr>
             </thead>
             <tbody>
@@ -138,6 +206,18 @@
                   <td>{{ "%.2f"|format(row.get("hit_10pct_before_sell_rate_pct", 0)) }}</td>
                   <td>{{ "%.2f"|format(row.get("hit_15pct_before_sell_rate_pct", 0)) }}</td>
                   <td>{{ "%.2f"|format(row.get("hit_20pct_before_sell_rate_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("total_return_pct", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("sharpe_ratio", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("max_drawdown_pct", 0)) }}</td>
+                  <td>{{ row.get("max_drawdown_duration_days", 0) }}</td>
+                  <td>{{ row.get("in_sample_trades", 0) }}</td>
+                  <td>{{ "%.2f"|format(row.get("in_sample_sharpe_ratio", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("in_sample_max_drawdown_pct", 0)) }}</td>
+                  <td>{{ row.get("out_of_sample_trades", 0) }}</td>
+                  <td>{{ "%.2f"|format(row.get("out_of_sample_sharpe_ratio", 0)) }}</td>
+                  <td>{{ "%.2f"|format(row.get("out_of_sample_max_drawdown_pct", 0)) }}</td>
+                  <td>{{ row.get("out_of_sample_max_drawdown_duration_days", 0) }}</td>
+                  <td>{% if row.get("meets_sharpe_gate") %}Yes{% else %}No{% endif %}</td>
                 </tr>
               {% endfor %}
             </tbody>
@@ -172,6 +252,7 @@
                 <th>Max Gain Date</th>
                 <th>Outcome</th>
                 <th>Holding Weeks</th>
+                <th>Sample</th>
               </tr>
             </thead>
             <tbody>
@@ -190,6 +271,7 @@
                   <td>{{ row.get("max_gain_date", "") }}</td>
                   <td>{{ row.get("outcome", "") }}</td>
                   <td>{{ row.get("holding_weeks", "") }}</td>
+                  <td>{{ row.get("sample", "") }}</td>
                 </tr>
               {% endfor %}
             </tbody>

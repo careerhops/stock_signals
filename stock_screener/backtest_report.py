@@ -40,37 +40,57 @@ def _write_summary_sheet(sheet: Any, summary: dict[str, Any]) -> None:
     sheet.merge_cells("A1:D1")
 
     rows = [
-        ("Exchange", summary.get("exchange", "")),
-        ("Symbols processed", summary.get("symbols_processed", 0)),
-        ("Symbols with closed trades", summary.get("symbols_with_closed_trades", 0)),
-        ("Closed BUY-to-SELL trades", summary.get("closed_trades", 0)),
-        ("Winning trades", summary.get("winning_trades", 0)),
-        ("Losing trades", summary.get("losing_trades", 0)),
-        ("Breakeven trades", summary.get("breakeven_trades", 0)),
-        ("Open BUY positions", summary.get("open_positions", 0)),
-        ("Win rate", summary.get("win_rate_pct", 0) / 100),
-        ("Loss rate", summary.get("loss_rate_pct", 0) / 100),
-        ("Average return", summary.get("avg_return_pct", 0) / 100),
-        ("Median return", summary.get("median_return_pct", 0) / 100),
-        ("Best return", summary.get("best_return_pct", 0) / 100),
-        ("Worst return", summary.get("worst_return_pct", 0) / 100),
-        ("Trades went up before SELL", summary.get("trades_went_up_before_sell", 0)),
-        ("Went up before SELL rate", summary.get("went_up_before_sell_rate_pct", 0) / 100),
-        ("Average max gain before SELL", summary.get("avg_max_gain_before_sell_pct", 0) / 100),
-        ("Median max gain before SELL", summary.get("median_max_gain_before_sell_pct", 0) / 100),
-        ("Hit 5% before SELL rate", summary.get("hit_5pct_before_sell_rate_pct", 0) / 100),
-        ("Hit 10% before SELL rate", summary.get("hit_10pct_before_sell_rate_pct", 0) / 100),
-        ("Hit 15% before SELL rate", summary.get("hit_15pct_before_sell_rate_pct", 0) / 100),
-        ("Hit 20% before SELL rate", summary.get("hit_20pct_before_sell_rate_pct", 0) / 100),
+        ("Exchange", summary.get("exchange", ""), False),
+        ("Symbols processed", summary.get("symbols_processed", 0), False),
+        ("Symbols with closed trades", summary.get("symbols_with_closed_trades", 0), False),
+        ("Requested as-of date", summary.get("requested_as_of_date", ""), False),
+        ("Backtest start date", summary.get("backtest_start_date", ""), False),
+        ("Backtest end date", summary.get("backtest_end_date", ""), False),
+        ("In-sample years", summary.get("in_sample_years", 0), False),
+        ("Out-of-sample months", summary.get("out_of_sample_months", 0), False),
+        ("Minimum Sharpe gate", summary.get("min_sharpe_ratio", 0), False),
+        ("Closed BUY-to-SELL trades", summary.get("closed_trades", 0), False),
+        ("In-sample closed trades", summary.get("in_sample_closed_trades", 0), False),
+        ("Out-of-sample closed trades", summary.get("out_of_sample_closed_trades", 0), False),
+        ("Winning trades", summary.get("winning_trades", 0), False),
+        ("Losing trades", summary.get("losing_trades", 0), False),
+        ("Breakeven trades", summary.get("breakeven_trades", 0), False),
+        ("Open BUY positions", summary.get("open_positions", 0), False),
+        ("Win rate", summary.get("win_rate_pct", 0) / 100, True),
+        ("Loss rate", summary.get("loss_rate_pct", 0) / 100, True),
+        ("Average return", summary.get("avg_return_pct", 0) / 100, True),
+        ("Median return", summary.get("median_return_pct", 0) / 100, True),
+        ("Best return", summary.get("best_return_pct", 0) / 100, True),
+        ("Worst return", summary.get("worst_return_pct", 0) / 100, True),
+        ("Total compounded return", summary.get("total_return_pct", 0) / 100, True),
+        ("Sharpe Ratio", summary.get("sharpe_ratio", 0), False),
+        ("Sharpe gate pass", summary.get("sharpe_pass", False), False),
+        ("Maximum drawdown", summary.get("max_drawdown_pct", 0) / 100, True),
+        ("Maximum drawdown duration days", summary.get("max_drawdown_duration_days", 0), False),
+        ("In-sample Sharpe Ratio", summary.get("in_sample_sharpe_ratio", 0), False),
+        ("In-sample Sharpe pass", summary.get("in_sample_sharpe_pass", False), False),
+        ("In-sample maximum drawdown", summary.get("in_sample_max_drawdown_pct", 0) / 100, True),
+        ("In-sample maximum drawdown duration days", summary.get("in_sample_max_drawdown_duration_days", 0), False),
+        ("Out-of-sample Sharpe Ratio", summary.get("out_of_sample_sharpe_ratio", 0), False),
+        ("Out-of-sample Sharpe pass", summary.get("out_of_sample_sharpe_pass", False), False),
+        ("Out-of-sample maximum drawdown", summary.get("out_of_sample_max_drawdown_pct", 0) / 100, True),
+        ("Out-of-sample maximum drawdown duration days", summary.get("out_of_sample_max_drawdown_duration_days", 0), False),
+        ("Trades went up before SELL", summary.get("trades_went_up_before_sell", 0), False),
+        ("Went up before SELL rate", summary.get("went_up_before_sell_rate_pct", 0) / 100, True),
+        ("Average max gain before SELL", summary.get("avg_max_gain_before_sell_pct", 0) / 100, True),
+        ("Median max gain before SELL", summary.get("median_max_gain_before_sell_pct", 0) / 100, True),
+        ("Hit 5% before SELL rate", summary.get("hit_5pct_before_sell_rate_pct", 0) / 100, True),
+        ("Hit 10% before SELL rate", summary.get("hit_10pct_before_sell_rate_pct", 0) / 100, True),
+        ("Hit 15% before SELL rate", summary.get("hit_15pct_before_sell_rate_pct", 0) / 100, True),
+        ("Hit 20% before SELL rate", summary.get("hit_20pct_before_sell_rate_pct", 0) / 100, True),
     ]
 
-    for row_index, (label, value) in enumerate(rows, start=3):
+    for row_index, (label, value, is_percent) in enumerate(rows, start=3):
         sheet.cell(row=row_index, column=1, value=label)
         sheet.cell(row=row_index, column=2, value=value)
         sheet.cell(row=row_index, column=1).font = BOLD_FONT
-
-    for row_index in range(11, 25):
-        sheet.cell(row=row_index, column=2).number_format = "0.00%"
+        if is_percent:
+            sheet.cell(row=row_index, column=2).number_format = "0.00%"
 
     chart_data_start = 7
     sheet["D6"] = "Outcome"
@@ -134,8 +154,23 @@ def _write_dataframe_sheet(workbook: Workbook, title: str, frame: pd.DataFrame) 
         "hit_10pct_before_sell_rate_pct",
         "hit_15pct_before_sell_rate_pct",
         "hit_20pct_before_sell_rate_pct",
+        "total_return_pct",
+        "max_drawdown_pct",
+        "in_sample_total_return_pct",
+        "in_sample_max_drawdown_pct",
+        "out_of_sample_total_return_pct",
+        "out_of_sample_max_drawdown_pct",
     }
-    date_columns = {"buy_date", "sell_date", "latest_date", "max_gain_date"}
+    date_columns = {
+        "buy_date",
+        "sell_date",
+        "latest_date",
+        "max_gain_date",
+        "max_drawdown_peak_date",
+        "max_drawdown_trough_date",
+        "max_drawdown_recovery_date",
+    }
+    percent_columns.update(column for column in frame.columns if str(column).endswith("_pct"))
     for column_index, cell in enumerate(sheet[1], start=1):
         column_name = str(cell.value)
         if column_name in percent_columns:

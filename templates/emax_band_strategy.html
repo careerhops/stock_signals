@@ -1,0 +1,345 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="hero compact-hero">
+    <div>
+      <p class="eyebrow">EMAX BAND REVERSAL SETUP</p>
+      <h1>EMAX band strategy</h1>
+      <p class="lede">Run the IB/EB band screener with each stock's optimized EMA length instead of forcing EMA20 across the universe.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <form action="/emax-band-strategy/run" method="post" class="filter-panel">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+      </label>
+      <label>
+        Current signal lookback
+        <input type="number" name="current_signal_lookback_sessions" min="1" max="60" value="{{ current_signal_lookback_sessions }}">
+      </label>
+      <label>
+        Profit target %
+        <input type="number" name="profit_target_pct" min="0" max="100" step="0.1" value="{{ profit_target_pct }}">
+      </label>
+      <label>
+        Stop loss %
+        <input type="number" name="stop_loss_pct" min="0.1" max="50" step="0.1" value="{{ stop_loss_pct }}">
+      </label>
+      <label>
+        Pattern-low buffer %
+        <input type="number" name="stop_buffer_pct" min="0" max="10" step="0.1" value="{{ stop_buffer_pct }}">
+      </label>
+      <label>
+        Entry price
+        <select name="entry_price_mode">
+          <option value="next_open" {% if entry_price_mode == "next_open" %}selected{% endif %}>Next open</option>
+          <option value="next_close" {% if entry_price_mode == "next_close" %}selected{% endif %}>Next close</option>
+        </select>
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Run EMAX Daily Screener</button>
+      </div>
+    </form>
+    <script>
+      (() => {
+        const form = document.querySelector('form[action="/emax-band-strategy/run"]');
+        if (!form) return;
+        form.addEventListener("submit", () => {
+          const button = form.querySelector('button[type="submit"]');
+          if (!button) return;
+          button.disabled = true;
+          button.textContent = "Starting EMAX Screener...";
+        });
+      })();
+    </script>
+
+    {% if study_error %}
+      <p class="status error">{{ study_error }}</p>
+    {% elif study_ran %}
+      <p class="status success">EMAX band strategy completed.</p>
+    {% endif %}
+
+    {% if study_job %}
+      <div class="scan-progress" id="emax-band-progress" data-job-id="{{ study_job }}">
+        <div class="scan-progress-header">
+          <strong id="emax-band-progress-title">EMAX band strategy is queued</strong>
+          <span id="emax-band-progress-percent">0%</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="emax-band-progress-fill" style="width: 0%"></div></div>
+        <p id="emax-band-progress-detail">Preparing optimized EMA table...</p>
+      </div>
+      <script>
+        (() => {
+          const box = document.getElementById("emax-band-progress");
+          if (!box) return;
+          const title = document.getElementById("emax-band-progress-title");
+          const percent = document.getElementById("emax-band-progress-percent");
+          const fill = document.getElementById("emax-band-progress-fill");
+          const detail = document.getElementById("emax-band-progress-detail");
+          const poll = async () => {
+            try {
+              const response = await fetch(`/scan-status/${box.dataset.jobId}`, { cache: "no-store" });
+              if (!response.ok) throw new Error("Status unavailable");
+              const status = await response.json();
+              const value = Number(status.percent || 0);
+              const phase = status.phase || "";
+              title.textContent = status.status === "queued"
+                ? (phase && phase !== "Queued" ? phase : "EMAX band strategy is queued")
+                : (phase || "EMAX band strategy is running");
+              percent.textContent = `${value}%`;
+              fill.style.width = `${value}%`;
+              const completed = Number(status.completed || 0);
+              const total = Number(status.total || 0);
+              const current = status.current_symbol ? `: ${status.current_exchange || ""}:${status.current_symbol}` : "";
+              detail.textContent = `${status.phase || "Running"} · ${completed}/${total}${current}`;
+              if (status.status === "completed" || status.status === "failed") {
+                window.location.href = status.redirect_url || "/emax-band-strategy";
+                return;
+              }
+              window.setTimeout(poll, 1200);
+            } catch (_error) {
+              title.textContent = "EMAX band status unavailable";
+              detail.textContent = "Refresh this page to check the latest status.";
+            }
+          };
+          window.setTimeout(poll, 700);
+        })();
+      </script>
+    {% endif %}
+  </section>
+
+  <section class="stats-grid">
+    <article class="stat-card"><span>Current Candidates</span><strong>{{ summary.get("current_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Robust Current</span><strong>{{ summary.get("robust_current_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Robust Best EMAs</span><strong>{{ summary.get("symbols_with_robust_best_ema", 0) }}</strong></article>
+    <article class="stat-card"><span>Qualified EMAs</span><strong>{{ summary.get("symbols_with_qualified_best_ema", 0) }}</strong></article>
+    <article class="stat-card"><span>Total Trades</span><strong>{{ summary.get("total_backtest_trades", 0) }}</strong></article>
+    <article class="stat-card"><span>EMA Rows</span><strong>{{ summary.get("total_ema_strategy_rows", 0) }}</strong></article>
+    <article class="stat-card"><span>Any Confirmation</span><strong>{{ summary.get("candidates_with_any_confirmation", 0) }}</strong></article>
+    <article class="stat-card"><span>2+ Confirmations</span><strong>{{ summary.get("candidates_with_double_confirmation", 0) }}</strong></article>
+    <article class="stat-card"><span>Weekly BUY</span><strong>{{ summary.get("candidates_with_weekly_buy", 0) }}</strong></article>
+    <article class="stat-card"><span>ADX Cross</span><strong>{{ summary.get("candidates_with_adx_crossover", 0) }}</strong></article>
+    <article class="stat-card"><span>ADX + Minervini</span><strong>{{ summary.get("candidates_with_adx_minervini", 0) }}</strong></article>
+    <article class="stat-card"><span>Weekly + ADX</span><strong>{{ summary.get("candidates_with_weekly_adx", 0) }}</strong></article>
+    <article class="stat-card"><span>Agent A+/A</span><strong>{{ summary.get("agent_top_research_candidates", 0) + summary.get("agent_research_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>Operator Watch</span><strong>{{ summary.get("operator_activity_watch_candidates", 0) }}</strong></article>
+    <article class="stat-card"><span>As Of</span><strong>{{ summary.get("emax_current_as_of_date", summary.get("as_of_date", "-")) }}</strong></article>
+  </section>
+
+  <section class="panel">
+    <form method="get" action="/emax-band-strategy" class="filter-panel compact-form">
+      {% if dashboard_token %}<input type="hidden" name="token" value="{{ dashboard_token }}">{% endif %}
+      <input type="hidden" name="as_of_date" value="{{ as_of_date }}">
+      <input type="hidden" name="current_signal_lookback_sessions" value="{{ current_signal_lookback_sessions }}">
+      <input type="hidden" name="profit_target_pct" value="{{ profit_target_pct }}">
+      <input type="hidden" name="stop_loss_pct" value="{{ stop_loss_pct }}">
+      <input type="hidden" name="stop_buffer_pct" value="{{ stop_buffer_pct }}">
+      <input type="hidden" name="entry_price_mode" value="{{ entry_price_mode }}">
+      <label>Search stock<input type="search" name="stock_search" value="{{ stock_search }}" placeholder="Symbol or company"></label>
+      <label>
+        Pattern
+        <select name="pattern">
+          <option value="">All</option>
+          {% for pattern in pattern_options %}
+            <option value="{{ pattern }}" {% if pattern_filter == pattern %}selected{% endif %}>{{ pattern }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        EMAX strategy
+        <select name="strategy">
+          <option value="">All</option>
+          {% for strategy in strategy_options %}
+            <option value="{{ strategy }}" {% if strategy_filter == strategy %}selected{% endif %}>{{ strategy }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Confirmations
+        <select name="confirmation">
+          {% for option in confirmation_options %}
+            <option value="{{ option.value }}" {% if confirmation_filter == option.value %}selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="inline-checkbox">
+        <input type="checkbox" name="robust_only" value="1" {% if robust_only %}checked{% endif %}>
+        Robust optimized EMA only
+      </label>
+      <div class="filter-actions"><button class="button secondary" type="submit">Apply Filters</button></div>
+    </form>
+
+    <div class="table-actions">
+      <p class="status">Showing {{ candidates_count }} EMAX candidates.</p>
+      <div class="filter-actions">
+        <a class="button secondary" href="{{ candidate_download_href }}">Download Current Candidates CSV</a>
+        <a class="button secondary" href="/emax-band-strategy/robust-best-by-stock.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Robust EMA CSV</a>
+        <a class="button secondary" href="/emax-band-strategy/best-by-stock.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Best EMA CSV</a>
+        <a class="button secondary" href="/emax-band-strategy/trades.csv{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Trades CSV</a>
+        <a class="button secondary" href="/emax-band-strategy/report.xlsx{% if dashboard_token %}?token={{ dashboard_token }}{% endif %}">Download Excel</a>
+      </div>
+    </div>
+
+    {% if confirmation_sources %}
+      <p class="status">Confirmation sources:
+        {% for source in confirmation_sources %}
+          {{ source.label }} {{ source.as_of or source.modified or source.status }}{% if source.status and source.status not in ["loaded"] %} ({{ source.status }}){% endif %}{% if not loop.last %}; {% endif %}
+        {% endfor %}
+      </p>
+    {% endif %}
+
+    {% if candidate_symbols_csv %}
+      <div class="copy-block">
+        <div class="copy-row">
+          <div><h2>Candidate symbols</h2><p>{{ candidate_symbols_csv.split(',')|length }} stocks match the current filters.</p></div>
+          <button class="button secondary" type="button" data-copy-target="emax-candidate-symbols">Copy Symbols</button>
+        </div>
+        <textarea id="emax-candidate-symbols" readonly rows="3">{{ candidate_symbols_csv }}</textarea>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Agentic research shortlist</h2>
+      <p>EMAX candidates ranked with confirmations, trend context, risk/reward, liquidity, and operator-footprint checks.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Grade</th><th>Agent</th><th>Daily</th><th>Stock</th><th>Max DD %</th><th>MDD Dur</th><th>EMAX</th><th>Pattern</th><th>Signal</th>
+            <th>Entry</th><th>Stop</th><th>Target</th><th>Confirmations</th><th>Operator</th><th>Rationale</th><th>Risks</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in agent_shortlist %}
+            <tr>
+              <td>{{ row.get("daily_prediction_rank", loop.index)|number(0) }}</td>
+              <td><span class="badge buy">{{ row.get("agent_grade", "") }}</span></td>
+              <td>{{ row.get("agent_total_score", "")|number(2) }}</td>
+              <td>{{ row.get("daily_prediction_score", "")|number(2) }}</td>
+              <td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("max_drawdown_pct", "")|number(2) }}</td>
+              <td>{{ row.get("max_drawdown_duration_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("optimized_ema_length", "")|number(0) }}</td>
+              <td>{{ row.get("pattern", "") }}</td>
+              <td>{{ row.get("signal_date", "") }}</td>
+              <td>{{ row.get("planned_entry_price", "")|number(2) }}</td>
+              <td>{{ row.get("planned_stop_price", "")|number(2) }}</td>
+              <td>{{ row.get("planned_target_price", "")|number(2) }}</td>
+              <td>{{ row.get("confirmation_summary", "") or "-" }}</td>
+              <td>{{ row.get("operator_activity_score", "")|number(0) }} {{ row.get("operator_activity_label", "") }}</td>
+              <td>{{ row.get("agent_rationale", "") }}</td>
+              <td>{{ row.get("agent_risks", "") }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="17">No agent-ranked EMAX candidates match the current filters.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Current EMAX candidates</h2>
+      <p>Each stock is screened with its own optimized EMA band from the all-NSE backtest.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Daily Score</th><th>Robust</th><th>Stock</th><th>Name</th><th>Max DD %</th><th>MDD Dur</th><th>EMAX</th><th>Optimized Strategy</th>
+            <th>Pattern</th><th>Signal Date</th><th>Sessions</th><th>Entry</th><th>CMP</th><th>Stop</th><th>Target</th>
+            <th>Confirmations</th><th>Weekly</th><th>ADX</th><th>Minervini</th><th>Knox</th><th>Agent</th><th>Operator</th>
+            <th>Validation Avg %</th><th>Avg Max 10D %</th><th>Median Max 10D %</th><th>Profit Factor</th><th>EMA Trend</th><th>Dist Low %</th><th>Dist Close %</th><th>Vol Ratio</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in candidates %}
+            <tr>
+              <td>{{ row.get("daily_prediction_rank", row.get("candidate_rank", ""))|number(0) }}</td>
+              <td>{{ row.get("daily_prediction_score", "")|number(2) }}</td>
+              <td>{% if row.get("robust_best_ema") %}<span class="badge buy">Yes</span>{% else %}-{% endif %}</td>
+              <td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("max_drawdown_pct", "")|number(2) }}</td>
+              <td>{{ row.get("max_drawdown_duration_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("optimized_ema_length", "")|number(0) }}</td>
+              <td>{{ row.get("optimized_strategy", "") }}</td>
+              <td>{{ row.get("pattern", "") }}</td>
+              <td>{{ row.get("signal_date", "") }}</td>
+              <td>{{ row.get("sessions_since_signal", "")|number(0) }}</td>
+              <td>{{ row.get("entry_status", "") }} {{ row.get("entry_date", "") }}</td>
+              <td>{{ row.get("as_of_close", "")|number(2) }}</td>
+              <td>{{ row.get("planned_stop_price", "")|number(2) }}</td>
+              <td>{{ row.get("planned_target_price", "")|number(2) }}</td>
+              <td>{% if row.get("confirmation_count") %}<span class="badge buy">{{ row.get("confirmation_count", 0)|number(0) }}</span> {{ row.get("confirmation_summary", "") }}{% else %}-{% endif %}</td>
+              <td>{% if row.get("weekly_buy_signal") %}<span class="badge buy">BUY</span>{% elif row.get("weekly_sell_signal") %}<span class="badge hot">SELL</span>{% else %}-{% endif %}</td>
+              <td>{% if row.get("adx_crossover_pass") %}<span class="badge buy">Pass</span>{% else %}-{% endif %}</td>
+              <td>{% if row.get("minervini_quality_pass") %}<span class="badge buy">Pass</span>{% else %}-{% endif %}</td>
+              <td>{% if row.get("knox_envelope_pass") %}<span class="badge buy">Pass</span>{% else %}-{% endif %}</td>
+              <td>{{ row.get("agent_grade", "") }} {{ row.get("agent_total_score", "")|number(1) }}</td>
+              <td>{{ row.get("operator_activity_score", "")|number(0) }} {{ row.get("operator_activity_label", "") }}</td>
+              <td>{{ row.get("optimized_validation_avg_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("optimized_avg_max_return_10_sessions_pct", "")|number(2) }}</td>
+              <td>{{ row.get("optimized_median_max_return_10_sessions_pct", "")|number(2) }}</td>
+              <td>{{ row.get("optimized_profit_factor", "")|number(2) }}</td>
+              <td>{{ row.get("ema_trend_20d_label", "") }} {{ row.get("ema_close_trend_20d_pct", "")|number(2) }}%</td>
+              <td>{{ row.get("distance_to_ema_low_pct", "")|number(2) }}</td>
+              <td>{{ row.get("distance_to_ema_close_pct", "")|number(2) }}</td>
+              <td>{{ row.get("volume_ratio_50", "")|number(2) }}x</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="31">Run EMAX or broaden the current signal lookback to find candidates.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Robust best EMAX by stock</h2>
+      <p>Per-stock optimized EMA/pattern rows that pass minimum sample, validation, and profit-factor checks.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Stock</th><th>Name</th><th>Max DD %</th><th>MDD Dur</th><th>EMAX</th><th>Strategy</th><th>Edge</th><th>Trades</th><th>Win %</th><th>Avg %</th><th>Validation Trades</th><th>Validation Avg %</th><th>Avg Max 10D %</th><th>Median Max 10D %</th><th>Profit Factor</th><th>Stop %</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in robust_best %}
+            <tr>
+              <td>{{ row.get("robust_rank", "")|number(0) }}</td>
+              <td>{{ row.get("exchange", "") }}:{{ row.get("symbol", "") }}</td>
+              <td>{{ row.get("name", "") }}</td>
+              <td>{{ row.get("max_drawdown_pct", "")|number(2) }}</td>
+              <td>{{ row.get("max_drawdown_duration_sessions", "")|number(0) }}</td>
+              <td>{{ row.get("ema_length", "")|number(0) }}</td>
+              <td>{{ row.get("strategy", "") }}</td>
+              <td>{{ row.get("edge_score", "")|number(2) }}</td>
+              <td>{{ row.get("total_trades", "")|number(0) }}</td>
+              <td>{{ row.get("win_rate_pct", "")|number(2) }}</td>
+              <td>{{ row.get("avg_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("validation_trades", "")|number(0) }}</td>
+              <td>{{ row.get("validation_avg_return_pct", "")|number(2) }}</td>
+              <td>{{ row.get("avg_max_return_10_sessions_pct", "")|number(2) }}</td>
+              <td>{{ row.get("median_max_return_10_sessions_pct", "")|number(2) }}</td>
+              <td>{{ row.get("profit_factor", "")|number(2) }}</td>
+              <td>{{ row.get("stopped_pct", "")|number(2) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="17">No robust EMAX rows are available yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

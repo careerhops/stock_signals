@@ -85,6 +85,40 @@ Open:
 http://localhost:8000
 ```
 
+## Order Block Retest Screener
+
+Open `http://localhost:8000/order-block-retest`. Leave Symbols blank to scan the NSE universe, or enter comma-separated symbols for a focused run. The results identify green-tick/green-block and red-tick/red-block matches, including the block BOS date, tick candle date, next-bar confirmation date, prior sample count, target rate, win rate, and average return. Candidate direction is determined from the latest active retest across both sides, so a newer opposite-side or same-bar mixed retest suppresses an older match.
+
+The integrated backtest enters at the next session's open after the Pine alert bar, uses the order-block boundary with the configured maximum stop, and exits on target, stop, or maximum holding period. Candidate and trade CSVs are available from the same page.
+
+## Morningstar Fair Value Agent
+
+The fetcher reads Morningstar's short-lived SAL tokens from each stock page and then calls the same fair-value chart API used by the page. No browser password is stored in the repo. Fetch one stock:
+
+Dashboard UI:
+
+```text
+http://localhost:8000/morningstar-fair-value
+```
+
+```bash
+python scripts/fetch_morningstar_fair_value.py \
+  --symbol AUSOMENT \
+  --url "https://www.morningstar.in/stocks/0p0000b3ha/nse-ausom-enterprise-ltd/price.aspx"
+```
+
+For a batch, supply a CSV with `symbol,page_url` columns and add `--output-csv`:
+
+```bash
+python scripts/fetch_morningstar_fair_value.py \
+  --input-csv config/morningstar_stocks.csv \
+  --output-csv data/morningstar_fair_values.csv \
+  --delay-seconds 2 \
+  --jitter-seconds 1
+```
+
+The UI and CLI pause between stock requests by default (`2s` plus up to `1s` jitter). Tune that with `MORNINGSTAR_REQUEST_DELAY_SECONDS`, `MORNINGSTAR_REQUEST_JITTER_SECONDS`, or the page's Delay / stock field. The output contains the calendar current-month and previous-month fair values, percentage change, currency, as-of date, and source URL. The agent does not extract or persist browser credentials.
+
 ## Universe Modes
 
 Scan all NSE equity instruments from Kite:

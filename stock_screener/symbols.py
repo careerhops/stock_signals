@@ -8,7 +8,7 @@ import pandas as pd
 NSE_SERIES_SUFFIXES = ("-BE", "-BZ", "-BL", "-BT", "-SM", "-ST")
 NSE_TRADED_ALLOWED_SUFFIXES = ("", "-SM", "-ST", "-BZ", "-IV", "-E1", "-P1", "-RR")
 _NSE_DEBT_LIKE_SYMBOL_RE = re.compile(
-    r"-SG|-GB|-N[0-9A-Z]+$|-Y[0-9A-Z]+$|-Z[0-9A-Z]+$|-A[0-9A-Z]+$|-P[0-9A-Z]+$|-W$|-NV$|-YW$"
+    r"-TB$|-SG|-GB|-GS|-N[0-9A-Z]+$|-Y[0-9A-Z]+$|-Z[0-9A-Z]+$|-A[0-9A-Z]+$|-P[0-9A-Z]+$|-W$|-NV$|-YW$"
 )
 _WEEKLY_FUND_NAME_RE = re.compile(
     r"\bETF\b|EXCHANGE[ -]TRADED FUND|AMC\s*-|\bGOLD FUND$",

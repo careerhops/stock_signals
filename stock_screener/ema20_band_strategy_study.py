@@ -20,12 +20,13 @@ DEFAULT_STOP_LOSS_PCT = 4.0
 DEFAULT_STOP_BUFFER_PCT = 0.5
 DEFAULT_ROUND_TRIP_COST_PCT = 0.20
 DEFAULT_EMA_TREND_SESSIONS = 20
+MAX_RETURN_LOOKAHEAD_SESSIONS = 10
 ENTRY_PRICE_MODES = {"next_open", "next_close"}
 
 STRATEGY_VARIANTS: tuple[tuple[str, str], ...] = (
     ("Any EMA20 Band Bullish Pattern", "any_signal"),
     ("Bullish Inside Bar Below EMA20 Band", "bullish_inside_bar"),
-    ("Bullish Engulfing Below EMA20 Band", "bullish_engulfing"),
+    ("Bullish Engulfing Bar Below EMA20 Band", "bullish_engulfing"),
 )
 
 
@@ -265,12 +266,66 @@ def load_ema20_band_strategy_outputs(output_dir: Path) -> Ema20BandStrategyResul
 def write_ema20_band_strategy_workbook(result: Ema20BandStrategyResult, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        if not result.candidates.empty and "agent_total_score" in result.candidates.columns:
+            agent_sort_columns = [
+                column
+                for column in ("agent_total_score", "confirmation_count", "candidate_score", "symbol")
+                if column in result.candidates.columns
+            ]
+            agent_shortlist = result.candidates.copy()
+            if agent_sort_columns:
+                agent_shortlist = agent_shortlist.sort_values(
+                    agent_sort_columns,
+                    ascending=[False, False, False, True][: len(agent_sort_columns)],
+                    na_position="last",
+                )
+            agent_shortlist.head(100).to_excel(writer, sheet_name="Agent Shortlist", index=False)
         result.candidates.to_excel(writer, sheet_name="Current Candidates", index=False)
         result.strategy_stats.to_excel(writer, sheet_name="Strategy Stats", index=False)
         result.stock_stats.to_excel(writer, sheet_name="Stock Stats", index=False)
         result.yearly_stats.to_excel(writer, sheet_name="Yearly Stats", index=False)
         result.trades.to_excel(writer, sheet_name="Trades", index=False)
         pd.DataFrame([result.summary]).to_excel(writer, sheet_name="Summary", index=False)
+        _ema20_methodology_frame().to_excel(writer, sheet_name="Methodology", index=False)
+
+
+def _ema20_methodology_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "step": "Candidate generation",
+                "method": "Find EMA20 band IB/EB signals: prior candle red, current candle green, both candles fully below EMA20 low band, current bar inside or range-engulfing the prior bar.",
+            },
+            {
+                "step": "Backtested entry",
+                "method": "Enter on the configured next-session price after the signal, usually next open.",
+            },
+            {
+                "step": "Initial stop",
+                "method": "Use the tighter risk control from fixed stop-loss percent and the pattern-low buffer.",
+            },
+            {
+                "step": "Exit logic",
+                "method": "Exit on stop, profit target, optional close above EMA close, or max hold sessions.",
+            },
+            {
+                "step": "10-session maximum return",
+                "method": "For every historical IB/EB event, also measure the highest return available from buying the next session and holding for up to 10 trading sessions, independent of the strategy exit.",
+            },
+            {
+                "step": "Agent ranking",
+                "method": "Score setup quality, secondary confirmations, trend context, risk/reward, historical backtest edge, and liquidity.",
+            },
+            {
+                "step": "Operator activity footprint",
+                "method": "Flag possible stealth accumulation from daily OHLCV using high-volume tight-range days, absorption days, OBV/CMF divergence, and high effort with limited price movement. This is not proof of manipulation or intent.",
+            },
+            {
+                "step": "Decision rule",
+                "method": "A+/A are research priorities only when risk/reward and backtest evidence are acceptable; conflicts, invalidated stops, low liquidity, or weak samples are downgraded.",
+            },
+        ]
+    )
 
 
 def _prepare_constituents(constituents: pd.DataFrame) -> pd.DataFrame:
@@ -347,20 +402,16 @@ def _add_features(daily: pd.DataFrame, *, ema_length: int) -> pd.DataFrame:
     previous_close = close.shift(1)
     previous_ema_low = frame["ema_low"].shift(1)
 
+    frame["previous_red"] = previous_close < previous_open
+    frame["current_green"] = close > open_
     frame["fully_below_band"] = high < frame["ema_low"]
     frame["previous_fully_below_band"] = previous_high < previous_ema_low
     frame["both_bars_outside"] = frame["previous_fully_below_band"] & frame["fully_below_band"]
-    frame["bullish_current"] = close > open_
-    frame["inside_bar"] = (high < previous_high) & (low > previous_low)
-    frame["previous_bearish"] = previous_close < previous_open
-    frame["body_engulfing"] = (open_ <= previous_close) & (close >= previous_open)
-    frame["bullish_inside_bar"] = frame["both_bars_outside"] & frame["inside_bar"] & frame["bullish_current"]
-    frame["bullish_engulfing"] = (
-        frame["both_bars_outside"]
-        & frame["previous_bearish"]
-        & frame["bullish_current"]
-        & frame["body_engulfing"]
-    )
+    frame["valid_red_green_pair"] = frame["previous_red"] & frame["current_green"] & frame["both_bars_outside"]
+    frame["range_inside"] = (high < previous_high) & (low > previous_low)
+    frame["range_engulfing"] = (high > previous_high) & (low < previous_low)
+    frame["bullish_inside_bar"] = frame["valid_red_green_pair"] & frame["range_inside"]
+    frame["bullish_engulfing"] = frame["valid_red_green_pair"] & frame["range_engulfing"]
     frame["any_signal"] = frame["bullish_inside_bar"] | frame["bullish_engulfing"]
 
     candle_range = (high - low).replace(0, np.nan)
@@ -597,6 +648,13 @@ def _simulate_trade(
     trade_window = frame.iloc[entry_index : exit_index + 1]
     mfe = (float(trade_window["high"].max()) / float(entry_price) - 1.0) * 100.0 if not trade_window.empty else np.nan
     mae = (float(trade_window["low"].min()) / float(entry_price) - 1.0) * 100.0 if not trade_window.empty else np.nan
+    fixed_horizon = _fixed_horizon_return_metrics(
+        frame,
+        entry_index=entry_index,
+        entry_price=float(entry_price),
+        horizon_sessions=MAX_RETURN_LOOKAHEAD_SESSIONS,
+        end_ts=end_ts,
+    )
     return {
         "signal_date": _date_text(frame.iloc[signal_index].get("date")),
         "entry_date": _date_text(entry_row.get("date")),
@@ -613,8 +671,51 @@ def _simulate_trade(
         "win_flag": bool(net_return > 0.0),
         "mfe_pct": mfe,
         "mae_pct": mae,
+        **fixed_horizon,
         "entry_index": int(entry_index),
         "exit_index": int(exit_index),
+    }
+
+
+def _fixed_horizon_return_metrics(
+    frame: pd.DataFrame,
+    *,
+    entry_index: int,
+    entry_price: float,
+    horizon_sessions: int,
+    end_ts: pd.Timestamp,
+) -> dict[str, Any]:
+    horizon_index = min(len(frame) - 1, int(entry_index) + max(int(horizon_sessions), 1))
+    while horizon_index > entry_index and pd.Timestamp(frame.iloc[horizon_index]["date"]).normalize() > end_ts:
+        horizon_index -= 1
+    window = frame.iloc[entry_index : horizon_index + 1].copy()
+    if window.empty or entry_price <= 0.0:
+        return {
+            "max_return_10_sessions_pct": np.nan,
+            "max_return_10_sessions_price": np.nan,
+            "max_return_10_sessions_date": "",
+            "sessions_to_max_return_10": np.nan,
+            "close_return_10_sessions_pct": np.nan,
+            "close_return_10_sessions_date": "",
+            "max_return_10_sessions_observed": 0,
+        }
+    highs = pd.to_numeric(window["high"], errors="coerce")
+    closes = pd.to_numeric(window["close"], errors="coerce")
+    if highs.dropna().empty:
+        max_index = window.index[0]
+        max_price = np.nan
+    else:
+        max_index = int(highs.idxmax())
+        max_price = _finite_float(frame.loc[max_index].get("high"))
+    close_price = _finite_float(closes.iloc[-1]) if not closes.empty else None
+    return {
+        "max_return_10_sessions_pct": ((float(max_price) / entry_price - 1.0) * 100.0) if max_price is not None else np.nan,
+        "max_return_10_sessions_price": np.nan if max_price is None else float(max_price),
+        "max_return_10_sessions_date": _date_text(frame.loc[max_index].get("date")) if max_price is not None else "",
+        "sessions_to_max_return_10": int(max_index - entry_index) if max_price is not None else np.nan,
+        "close_return_10_sessions_pct": ((float(close_price) / entry_price - 1.0) * 100.0) if close_price is not None else np.nan,
+        "close_return_10_sessions_date": _date_text(window.iloc[-1].get("date")),
+        "max_return_10_sessions_observed": int(horizon_index - entry_index),
     }
 
 
@@ -626,7 +727,7 @@ def _signal_context(frame: pd.DataFrame, signal_index: int) -> dict[str, Any]:
     if inside and engulfing:
         pattern = "Inside + Engulfing"
     elif engulfing:
-        pattern = "Bullish Engulfing"
+        pattern = "Bullish Engulfing Bar"
     else:
         pattern = "Bullish Inside Bar"
     ema_trend = _finite_float(row.get("ema_close_trend_20d_pct"))
@@ -658,6 +759,11 @@ def _signal_context(frame: pd.DataFrame, signal_index: int) -> dict[str, Any]:
         "fully_below_band": bool(row.get("fully_below_band", False)),
         "previous_fully_below_band": bool(row.get("previous_fully_below_band", False)),
         "both_bars_outside": bool(row.get("both_bars_outside", False)),
+        "previous_red": bool(row.get("previous_red", False)),
+        "current_green": bool(row.get("current_green", False)),
+        "valid_red_green_pair": bool(row.get("valid_red_green_pair", False)),
+        "range_inside": bool(row.get("range_inside", False)),
+        "range_engulfing": bool(row.get("range_engulfing", False)),
     }
     context["candidate_score"] = _candidate_score(context)
     return context
@@ -772,6 +878,9 @@ def _aggregate_stats(trades: pd.DataFrame, group_columns: list[str]) -> pd.DataF
                 "avg_hold_sessions": float(pd.to_numeric(group["hold_trading_sessions"], errors="coerce").mean()),
                 "avg_mfe_pct": float(pd.to_numeric(group["mfe_pct"], errors="coerce").mean()),
                 "avg_mae_pct": float(pd.to_numeric(group["mae_pct"], errors="coerce").mean()),
+                "avg_max_return_10_sessions_pct": float(pd.to_numeric(group.get("max_return_10_sessions_pct", pd.Series(dtype="float64")), errors="coerce").mean()),
+                "median_max_return_10_sessions_pct": float(pd.to_numeric(group.get("max_return_10_sessions_pct", pd.Series(dtype="float64")), errors="coerce").median()),
+                "avg_close_return_10_sessions_pct": float(pd.to_numeric(group.get("close_return_10_sessions_pct", pd.Series(dtype="float64")), errors="coerce").mean()),
             }
         )
         rows.append(record)
@@ -813,7 +922,7 @@ def _build_summary(
     exit_on_ema_close_reclaim: bool,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {
-        "strategy_name": "EMA20 Band Strict Outside Bullish Patterns",
+        "strategy_name": "EMA20 Exact Red-Green IB EB v6",
         "universe": universe_name,
         "requested_as_of_date": as_of_ts.strftime("%Y-%m-%d"),
         "analysis_as_of_date": as_of_ts.strftime("%Y-%m-%d"),
@@ -885,11 +994,23 @@ def _empty_trades() -> pd.DataFrame:
             "win_flag",
             "mfe_pct",
             "mae_pct",
+            "max_return_10_sessions_pct",
+            "max_return_10_sessions_price",
+            "max_return_10_sessions_date",
+            "sessions_to_max_return_10",
+            "close_return_10_sessions_pct",
+            "close_return_10_sessions_date",
+            "max_return_10_sessions_observed",
             "entry_index",
             "exit_index",
             "candidate_score",
             "pattern",
             "ema_trend_20d_label",
+            "previous_red",
+            "current_green",
+            "valid_red_green_pair",
+            "range_inside",
+            "range_engulfing",
             "distance_to_ema_low_pct",
             "distance_to_ema_close_pct",
             "band_gap_pct",

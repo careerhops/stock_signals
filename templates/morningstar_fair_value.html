@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="panel">
+    <div class="panel-heading">
+      <h2>Morningstar Fair Value</h2>
+      <p>Paste NSE symbols and fetch the current-month and previous-month Morningstar fair values.</p>
+    </div>
+
+    <form action="/morningstar-fair-value{% if dashboard_token %}?token={{ dashboard_token|urlencode }}{% endif %}" method="post" class="filter-panel">
+      <label class="wide-field">
+        Symbols
+        <textarea name="symbols" placeholder="TIPSFILMS, TCS, INFY">{{ symbols_text }}</textarea>
+      </label>
+      <label>
+        As of date
+        <input type="date" name="as_of_date" value="{{ as_of_date }}">
+      </label>
+      <label>
+        Delay / stock
+        <input type="number" name="delay_seconds" min="0" max="30" step="0.5" value="{{ delay_seconds|number(1) }}">
+      </label>
+      <div class="filter-actions">
+        <button class="button" type="submit">Fetch Fair Values</button>
+      </div>
+    </form>
+
+    {% if error %}
+      <p class="warning-note">{{ error }}</p>
+    {% endif %}
+  </section>
+
+  {% if ran and rows %}
+    <section class="summary-grid">
+      <div class="metric">
+        <span>Resolved</span>
+        <strong>{{ success_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>Needs Attention</span>
+        <strong>{{ error_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>Qualified</span>
+        <strong>{{ qualified_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>As Of</span>
+        <strong>{{ as_of_date }}</strong>
+      </div>
+      <div class="metric">
+        <span>Delay / Stock</span>
+        <strong>{{ delay_seconds|number(1) }}s</strong>
+      </div>
+      <div class="metric">
+        <span>Fetch Time</span>
+        <strong>{% if fetch_elapsed_seconds is not none %}{{ fetch_elapsed_seconds|number(1) }}s{% endif %}</strong>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Fair Value Table</h2>
+        <p>{{ rows|length }} requested stock{{ "" if rows|length == 1 else "s" }}.</p>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Company</th>
+              <th>Current Month</th>
+              <th>Current FV</th>
+              <th>Market Price</th>
+              <th>FV - CMP</th>
+              <th>FV - CMP %</th>
+              <th>Previous Month</th>
+              <th>Previous FV</th>
+              <th>FV Change</th>
+              <th>FV Change %</th>
+              <th>Currency</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in rows %}
+              {% if row.get("status") == "OK" %}
+                <tr>
+                  <td><strong>{{ row.get("symbol", "") }}</strong></td>
+                  <td>
+                    {{ row.get("company_name", "") }}
+                    {% if row.get("exchange") %}<br><span class="muted-text">{{ row.get("exchange") }}</span>{% endif %}
+                  </td>
+                  <td>{{ row.get("current_month", "") }}</td>
+                  <td>{{ row.get("current_fair_value")|number(2) }}</td>
+                  <td>
+                    {{ row.get("current_market_price")|number(2) }}
+                    {% if row.get("current_market_price_date") %}<br><span class="muted-text">{{ row.get("current_market_price_date") }}</span>{% endif %}
+                  </td>
+                  <td>{{ row.get("fair_value_market_price_difference")|number(2) }}</td>
+                  <td>{% if row.get("fair_value_market_price_difference_pct") is not none %}{{ row.get("fair_value_market_price_difference_pct")|number(2) }}%{% endif %}</td>
+                  <td>{{ row.get("previous_month", "") }}</td>
+                  <td>{{ row.get("previous_fair_value")|number(2) }}</td>
+                  <td>{{ row.get("fair_value_change")|number(2) }}</td>
+                  <td>{% if row.get("fair_value_change_pct") is not none %}{{ row.get("fair_value_change_pct")|number(2) }}%{% endif %}</td>
+                  <td>{{ row.get("currency", "") }}</td>
+                  <td>
+                    <a class="table-link" href="{{ row.get("page_url") or row.get("source_url") }}" target="_blank" rel="noopener">Open</a>
+                  </td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td><strong>{{ row.get("symbol", "") }}</strong></td>
+                  <td colspan="12">
+                    <span class="badge hot">Error</span>
+                    {{ row.get("error", "") }}
+                  </td>
+                </tr>
+              {% endif %}
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Qualified Stocks</h2>
+        <p>Current fair value at least {{ fv_premium_threshold_pct|number(0) }}% above market price, with fair value up at least {{ fv_change_threshold_pct|number(0) }}% from previous month.</p>
+      </div>
+
+      {% if qualified_rows %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Company</th>
+                <th>Current FV</th>
+                <th>Market Price</th>
+                <th>FV - CMP</th>
+                <th>FV - CMP %</th>
+                <th>Previous FV</th>
+                <th>FV Change</th>
+                <th>FV Change %</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in qualified_rows %}
+                <tr>
+                  <td><strong>{{ row.get("symbol", "") }}</strong></td>
+                  <td>
+                    {{ row.get("company_name", "") }}
+                    {% if row.get("exchange") %}<br><span class="muted-text">{{ row.get("exchange") }}</span>{% endif %}
+                  </td>
+                  <td>{{ row.get("current_fair_value")|number(2) }}</td>
+                  <td>{{ row.get("current_market_price")|number(2) }}</td>
+                  <td>{{ row.get("fair_value_market_price_difference")|number(2) }}</td>
+                  <td>{{ row.get("fair_value_market_price_difference_pct")|number(2) }}%</td>
+                  <td>{{ row.get("previous_fair_value")|number(2) }}</td>
+                  <td>{{ row.get("fair_value_change")|number(2) }}</td>
+                  <td>{{ row.get("fair_value_change_pct")|number(2) }}%</td>
+                  <td>
+                    <a class="table-link" href="{{ row.get("page_url") or row.get("source_url") }}" target="_blank" rel="noopener">Open</a>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="warning-note">No stocks matched the final filter.</p>
+      {% endif %}
+    </section>
+  {% elif ran and not error %}
+    <section class="panel">
+      <p class="warning-note">No rows returned.</p>
+    </section>
+  {% endif %}
+{% endblock %}

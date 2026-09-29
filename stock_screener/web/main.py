@@ -7,6 +7,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import random
 import re
 from threading import Lock
 import time
@@ -16,6 +17,8 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
+import certifi
+import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +26,14 @@ from fastapi.templating import Jinja2Templates
 from kiteconnect import KiteConnect
 
 from stock_screener.auth.kite_token import load_access_token, save_access_token, token_status
-from stock_screener.backtest import run_buy_sell_backtest, run_buy_sell_backtest_for_symbols, save_backtest_outputs
+from stock_screener.backtest import (
+    DEFAULT_IN_SAMPLE_YEARS,
+    DEFAULT_MIN_SHARPE_RATIO,
+    DEFAULT_OUT_OF_SAMPLE_MONTHS,
+    run_buy_sell_backtest,
+    run_buy_sell_backtest_for_symbols,
+    save_backtest_outputs,
+)
 from stock_screener.backtest_report import write_backtest_workbook
 from stock_screener.config import get_data_root, load_config, require_env
 from stock_screener.data.kite import KiteDataProvider, serialized_daily_candle_refresh
@@ -78,10 +88,17 @@ from stock_screener.ema20_band_strategy_study import (
     DEFAULT_STOP_BUFFER_PCT as EMA20_BAND_DEFAULT_STOP_BUFFER_PCT,
     DEFAULT_STOP_LOSS_PCT as EMA20_BAND_DEFAULT_STOP_PCT,
     DEFAULT_WARMUP_MONTHS as EMA20_BAND_DEFAULT_WARMUP_MONTHS,
+    Ema20BandStrategyResult,
     load_ema20_band_strategy_outputs,
     run_ema20_band_strategy_study,
     save_ema20_band_strategy_outputs,
     write_ema20_band_strategy_workbook,
+)
+from stock_screener.ema20_research_agents import enrich_ema20_candidates_with_research_agents
+from stock_screener.ema_band_optimization_study import (
+    EmaBandOptimizationResult,
+    build_emax_current_candidates,
+    write_ema_band_optimization_workbook,
 )
 from stock_screener.gtt_gain_report import write_gtt_gain_workbook
 from stock_screener.gtt_gain_study import (
@@ -149,6 +166,26 @@ from stock_screener.knox_recovery_study import (
     load_knox_recovery_outputs,
     run_knox_recovery_study,
     save_knox_recovery_outputs,
+)
+from stock_screener.order_block_retest_study import (
+    DEFAULT_HOLDING_SESSIONS as ORDER_BLOCK_DEFAULT_HOLDING_SESSIONS,
+    DEFAULT_INVALIDATION_METHOD as ORDER_BLOCK_DEFAULT_INVALIDATION_METHOD,
+    DEFAULT_MAX_STOP_LOSS_PCT as ORDER_BLOCK_DEFAULT_MAX_STOP_LOSS_PCT,
+    DEFAULT_MIN_HISTORICAL_SAMPLES as ORDER_BLOCK_DEFAULT_MIN_HISTORICAL_SAMPLES,
+    DEFAULT_POC_BINS as ORDER_BLOCK_DEFAULT_POC_BINS,
+    DEFAULT_PROFIT_TARGET_PCT as ORDER_BLOCK_DEFAULT_PROFIT_TARGET_PCT,
+    DEFAULT_RECENT_SIGNAL_BARS as ORDER_BLOCK_DEFAULT_RECENT_SIGNAL_BARS,
+    DEFAULT_ROUND_TRIP_COST_PCT as ORDER_BLOCK_DEFAULT_ROUND_TRIP_COST_PCT,
+    DEFAULT_SIGNAL_DIRECTION as ORDER_BLOCK_DEFAULT_SIGNAL_DIRECTION,
+    DEFAULT_STOP_BUFFER_PCT as ORDER_BLOCK_DEFAULT_STOP_BUFFER_PCT,
+    DEFAULT_SWING_LENGTH as ORDER_BLOCK_DEFAULT_SWING_LENGTH,
+    INVALIDATION_METHODS as ORDER_BLOCK_INVALIDATION_METHODS,
+    ORDER_BLOCK_COMPATIBLE_LOGIC_VERSIONS,
+    ORDER_BLOCK_LOGIC_VERSION,
+    SIGNAL_DIRECTIONS as ORDER_BLOCK_SIGNAL_DIRECTIONS,
+    load_order_block_retest_outputs,
+    run_order_block_retest_study,
+    save_order_block_retest_outputs,
 )
 from stock_screener.notifications.telegram import send_buy_signal_list_to_telegram, send_gtt_stock_list_to_telegram
 from stock_screener.resample import resample_daily_to_weekly
@@ -237,6 +274,12 @@ from stock_screener.minervini_sheet_sync import (
     load_minervini_sheet_sync_outputs,
     run_minervini_sheet_sync,
     save_minervini_sheet_sync_outputs,
+)
+from stock_screener.morningstar_fair_value import (
+    FairValueRequest,
+    MorningstarFairValueAgent,
+    MorningstarFairValueError,
+    resolve_morningstar_stock_page,
 )
 from stock_screener.minervini_quality_study import (
     DEFAULT_BENCHMARK_SYMBOL as MINERVINI_QUALITY_DEFAULT_BENCHMARK,
@@ -338,6 +381,37 @@ STOCK_SIGNATURE_UNIVERSE_DEFINITIONS = {
 }
 STOCK_SIGNATURE_DEFAULT_UNIVERSES = ("nifty100",)
 ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS = 8
+MORNINGSTAR_MAX_DELAY_SECONDS = 30.0
+MORNINGSTAR_MIN_FV_PREMIUM_PCT = 30.0
+MORNINGSTAR_MIN_FV_CHANGE_PCT = 40.0
+
+
+def _bounded_float_value(
+    value: Any,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: float = MORNINGSTAR_MAX_DELAY_SECONDS,
+) -> float:
+    text = str(value if value is not None else "").strip()
+    try:
+        parsed = float(text or default)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if parsed != parsed:
+        parsed = float(default)
+    return min(max(parsed, minimum), maximum)
+
+
+MORNINGSTAR_DEFAULT_DELAY_SECONDS = _bounded_float_value(
+    os.getenv("MORNINGSTAR_REQUEST_DELAY_SECONDS", "2.0"),
+    2.0,
+)
+MORNINGSTAR_DEFAULT_JITTER_SECONDS = _bounded_float_value(
+    os.getenv("MORNINGSTAR_REQUEST_JITTER_SECONDS", "1.0"),
+    1.0,
+    maximum=10.0,
+)
 
 
 def _template_number(value: Any, digits: int = 2) -> str:
@@ -421,6 +495,8 @@ SCREENER_FUTURES: dict[str, Future[Any]] = {}
 SCREENER_FUTURES_LOCK = Lock()
 SCREENER_KIND_LOCKS: dict[str, Lock] = {}
 SCREENER_KIND_LOCKS_LOCK = Lock()
+LATEST_SCAN_JOB_BY_KIND: dict[str, str] = {}
+LATEST_SCAN_JOB_BY_KIND_LOCK = Lock()
 LATEST_WEEKLY_JOB_ID = ""
 LATEST_WEEKLY_JOB_LOCK = Lock()
 BIG_BULL_DEALS_CACHE: dict[str, Any] = {
@@ -472,6 +548,10 @@ def _scan_job_path(job_id: str) -> Path:
     return SCAN_JOBS_DIR / f"{job_id}.json"
 
 
+class _ScanJobCancelled(RuntimeError):
+    pass
+
+
 def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
@@ -482,6 +562,10 @@ def _set_scan_job(job_id: str, **updates: Any) -> None:
         current = SCAN_JOBS.setdefault(job_id, {})
 
         status = str(updates.get("status") or "").strip().lower()
+        if current.get("cancel_requested") and status in {"queued", "starting", "running"}:
+            raise _ScanJobCancelled(str(current.get("error") or "Cancelled by newer run."))
+        if current.get("cancel_requested") and status == "completed":
+            return
         if status == "queued" and not current.get("queued_at"):
             updates.setdefault("queued_at", now)
         if status in {"starting", "running"} and not current.get("started_at"):
@@ -506,9 +590,17 @@ def _set_scan_job(job_id: str, **updates: Any) -> None:
         current.update(updates)
         safe_payload = _json_safe(current)
     path = _scan_job_path(job_id)
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(safe_payload), encoding="utf-8")
-    temporary.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(safe_payload), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def _timestamp_or_default(value: Any, default: float) -> float:
@@ -595,6 +687,71 @@ def _screener_kind_lock(job_kind: str) -> Lock:
         return SCREENER_KIND_LOCKS.setdefault(job_kind, Lock())
 
 
+def _register_latest_scan_job_for_kind(job_kind: str, job_id: str) -> None:
+    with LATEST_SCAN_JOB_BY_KIND_LOCK:
+        LATEST_SCAN_JOB_BY_KIND[str(job_kind)] = str(job_id)
+
+
+def _is_latest_scan_job_for_kind(job_kind: str, job_id: str) -> bool:
+    with LATEST_SCAN_JOB_BY_KIND_LOCK:
+        latest_job_id = LATEST_SCAN_JOB_BY_KIND.get(str(job_kind), "")
+    return not latest_job_id or latest_job_id == str(job_id)
+
+
+def _mark_scan_job_cancelled(job_id: str, job_kind: str, replacement_job_id: str = "") -> None:
+    replacement_text = f" Replacement job: {replacement_job_id}." if replacement_job_id else ""
+    updates = {
+        "status": "failed",
+        "phase": "Cancelled by newer run",
+        "error": f"This run was cancelled because a newer {job_kind} run was started.{replacement_text}",
+        "cancel_requested": True,
+    }
+    if replacement_job_id:
+        updates["superseded_by"] = replacement_job_id
+    _set_scan_job(job_id, **updates)
+
+
+def _cancel_active_scan_jobs_for_kind(job_kind: str, replacement_job_id: str) -> None:
+    active_statuses = {"queued", "starting", "running"}
+    candidate_job_ids: set[str] = set()
+    with SCAN_JOBS_LOCK:
+        for job_id, payload in SCAN_JOBS.items():
+            if job_id == replacement_job_id:
+                continue
+            if str(payload.get("job_kind") or "") != str(job_kind):
+                continue
+            if str(payload.get("status") or "").lower() in active_statuses:
+                candidate_job_ids.add(job_id)
+
+    for path in SCAN_JOBS_DIR.glob("*.json"):
+        job_id = path.stem
+        if job_id == replacement_job_id or job_id in candidate_job_ids:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(payload.get("job_kind") or "") != str(job_kind):
+            continue
+        if str(payload.get("status") or "").lower() in active_statuses:
+            with SCAN_JOBS_LOCK:
+                SCAN_JOBS[job_id] = dict(payload)
+            candidate_job_ids.add(job_id)
+
+    for job_id in candidate_job_ids:
+        _mark_scan_job_cancelled(job_id, job_kind, replacement_job_id)
+        with SCREENER_FUTURES_LOCK:
+            future = SCREENER_FUTURES.get(job_id)
+        if future is not None:
+            future.cancel()
+
+
+def _raise_if_scan_job_superseded(job_id: str, job_kind: str) -> None:
+    if _is_latest_scan_job_for_kind(job_kind, job_id):
+        return
+    raise _ScanJobCancelled(f"Cancelled by newer {job_kind} run.")
+
+
 def _run_submitted_scan_job(
     job_id: str,
     job_kind: str,
@@ -602,15 +759,19 @@ def _run_submitted_scan_job(
     args: tuple[Any, ...],
 ) -> None:
     kind_lock = _screener_kind_lock(job_kind)
-    if not kind_lock.acquire(blocking=False):
-        _set_scan_job(
-            job_id,
-            status="queued",
-            phase=f"Waiting for another {job_kind} run",
-            worker_count=SCREENER_WORKER_COUNT,
-        )
-        kind_lock.acquire()
+    lock_acquired = False
     try:
+        _raise_if_scan_job_superseded(job_id, job_kind)
+        if not kind_lock.acquire(blocking=False):
+            _set_scan_job(
+                job_id,
+                status="queued",
+                phase=f"Waiting for another {job_kind} run",
+                worker_count=SCREENER_WORKER_COUNT,
+            )
+            kind_lock.acquire()
+        lock_acquired = True
+        _raise_if_scan_job_superseded(job_id, job_kind)
         _set_scan_job(
             job_id,
             status="starting",
@@ -618,10 +779,13 @@ def _run_submitted_scan_job(
             worker_count=SCREENER_WORKER_COUNT,
         )
         runner(job_id, *args)
+    except _ScanJobCancelled:
+        _mark_scan_job_cancelled(job_id, job_kind)
     except Exception as exc:
         _set_scan_job(job_id, status="failed", phase="Failed", error=str(exc))
     finally:
-        kind_lock.release()
+        if lock_acquired:
+            kind_lock.release()
 
 
 def _submit_scan_job(
@@ -633,6 +797,8 @@ def _submit_scan_job(
 ) -> Future[Any] | None:
     """Queue a long-running scan without tying it to the HTTP response lifecycle."""
 
+    _register_latest_scan_job_for_kind(job_kind, job_id)
+    _cancel_active_scan_jobs_for_kind(job_kind, job_id)
     _set_scan_job(
         job_id,
         status="queued",
@@ -727,6 +893,110 @@ def _is_allowed(request: Request) -> bool:
     return request.query_params.get("token") == expected
 
 
+def _parse_morningstar_symbols(symbols_text: str) -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for raw_value in re.split(r"[\s,;]+", str(symbols_text or "")):
+        symbol = raw_value.strip().upper()
+        if not symbol:
+            continue
+        if ":" in symbol and not symbol.startswith(("HTTP://", "HTTPS://")):
+            symbol = symbol.rsplit(":", 1)[-1].strip()
+        if symbol and symbol not in seen:
+            symbols.append(symbol)
+            seen.add(symbol)
+    return symbols
+
+
+def _morningstar_target_date(value: str) -> date:
+    text = str(value or "").strip()
+    if not text:
+        return date.today()
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise MorningstarFairValueError("As-of date must be in YYYY-MM-DD format.") from exc
+
+
+def _morningstar_row_float(row: dict[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric != numeric:
+        return None
+    return numeric
+
+
+def _morningstar_qualified_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    qualified: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("status") != "OK":
+            continue
+        premium_pct = _morningstar_row_float(row, "fair_value_market_price_difference_pct")
+        fair_value_change_pct = _morningstar_row_float(row, "fair_value_change_pct")
+        if premium_pct is None or fair_value_change_pct is None:
+            continue
+        if (
+            premium_pct >= MORNINGSTAR_MIN_FV_PREMIUM_PCT
+            and fair_value_change_pct >= MORNINGSTAR_MIN_FV_CHANGE_PCT
+        ):
+            qualified.append(row)
+    return sorted(
+        qualified,
+        key=lambda row: (
+            _morningstar_row_float(row, "fair_value_market_price_difference_pct") or 0.0,
+            _morningstar_row_float(row, "fair_value_change_pct") or 0.0,
+        ),
+        reverse=True,
+    )
+
+
+def _fetch_morningstar_fair_value_rows(
+    symbols: list[str],
+    *,
+    as_of_date: date,
+    delay_seconds: float = MORNINGSTAR_DEFAULT_DELAY_SECONDS,
+    jitter_seconds: float = MORNINGSTAR_DEFAULT_JITTER_SECONDS,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    delay_seconds = _bounded_float_value(delay_seconds, MORNINGSTAR_DEFAULT_DELAY_SECONDS)
+    jitter_seconds = _bounded_float_value(jitter_seconds, MORNINGSTAR_DEFAULT_JITTER_SECONDS, maximum=10.0)
+    with MorningstarFairValueAgent() as agent:
+        for index, symbol in enumerate(symbols):
+            row: dict[str, Any] = {
+                "symbol": symbol,
+                "status": "OK",
+                "error": "",
+            }
+            try:
+                page = resolve_morningstar_stock_page(symbol, http_client=agent.http_client)
+                result = agent.fetch(
+                    FairValueRequest(symbol=symbol, page_url=page.page_url),
+                    as_of_date=as_of_date,
+                )
+                row.update(result.to_dict())
+                row.update(
+                    {
+                        "exchange": page.exchange,
+                        "company_name": page.company_name,
+                        "morningstar_symbol": page.lookup_symbol,
+                        "page_url": page.page_url,
+                    }
+                )
+            except MorningstarFairValueError as exc:
+                row.update(status="ERROR", error=str(exc))
+            except Exception as exc:
+                row.update(status="ERROR", error=f"Unexpected error: {exc}")
+            rows.append(row)
+            if index < len(symbols) - 1 and (delay_seconds > 0 or jitter_seconds > 0):
+                time.sleep(delay_seconds + random.uniform(0, jitter_seconds))
+    return rows
+
+
 def _load_symbol_metadata(config: dict) -> pd.DataFrame:
     metadata_file = config.get("universe", {}).get("metadata_file", "config/symbol_metadata.csv")
     path = BASE_DIR / metadata_file
@@ -776,12 +1046,211 @@ def _combined_symbol_metadata(config: dict, storage: Storage) -> pd.DataFrame:
     return metadata.drop_duplicates(subset=["symbol"], keep="last")
 
 
+def _promoter_holdings_path(data_root: Path) -> Path:
+    return data_root / "instruments" / "promoter_holdings.csv"
+
+
+def _load_promoter_holdings(data_root: Path) -> pd.DataFrame:
+    path = _promoter_holdings_path(data_root)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        holdings = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    if holdings.empty:
+        return pd.DataFrame()
+
+    column_lookup = {str(column).strip().lower(): column for column in holdings.columns}
+    symbol_column = _first_existing_column(
+        column_lookup,
+        ("symbol", "tradingsymbol", "nse_symbol", "nse symbol"),
+    )
+    promoter_column = _first_existing_column(
+        column_lookup,
+        (
+            "promoter_holding_pct",
+            "promoter_holding_percent",
+            "promoter_and_promoter_group_pct",
+            "promoter_promoter_group_pct",
+            "pr_and_prgrp",
+            "promoter & promoter group (a)",
+            "promoter and promoter group (a)",
+        ),
+    )
+    if not symbol_column or not promoter_column:
+        return pd.DataFrame()
+
+    as_on_column = _first_existing_column(
+        column_lookup,
+        ("as_on_date", "as on date", "as_of_date", "promoter_holding_as_of", "shareholding_as_on"),
+    )
+    source_column = _first_existing_column(
+        column_lookup,
+        ("source", "promoter_holding_source", "filing_url", "url"),
+    )
+    normalized = pd.DataFrame()
+    normalized["symbol"] = holdings[symbol_column].astype(str).str.upper().str.strip()
+    normalized["promoter_holding_pct"] = (
+        holdings[promoter_column]
+        .astype(str)
+        .str.replace("%", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .pipe(pd.to_numeric, errors="coerce")
+    )
+    normalized["promoter_holding_as_of"] = holdings[as_on_column].astype(str).str.strip() if as_on_column else ""
+    normalized["promoter_holding_source"] = holdings[source_column].astype(str).str.strip() if source_column else ""
+    normalized = normalized[normalized["symbol"] != ""].copy()
+    normalized["symbol_key"] = normalized["symbol"].apply(normalize_nse_symbol)
+    return normalized.drop_duplicates(subset=["symbol_key"], keep="last")
+
+
+def _fetch_and_store_promoter_holdings_from_nse(data_root: Path) -> dict[str, Any]:
+    url = "https://www.nseindia.com/api/corporate-share-holdings-master?index=equities"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern?tabIndex=equity",
+    }
+    session = requests.Session()
+    session.get("https://www.nseindia.com", headers=headers, timeout=15, verify=certifi.where())
+    try:
+        response = session.get(url, headers=headers, timeout=45, verify=certifi.where())
+    except requests.exceptions.SSLError:
+        session.get("https://www.nseindia.com", headers=headers, timeout=15, verify=False)
+        response = session.get(url, headers=headers, timeout=45, verify=False)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("NSE promoter holding endpoint returned no rows.")
+
+    frame = pd.DataFrame(payload)
+    required = {"symbol", "pr_and_prgrp"}
+    if frame.empty or not required.issubset(frame.columns):
+        raise ValueError("NSE promoter holding endpoint did not include symbol and pr_and_prgrp columns.")
+
+    normalized = pd.DataFrame(
+        {
+            "symbol": frame["symbol"].astype(str).str.upper().str.strip(),
+            "company_name": frame.get("name", "").astype(str).str.strip() if "name" in frame.columns else "",
+            "promoter_holding_pct": pd.to_numeric(frame["pr_and_prgrp"], errors="coerce"),
+            "as_on_date": frame.get("date", "").astype(str).str.strip() if "date" in frame.columns else "",
+            "submission_date": frame.get("submissionDate", "").astype(str).str.strip() if "submissionDate" in frame.columns else "",
+            "source": "NSE corporate-share-holdings-master",
+            "source_url": url,
+        }
+    )
+    normalized = normalized[normalized["symbol"] != ""].copy()
+    normalized["as_on_sort"] = pd.to_datetime(normalized["as_on_date"], errors="coerce", format="mixed")
+    normalized["submission_sort"] = pd.to_datetime(normalized["submission_date"], errors="coerce", format="mixed")
+    normalized = normalized.sort_values(["symbol", "as_on_sort", "submission_sort"], na_position="first")
+    normalized = normalized.drop_duplicates(subset=["symbol"], keep="last")
+    normalized = normalized.drop(columns=["as_on_sort", "submission_sort"], errors="ignore")
+
+    path = _promoter_holdings_path(data_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".csv.tmp")
+    normalized.to_csv(temporary, index=False)
+    temporary.replace(path)
+    return {"rows": int(len(normalized)), "path": str(path)}
+
+
+def _first_existing_column(column_lookup: dict[str, Any], candidates: tuple[str, ...]) -> Any | None:
+    for candidate in candidates:
+        column = column_lookup.get(candidate)
+        if column is not None:
+            return column
+    return None
+
+
+def _enrich_with_promoter_holdings(frame: pd.DataFrame, holdings: pd.DataFrame, symbol_column: str = "symbol") -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    enriched = frame.copy()
+    if holdings.empty or symbol_column not in enriched.columns:
+        for column in ("promoter_holding_pct", "promoter_holding_as_of", "promoter_holding_source"):
+            if column not in enriched.columns:
+                enriched[column] = ""
+        return enriched
+    lookup = holdings[["symbol_key", "promoter_holding_pct", "promoter_holding_as_of", "promoter_holding_source"]].copy()
+    enriched["symbol_key"] = enriched[symbol_column].apply(normalize_nse_symbol)
+    enriched = enriched.merge(lookup, on="symbol_key", how="left")
+    return enriched.drop(columns=["symbol_key"], errors="ignore")
+
+
+def _weekly_buy_research_frame(filtered: pd.DataFrame, promoter_holdings: pd.DataFrame) -> pd.DataFrame:
+    if filtered.empty:
+        return filtered
+    symbol_column = _symbol_column(filtered)
+    if not symbol_column:
+        return filtered
+    columns = [
+        "date",
+        "exchange",
+        symbol_column,
+        "name",
+        "signal",
+        "promoter_holding_pct",
+        "promoter_holding_as_of",
+        "market_cap_cr",
+        "market_cap_bucket",
+        "latest_close",
+        "latest_close_date",
+        "close",
+        "volume_confirmation_ratio",
+        "trend_confirmation",
+        "obv_confirmation",
+    ]
+    research = filtered.copy()
+    if "signal" in research.columns:
+        research = research[research["signal"].astype(str).str.upper() == "BUY"].copy()
+    research = _enrich_with_promoter_holdings(research, promoter_holdings, symbol_column)
+    if symbol_column != "symbol":
+        research = research.rename(columns={symbol_column: "symbol"})
+        columns = ["symbol" if column == symbol_column else column for column in columns]
+    for column in columns:
+        if column not in research.columns:
+            research[column] = ""
+    if "market_cap_cr" in research.columns:
+        research["market_cap_cr"] = pd.to_numeric(research["market_cap_cr"], errors="coerce")
+    if "promoter_holding_pct" in research.columns:
+        research["promoter_holding_pct"] = pd.to_numeric(research["promoter_holding_pct"], errors="coerce")
+    sort_columns = [column for column in ("market_cap_cr", "symbol") if column in research.columns]
+    if sort_columns:
+        research = research.sort_values(sort_columns, ascending=[False, True][: len(sort_columns)], na_position="last")
+    return research[columns]
+
+
 def _stock_signature_index_path(data_root: Path, universe_key: str) -> Path:
     definition = STOCK_SIGNATURE_UNIVERSE_DEFINITIONS.get(str(universe_key).strip().lower())
     filename = definition.get("filename") if definition else f"{str(universe_key).strip().lower()}_constituents.csv"
     if not filename:
         filename = f"{str(universe_key).strip().lower()}_constituents.csv"
     return data_root / "indices" / filename
+
+
+def _read_remote_index_csv(url: str) -> pd.DataFrame:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/csv,application/csv,application/octet-stream,*/*",
+        "Referer": "https://www.niftyindices.com/",
+    }
+    try:
+        response = requests.get(
+            str(url),
+            headers=headers,
+            timeout=30,
+            verify=certifi.where(),
+        )
+    except requests.exceptions.SSLError:
+        response = requests.get(
+            str(url),
+            headers=headers,
+            timeout=30,
+            verify=False,
+        )
+    response.raise_for_status()
+    return pd.read_csv(BytesIO(response.content))
 
 
 def _nifty100_constituents_path(data_root: Path) -> Path:
@@ -815,7 +1284,7 @@ def _load_stock_signature_index_constituents(
         frame = pd.DataFrame()
 
     if frame.empty and allow_remote_fetch:
-        frame = pd.read_csv(str(definition["url"]))
+        frame = _read_remote_index_csv(str(definition["url"]))
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(path, index=False)
 
@@ -1231,6 +1700,10 @@ def _dma_reclaim_strategy_dir(data_root: Path) -> Path:
 
 def _ema20_band_strategy_dir(data_root: Path) -> Path:
     return data_root / "ema20_band_strategy"
+
+
+def _emax_band_strategy_dir(data_root: Path) -> Path:
+    return data_root / "ema_band_optimization_all_nse"
 
 
 def _roi_journal_dma_dir(data_root: Path) -> Path:
@@ -3972,6 +4445,11 @@ def _swing_trade_error_url(error: Exception, query_suffix: str) -> str:
 
 
 def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: str) -> None:
+    job_kind = "Weekly BUY / SELL"
+
+    def check_cancelled() -> None:
+        _raise_if_scan_job_superseded(job_id, job_kind)
+
     _set_scan_job(
         job_id,
         status="running",
@@ -3984,6 +4462,7 @@ def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: st
     )
 
     def progress_callback(payload: dict[str, Any]) -> None:
+        check_cancelled()
         total = int(payload.get("total") or 0)
         completed = int(payload.get("completed") or 0)
         percent = int((completed / total) * 100) if total else 0
@@ -3999,7 +4478,11 @@ def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: st
         )
 
     try:
-        summary = run_daily_scan(scan_config, progress_callback=progress_callback)
+        summary = run_daily_scan(
+            scan_config,
+            progress_callback=progress_callback,
+            cancel_check=check_cancelled,
+        )
         _set_scan_job(
             job_id,
             status="completed",
@@ -4012,6 +4495,8 @@ def _run_screener_job(job_id: str, scan_config: dict[str, Any], query_suffix: st
             summary=summary,
             redirect_url=_scan_redirect_url(summary, query_suffix),
         )
+    except _ScanJobCancelled:
+        _mark_scan_job_cancelled(job_id, job_kind)
     except Exception as exc:
         _set_scan_job(
             job_id,
@@ -5619,6 +6104,134 @@ def _run_knox_envelope_job(
         )
 
 
+def _run_order_block_retest_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    symbols: list[str] | None,
+    start_date: str,
+    requested_as_of_date: str,
+    swing_length: int,
+    poc_bins: int,
+    invalidation_method: str,
+    signal_direction: str,
+    recent_signal_bars: int,
+    require_active_zone: bool,
+    holding_sessions: int,
+    profit_target_pct: float,
+    max_stop_loss_pct: float,
+    stop_buffer_pct: float,
+    round_trip_cost_pct: float,
+    min_historical_samples: int,
+) -> None:
+    storage = Storage(data_root)
+    _set_scan_job(
+        job_id,
+        status="running",
+        phase="Refreshing order-block candles",
+        completed=0,
+        total=0,
+        percent=0,
+        current_symbol="",
+        current_exchange="NSE",
+    )
+
+    def refresh_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 40) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Refreshing daily candles"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 40)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange="NSE",
+        )
+
+    def study_progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = 40 + (int((completed / total) * 60) if total else 0)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Scanning and backtesting retests"),
+            completed=completed,
+            total=total,
+            percent=max(40, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange="NSE",
+        )
+
+    try:
+        expected_date = _refresh_minervini_quality_benchmark(storage, "NIFTY 50")
+        requested_date, analysis_date = _resolve_analysis_as_of_date(
+            storage,
+            "NIFTY 50",
+            requested_as_of_date,
+            expected_date,
+        )
+        refreshed_symbols, refresh_audit = _refresh_adx_di_candles(
+            storage,
+            required_date=expected_date,
+            symbols=symbols,
+            progress_callback=refresh_progress,
+            scan_label="order-block retest screener",
+            progress_phase="Refreshing order-block candles",
+        )
+        if not refreshed_symbols:
+            raise RuntimeError("No fresh NSE daily candles were available for the order-block scan.")
+
+        result = run_order_block_retest_study(
+            storage,
+            exchange="NSE",
+            symbols=refreshed_symbols,
+            start_date=start_date,
+            as_of_date=analysis_date,
+            swing_length=swing_length,
+            poc_bins=poc_bins,
+            invalidation_method=invalidation_method,
+            signal_direction=signal_direction,
+            recent_signal_bars=recent_signal_bars,
+            require_active_zone=require_active_zone,
+            holding_sessions=holding_sessions,
+            profit_target_pct=profit_target_pct,
+            max_stop_loss_pct=max_stop_loss_pct,
+            stop_buffer_pct=stop_buffer_pct,
+            round_trip_cost_pct=round_trip_cost_pct,
+            min_historical_samples=min_historical_samples,
+            progress_callback=study_progress,
+        )
+        result.summary.update(refresh_audit)
+        result.summary["requested_as_of_date"] = requested_date
+        result.summary["analysis_as_of_date"] = analysis_date.isoformat()
+        result.summary["requested_symbols"] = ",".join(symbols or [])
+        save_order_block_retest_outputs(result, _order_block_retest_dir(data_root))
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(result.summary.get("symbols_processed", 0)),
+            total=int(result.summary.get("symbols_processed", 0)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=result.summary,
+            redirect_url=f"/order-block-retest?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/order-block-retest?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
 def _run_knox_recovery_job(
     job_id: str,
     data_root: Path,
@@ -6146,6 +6759,971 @@ def _filter_constituents_to_pair_texts(constituents: pd.DataFrame, pair_texts: I
     return working[pd.Series(mask, index=working.index)].copy()
 
 
+EMA20_CONFIRMATION_FILTER_OPTIONS: list[tuple[str, str]] = [
+    ("", "All"),
+    ("any", "Any confirmation"),
+    ("double", "2+ confirmations"),
+    ("weekly_buy", "Weekly BUY"),
+    ("weekly_sell", "Weekly SELL"),
+    ("adx", "ADX crossover"),
+    ("minervini", "Minervini Quality"),
+    ("adx_minervini", "ADX + Minervini"),
+    ("weekly_adx", "Weekly + ADX"),
+    ("weekly_minervini", "Weekly + Minervini"),
+    ("knox", "Knoxville-Envelope"),
+]
+
+EMA20_CONFIRMATION_COLUMNS: tuple[str, ...] = (
+    "weekly_signal",
+    "weekly_signal_date",
+    "weekly_timeframe",
+    "weekly_buy_signal",
+    "weekly_sell_signal",
+    "weekly_signal_pass",
+    "weekly_volume_confirmation_ratio",
+    "weekly_trend_confirmation",
+    "adx_crossover_pass",
+    "adx_signal_text",
+    "latest_adx",
+    "latest_di_plus",
+    "latest_di_minus",
+    "latest_cross_date",
+    "adx_trend_filter_pass",
+    "adx_quality_score",
+    "minervini_quality_pass",
+    "minervini_latest_date",
+    "minervini_stock_quality_score",
+    "minervini_setup_quality_score",
+    "minervini_entry_quality_score",
+    "knox_envelope_pass",
+    "knox_combined_match",
+    "knox_signal_date",
+    "knox_signal_age_bars",
+    "knox_confirmation_pass",
+    "knox_cmf_pass",
+    "knox_sharpe_pass",
+    "confirmation_count",
+    "confirmation_summary",
+    "double_confirmation_pass",
+    "adx_minervini_confirmation_pass",
+    "weekly_adx_confirmation_pass",
+    "weekly_minervini_confirmation_pass",
+)
+
+
+def _ema20_clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def _ema20_join_pair(exchange_value: Any, symbol_value: Any) -> tuple[str, str]:
+    exchange = _ema20_clean_text(exchange_value).upper() or "NSE"
+    symbol = _ema20_clean_text(symbol_value).upper()
+    if ":" in symbol:
+        prefix, remainder = symbol.split(":", 1)
+        if prefix in {"NSE", "BSE"}:
+            exchange = prefix
+            symbol = remainder
+    if symbol.endswith(".NS"):
+        exchange = "NSE"
+        symbol = symbol[:-3]
+    elif symbol.endswith(".BO"):
+        exchange = "BSE"
+        symbol = symbol[:-3]
+    if exchange not in {"NSE", "BSE"}:
+        exchange = "NSE"
+    if exchange == "NSE":
+        symbol = normalize_nse_symbol(symbol)
+    return exchange, symbol
+
+
+def _ema20_add_join_keys(frame: pd.DataFrame, default_exchange: str = "NSE") -> pd.DataFrame:
+    working = frame.copy()
+    symbol_column = next(
+        (column for column in ("symbol", "tradingsymbol", "Symbol", "Tradingsymbol") if column in working.columns),
+        "",
+    )
+    if not symbol_column:
+        working["_join_exchange"] = ""
+        working["_join_symbol"] = ""
+        return working
+    exchange_values = (
+        working["exchange"]
+        if "exchange" in working.columns
+        else pd.Series(default_exchange, index=working.index)
+    )
+    pairs = [
+        _ema20_join_pair(exchange, symbol)
+        for exchange, symbol in zip(exchange_values, working[symbol_column], strict=False)
+    ]
+    working["_join_exchange"] = [exchange for exchange, _ in pairs]
+    working["_join_symbol"] = [symbol for _, symbol in pairs]
+    return working
+
+
+def _ema20_truthy_value(value: Any) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value) != 0.0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _ema20_bool_series(series: pd.Series | Any, index: pd.Index | None = None) -> pd.Series:
+    if isinstance(series, pd.Series):
+        return series.map(_ema20_truthy_value).astype(bool)
+    return pd.Series(_ema20_truthy_value(series), index=index, dtype=bool)
+
+
+def _ema20_read_csv(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path) if path.exists() else pd.DataFrame()
+    except (pd.errors.EmptyDataError, OSError):
+        return pd.DataFrame()
+
+
+def _ema20_latest_date_text(frame: pd.DataFrame, columns: Iterable[str]) -> str:
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        values = pd.to_datetime(frame[column], errors="coerce").dropna()
+        if not values.empty:
+            return values.max().normalize().date().isoformat()
+    return ""
+
+
+def _ema20_source_status(label: str, path: Path, frame: pd.DataFrame, date_columns: Iterable[str], *, status: str = "") -> dict[str, Any]:
+    modified = ""
+    if path.exists():
+        try:
+            modified = pd.Timestamp.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            modified = ""
+    return {
+        "label": label,
+        "status": status or ("loaded" if path.exists() else "missing"),
+        "rows": int(len(frame)),
+        "as_of": _ema20_latest_date_text(frame, date_columns),
+        "modified": modified,
+        "file": str(path),
+    }
+
+
+def _ema20_merge_source(candidates: pd.DataFrame, source: pd.DataFrame, columns: list[str], *, default_exchange: str = "NSE", date_column: str = "") -> pd.DataFrame:
+    if candidates.empty or source.empty:
+        return candidates
+    prepared = _ema20_add_join_keys(source, default_exchange=default_exchange)
+    prepared = prepared[prepared["_join_symbol"].astype(str).str.len() > 0].copy()
+    if prepared.empty:
+        return candidates
+    if date_column and date_column in prepared.columns:
+        prepared["_source_sort_date"] = pd.to_datetime(prepared[date_column], errors="coerce")
+        prepared = prepared.sort_values("_source_sort_date", ascending=False, na_position="last")
+    available = ["_join_exchange", "_join_symbol", *[column for column in columns if column in prepared.columns]]
+    prepared = prepared.drop_duplicates(subset=["_join_exchange", "_join_symbol"], keep="first")
+    return candidates.merge(prepared[available], on=["_join_exchange", "_join_symbol"], how="left")
+
+
+def _ema20_confirmation_labels(row: pd.Series) -> str:
+    labels: list[str] = []
+    if _ema20_truthy_value(row.get("weekly_buy_signal")):
+        labels.append("Weekly BUY")
+    if _ema20_truthy_value(row.get("weekly_sell_signal")):
+        labels.append("Weekly SELL")
+    if _ema20_truthy_value(row.get("adx_crossover_pass")):
+        labels.append("ADX")
+    if _ema20_truthy_value(row.get("minervini_quality_pass")):
+        labels.append("Minervini")
+    if _ema20_truthy_value(row.get("knox_envelope_pass")):
+        labels.append("Knox")
+    return ", ".join(labels)
+
+
+def _enrich_ema20_candidates_with_confirmations(candidates: pd.DataFrame, data_root: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    if candidates.empty:
+        return candidates.copy(), {
+            "confirmation_sources": sources,
+            "candidates_with_any_confirmation": 0,
+            "candidates_with_double_confirmation": 0,
+            "candidates_with_weekly_buy": 0,
+            "candidates_with_weekly_sell": 0,
+            "candidates_with_adx_crossover": 0,
+            "candidates_with_minervini_quality": 0,
+            "candidates_with_adx_minervini": 0,
+            "candidates_with_weekly_adx": 0,
+            "candidates_with_weekly_minervini": 0,
+            "candidates_with_knox_envelope": 0,
+        }
+
+    working = candidates.drop(columns=list(EMA20_CONFIRMATION_COLUMNS), errors="ignore").copy()
+    working = _ema20_add_join_keys(working)
+
+    weekly_path = data_root / "signals" / "latest_filtered.csv"
+    weekly = _ema20_read_csv(weekly_path)
+    sources.append(_ema20_source_status("Weekly BUY/SELL", weekly_path, weekly, ("date", "latest_close_date")))
+    if not weekly.empty:
+        weekly_prepared = weekly.copy()
+        if "signal" in weekly_prepared.columns:
+            weekly_prepared["weekly_signal"] = weekly_prepared["signal"].fillna("").astype(str).str.upper().str.strip()
+            weekly_prepared = weekly_prepared[weekly_prepared["weekly_signal"].isin({"BUY", "SELL"})].copy()
+        else:
+            weekly_prepared["weekly_signal"] = ""
+        weekly_prepared["weekly_signal_date"] = weekly_prepared.get("date", pd.Series("", index=weekly_prepared.index))
+        weekly_prepared["weekly_timeframe"] = weekly_prepared.get("timeframe", pd.Series("", index=weekly_prepared.index))
+        weekly_prepared["weekly_volume_confirmation_ratio"] = weekly_prepared.get(
+            "volume_confirmation_ratio",
+            pd.Series(np.nan, index=weekly_prepared.index),
+        )
+        weekly_prepared["weekly_trend_confirmation"] = weekly_prepared.get(
+            "trend_confirmation",
+            pd.Series("", index=weekly_prepared.index),
+        )
+        working = _ema20_merge_source(
+            working,
+            weekly_prepared,
+            [
+                "weekly_signal",
+                "weekly_signal_date",
+                "weekly_timeframe",
+                "weekly_volume_confirmation_ratio",
+                "weekly_trend_confirmation",
+            ],
+            date_column="weekly_signal_date",
+        )
+    for column in ("weekly_signal", "weekly_signal_date", "weekly_timeframe", "weekly_trend_confirmation"):
+        if column not in working.columns:
+            working[column] = ""
+        working[column] = working[column].fillna("").astype(str)
+    weekly_signal = working["weekly_signal"].fillna("").astype(str).str.upper().str.strip()
+    working["weekly_buy_signal"] = weekly_signal.eq("BUY")
+    working["weekly_sell_signal"] = weekly_signal.eq("SELL")
+    working["weekly_signal_pass"] = working["weekly_buy_signal"] | working["weekly_sell_signal"]
+
+    adx_output = load_adx_di_outputs(_adx_di_dir(data_root))
+    adx_path = _adx_di_dir(data_root) / "latest_stock_stats.csv"
+    adx = adx_output.stock_stats.copy()
+    sources.append(_ema20_source_status("ADX Crossover", adx_path, adx, ("latest_close_date", "latest_cross_date")))
+    if not adx.empty:
+        adx["adx_crossover_pass"] = _ema20_bool_series(
+            adx["adx_shortlist_pass"] if "adx_shortlist_pass" in adx.columns else False,
+            index=adx.index,
+        )
+        adx["adx_signal_text"] = (
+            adx["di_plus_signal_text"].fillna("").astype(str)
+            if "di_plus_signal_text" in adx.columns
+            else np.where(adx["adx_crossover_pass"], "ADX shortlist", "")
+        )
+        if "trend_filter_pass" in adx.columns:
+            adx["adx_trend_filter_pass"] = _ema20_bool_series(adx["trend_filter_pass"])
+        else:
+            adx["adx_trend_filter_pass"] = False
+        if "quality_score" in adx.columns:
+            adx["adx_quality_score"] = adx["quality_score"]
+        else:
+            adx["adx_quality_score"] = np.nan
+        working = _ema20_merge_source(
+            working,
+            adx,
+            [
+                "adx_crossover_pass",
+                "adx_signal_text",
+                "latest_adx",
+                "latest_di_plus",
+                "latest_di_minus",
+                "latest_cross_date",
+                "adx_trend_filter_pass",
+                "adx_quality_score",
+            ],
+            date_column="latest_close_date",
+        )
+
+    minervini_output = load_minervini_quality_outputs(_minervini_quality_dir(data_root))
+    minervini_path = _minervini_quality_dir(data_root) / "latest_stock_stats.csv"
+    minervini = minervini_output.stock_stats.copy()
+    sources.append(_ema20_source_status("Minervini Quality", minervini_path, minervini, ("latest_date",)))
+    if not minervini.empty:
+        minervini["minervini_quality_pass"] = _ema20_bool_series(
+            minervini["quality_pass"] if "quality_pass" in minervini.columns else False,
+            index=minervini.index,
+        )
+        minervini["minervini_latest_date"] = minervini.get("latest_date", pd.Series("", index=minervini.index))
+        minervini["minervini_stock_quality_score"] = minervini.get("stock_quality_score", pd.Series(np.nan, index=minervini.index))
+        minervini["minervini_setup_quality_score"] = minervini.get("setup_quality_score", pd.Series(np.nan, index=minervini.index))
+        minervini["minervini_entry_quality_score"] = minervini.get("entry_quality_score", pd.Series(np.nan, index=minervini.index))
+        working = _ema20_merge_source(
+            working,
+            minervini,
+            [
+                "minervini_quality_pass",
+                "minervini_latest_date",
+                "minervini_stock_quality_score",
+                "minervini_setup_quality_score",
+                "minervini_entry_quality_score",
+            ],
+            date_column="minervini_latest_date",
+        )
+
+    knox_output = load_knox_envelope_outputs(_knox_envelope_dir(data_root))
+    knox_path = _knox_envelope_dir(data_root) / "latest_stock_stats.csv"
+    knox = knox_output.stock_stats.copy()
+    knox_status = ""
+    if knox_output.summary and knox_output.summary.get("logic_version") != KNOX_ENVELOPE_LOGIC_VERSION:
+        knox_status = "stale logic"
+        knox = pd.DataFrame()
+    sources.append(_ema20_source_status("Knoxville-Envelope", knox_path, knox, ("latest_date", "signal_date"), status=knox_status))
+    if not knox.empty:
+        knox["knox_combined_match"] = _ema20_bool_series(
+            knox["combined_match"] if "combined_match" in knox.columns else False,
+            index=knox.index,
+        )
+        knox["knox_envelope_pass"] = knox["knox_combined_match"]
+        if "confirmation_pass" in knox.columns:
+            knox["knox_confirmation_pass"] = _ema20_bool_series(knox["confirmation_pass"])
+        else:
+            knox["knox_confirmation_pass"] = False
+        if "cmf_pass" in knox.columns:
+            knox["knox_cmf_pass"] = _ema20_bool_series(knox["cmf_pass"])
+        else:
+            knox["knox_cmf_pass"] = False
+        if "sharpe_pass" in knox.columns:
+            knox["knox_sharpe_pass"] = _ema20_bool_series(knox["sharpe_pass"])
+        else:
+            knox["knox_sharpe_pass"] = False
+        knox["knox_signal_date"] = knox.get("signal_date", pd.Series("", index=knox.index))
+        knox["knox_signal_age_bars"] = knox.get("signal_age_bars", pd.Series(np.nan, index=knox.index))
+        working = _ema20_merge_source(
+            working,
+            knox,
+            [
+                "knox_envelope_pass",
+                "knox_combined_match",
+                "knox_signal_date",
+                "knox_signal_age_bars",
+                "knox_confirmation_pass",
+                "knox_cmf_pass",
+                "knox_sharpe_pass",
+            ],
+            date_column="latest_date",
+        )
+
+    for column in (
+        "adx_crossover_pass",
+        "adx_trend_filter_pass",
+        "minervini_quality_pass",
+        "knox_envelope_pass",
+        "knox_combined_match",
+        "knox_confirmation_pass",
+        "knox_cmf_pass",
+        "knox_sharpe_pass",
+    ):
+        if column not in working.columns:
+            working[column] = False
+        working[column] = _ema20_bool_series(working[column])
+
+    for column in ("adx_signal_text", "latest_cross_date", "minervini_latest_date", "knox_signal_date"):
+        if column not in working.columns:
+            working[column] = ""
+        working[column] = working[column].fillna("").astype(str)
+
+    weekly_pass = _ema20_bool_series(working["weekly_signal_pass"])
+    adx_pass = _ema20_bool_series(working["adx_crossover_pass"])
+    minervini_pass = _ema20_bool_series(working["minervini_quality_pass"])
+    knox_pass = _ema20_bool_series(working["knox_envelope_pass"])
+    working["confirmation_count"] = (
+        weekly_pass.astype(int)
+        + adx_pass.astype(int)
+        + minervini_pass.astype(int)
+        + knox_pass.astype(int)
+    )
+    working["double_confirmation_pass"] = working["confirmation_count"] >= 2
+    working["adx_minervini_confirmation_pass"] = adx_pass & minervini_pass
+    working["weekly_adx_confirmation_pass"] = weekly_pass & adx_pass
+    working["weekly_minervini_confirmation_pass"] = weekly_pass & minervini_pass
+    working["confirmation_summary"] = working.apply(_ema20_confirmation_labels, axis=1)
+
+    summary = {
+        "confirmation_sources": sources,
+        "candidates_with_any_confirmation": int((working["confirmation_count"] > 0).sum()),
+        "candidates_with_double_confirmation": int(_ema20_bool_series(working["double_confirmation_pass"]).sum()),
+        "candidates_with_weekly_buy": int(_ema20_bool_series(working["weekly_buy_signal"]).sum()),
+        "candidates_with_weekly_sell": int(_ema20_bool_series(working["weekly_sell_signal"]).sum()),
+        "candidates_with_adx_crossover": int(adx_pass.sum()),
+        "candidates_with_minervini_quality": int(minervini_pass.sum()),
+        "candidates_with_adx_minervini": int(_ema20_bool_series(working["adx_minervini_confirmation_pass"]).sum()),
+        "candidates_with_weekly_adx": int(_ema20_bool_series(working["weekly_adx_confirmation_pass"]).sum()),
+        "candidates_with_weekly_minervini": int(_ema20_bool_series(working["weekly_minervini_confirmation_pass"]).sum()),
+        "candidates_with_knox_envelope": int(knox_pass.sum()),
+    }
+    return working.drop(columns=["_join_exchange", "_join_symbol"], errors="ignore"), summary
+
+
+def _enrich_ema20_band_result_with_confirmations(result: Ema20BandStrategyResult, data_root: Path) -> Ema20BandStrategyResult:
+    candidates, confirmation_summary = _enrich_ema20_candidates_with_confirmations(result.candidates, data_root)
+    candidates = enrich_ema20_candidates_with_research_agents(
+        candidates,
+        stock_stats=result.stock_stats,
+        trades=result.trades,
+        storage=Storage(data_root),
+        as_of_date=result.summary.get("analysis_as_of_date") or result.summary.get("requested_as_of_date"),
+    )
+    summary = dict(result.summary)
+    summary.update(confirmation_summary)
+    if not candidates.empty and "agent_grade" in candidates.columns:
+        grade_counts = candidates["agent_grade"].fillna("").astype(str).value_counts()
+        summary["agent_top_research_candidates"] = int(grade_counts.get("A+", 0))
+        summary["agent_research_candidates"] = int(grade_counts.get("A", 0))
+        summary["agent_watchlist_candidates"] = int(grade_counts.get("B", 0))
+        summary["agent_low_priority_candidates"] = int(grade_counts.get("C", 0) + grade_counts.get("Wait", 0) + grade_counts.get("Avoid", 0) + grade_counts.get("Conflict", 0))
+        if "operator_activity_score" in candidates.columns:
+            operator_scores = pd.to_numeric(candidates["operator_activity_score"], errors="coerce")
+            operator_labels = candidates.get("operator_activity_label", pd.Series("", index=candidates.index)).fillna("").astype(str)
+            summary["operator_activity_watch_candidates"] = int((operator_scores >= 60.0).sum())
+            summary["operator_activity_strong_candidates"] = int((operator_scores >= 75.0).sum())
+            summary["operator_distribution_watch_candidates"] = int(operator_labels.str.lower().str.contains("distribution|churn", regex=True).sum())
+    else:
+        summary["agent_top_research_candidates"] = 0
+        summary["agent_research_candidates"] = 0
+        summary["agent_watchlist_candidates"] = 0
+        summary["agent_low_priority_candidates"] = 0
+        summary["operator_activity_watch_candidates"] = 0
+        summary["operator_activity_strong_candidates"] = 0
+        summary["operator_distribution_watch_candidates"] = 0
+    return Ema20BandStrategyResult(
+        summary=summary,
+        candidates=candidates,
+        strategy_stats=result.strategy_stats,
+        yearly_stats=result.yearly_stats,
+        stock_stats=result.stock_stats,
+        trades=result.trades,
+    )
+
+
+def _apply_ema20_confirmation_filter(frame: pd.DataFrame, confirmation_filter: str) -> pd.DataFrame:
+    value = str(confirmation_filter or "").strip().lower()
+    if frame.empty or not value:
+        return frame
+    if value == "any":
+        return frame[pd.to_numeric(frame.get("confirmation_count", 0), errors="coerce").fillna(0) > 0].copy()
+    if value == "double":
+        return frame[pd.to_numeric(frame.get("confirmation_count", 0), errors="coerce").fillna(0) >= 2].copy()
+    column_by_filter = {
+        "weekly_buy": "weekly_buy_signal",
+        "weekly_sell": "weekly_sell_signal",
+        "adx": "adx_crossover_pass",
+        "minervini": "minervini_quality_pass",
+        "adx_minervini": "adx_minervini_confirmation_pass",
+        "weekly_adx": "weekly_adx_confirmation_pass",
+        "weekly_minervini": "weekly_minervini_confirmation_pass",
+        "knox": "knox_envelope_pass",
+    }
+    column = column_by_filter.get(value)
+    if not column or column not in frame.columns:
+        return frame
+    return frame[_ema20_bool_series(frame[column])].copy()
+
+
+def _ema20_current_candidates_for_request(result: Ema20BandStrategyResult, request: Request) -> pd.DataFrame:
+    candidates = result.candidates.copy()
+    if candidates.empty:
+        return candidates
+    stock_search = request.query_params.get("stock_search", "").strip()
+    pattern_filter = request.query_params.get("pattern", "").strip()
+    confirmation_filter = request.query_params.get("confirmation", "").strip().lower()
+    candidates = _apply_stock_search(candidates, stock_search)
+    if pattern_filter and "pattern" in candidates.columns:
+        candidates = candidates[candidates["pattern"].astype(str).eq(pattern_filter)].copy()
+    candidates = _apply_ema20_confirmation_filter(candidates, confirmation_filter)
+    sort_cols = [column for column in ("confirmation_count", "candidate_score", "sessions_since_signal", "symbol") if column in candidates.columns]
+    if sort_cols:
+        candidates = candidates.sort_values(sort_cols, ascending=[False, False, True, True][: len(sort_cols)], na_position="last")
+    return candidates
+
+
+def _ema20_current_candidates_download_href(request: Request, *, stock_search: str, pattern_filter: str, confirmation_filter: str) -> str:
+    params: list[str] = []
+    token = request.query_params.get("token", "").strip()
+    if token:
+        params.append(f"token={quote(token)}")
+    if stock_search:
+        params.append(f"stock_search={quote(stock_search)}")
+    if pattern_filter:
+        params.append(f"pattern={quote(pattern_filter)}")
+    if confirmation_filter:
+        params.append(f"confirmation={quote(confirmation_filter)}")
+    return "/ema20-band-strategy/candidates.csv" + (f"?{'&'.join(params)}" if params else "")
+
+
+def _load_emax_band_outputs(data_root: Path, *, include_trades: bool = False) -> EmaBandOptimizationResult:
+    output_dir = _emax_band_strategy_dir(data_root)
+    summary_path = output_dir / "summary.json"
+    summary: dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            summary = {}
+    trades = _ema20_read_csv(output_dir / "trades.csv") if include_trades else pd.DataFrame()
+    candidates = _ema20_read_csv(output_dir / "daily_prediction_candidates.csv")
+    if candidates.empty:
+        candidates = _ema20_read_csv(output_dir / "current_candidates.csv")
+    return EmaBandOptimizationResult(
+        summary=summary,
+        best_by_stock=_ema20_read_csv(output_dir / "best_by_stock.csv"),
+        robust_best_by_stock=_ema20_read_csv(output_dir / "robust_best_by_stock.csv"),
+        ema_stats=_ema20_read_csv(output_dir / "ema_stats.csv"),
+        current_candidates=candidates,
+        trades=trades,
+    )
+
+
+def _save_emax_daily_candidates(data_root: Path, candidates: pd.DataFrame, summary_updates: dict[str, Any]) -> None:
+    output_dir = _emax_band_strategy_dir(data_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidates.to_csv(output_dir / "daily_prediction_candidates.csv", index=False)
+    summary_path = output_dir / "summary.json"
+    summary: dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            summary = {}
+    summary.update(summary_updates)
+    summary_path.write_text(json.dumps(_json_safe(summary), indent=2), encoding="utf-8")
+
+
+EMAX_DRAWDOWN_COLUMNS: tuple[str, ...] = (
+    "max_drawdown_pct",
+    "max_drawdown_peak_date",
+    "max_drawdown_trough_date",
+    "max_drawdown_peak_to_trough_sessions",
+    "max_drawdown_recovery_date",
+    "max_drawdown_duration_sessions",
+    "max_drawdown_duration_peak_date",
+    "max_drawdown_duration_end_date",
+    "max_drawdown_duration_recovered",
+    "current_drawdown_pct",
+    "drawdown_latest_date",
+    "drawdown_history_sessions",
+)
+
+
+def _emax_drawdown_as_of(summary: dict[str, Any]) -> str:
+    return str(
+        summary.get("emax_current_as_of_date")
+        or summary.get("as_of_date")
+        or _latest_completed_nse_calendar_date().isoformat()
+    )
+
+
+def _emax_drawdown_metrics_from_candles(candles: pd.DataFrame, as_of_date: str) -> dict[str, Any]:
+    if candles.empty or "date" not in candles.columns or "close" not in candles.columns:
+        return {}
+    frame = candles[["date", "close"]].copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame[frame["date"].notna() & frame["close"].gt(0)].copy()
+    if as_of_date:
+        try:
+            as_of_ts = pd.Timestamp(as_of_date).normalize()
+            frame = frame[frame["date"] <= as_of_ts].copy()
+        except (TypeError, ValueError):
+            pass
+    frame = frame.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    if frame.empty:
+        return {}
+
+    closes = frame["close"].astype(float)
+    dates = frame["date"]
+    running_peak = closes.cummax()
+    drawdown_pct = ((closes / running_peak) - 1.0) * 100.0
+    trough_pos = int(drawdown_pct.to_numpy().argmin())
+    peak_close = float(running_peak.iloc[trough_pos])
+    peak_candidates = frame.iloc[: trough_pos + 1][closes.iloc[: trough_pos + 1].eq(peak_close)]
+    peak_pos = int(peak_candidates.index[-1]) if not peak_candidates.empty else 0
+    recovery_date = ""
+    if trough_pos + 1 < len(frame):
+        recovered = frame.iloc[trough_pos + 1 :][closes.iloc[trough_pos + 1 :].ge(peak_close)]
+        if not recovered.empty:
+            recovery_date = pd.Timestamp(recovered.iloc[0]["date"]).date().isoformat()
+
+    longest_duration = 0
+    longest_peak_pos = 0
+    longest_end_pos = 0
+    longest_recovered = False
+    active_peak_pos = 0
+    active_peak_close = float(closes.iloc[0])
+    underwater = False
+    for position in range(1, len(frame)):
+        close = float(closes.iloc[position])
+        if close >= active_peak_close:
+            if underwater:
+                duration = position - active_peak_pos
+                if duration > longest_duration:
+                    longest_duration = duration
+                    longest_peak_pos = active_peak_pos
+                    longest_end_pos = position
+                    longest_recovered = True
+                underwater = False
+            active_peak_pos = position
+            active_peak_close = close
+            continue
+        underwater = True
+        duration = position - active_peak_pos
+        if duration > longest_duration:
+            longest_duration = duration
+            longest_peak_pos = active_peak_pos
+            longest_end_pos = position
+            longest_recovered = False
+
+    return {
+        "max_drawdown_pct": round(float(drawdown_pct.iloc[trough_pos]), 2),
+        "max_drawdown_peak_date": pd.Timestamp(dates.iloc[peak_pos]).date().isoformat(),
+        "max_drawdown_trough_date": pd.Timestamp(dates.iloc[trough_pos]).date().isoformat(),
+        "max_drawdown_peak_to_trough_sessions": int(max(0, trough_pos - peak_pos)),
+        "max_drawdown_recovery_date": recovery_date,
+        "max_drawdown_duration_sessions": int(longest_duration),
+        "max_drawdown_duration_peak_date": pd.Timestamp(dates.iloc[longest_peak_pos]).date().isoformat(),
+        "max_drawdown_duration_end_date": pd.Timestamp(dates.iloc[longest_end_pos]).date().isoformat(),
+        "max_drawdown_duration_recovered": bool(longest_recovered),
+        "current_drawdown_pct": round(float(drawdown_pct.iloc[-1]), 2),
+        "drawdown_latest_date": pd.Timestamp(dates.iloc[-1]).date().isoformat(),
+        "drawdown_history_sessions": int(len(frame)),
+    }
+
+
+def _emax_drawdown_metrics_for_rows(data_root: Path, frames: Iterable[pd.DataFrame], as_of_date: str) -> pd.DataFrame:
+    keys: set[tuple[str, str]] = set()
+    for frame in frames:
+        if frame.empty or "symbol" not in frame.columns:
+            continue
+        exchange_values = frame["exchange"] if "exchange" in frame.columns else pd.Series("NSE", index=frame.index)
+        for exchange, symbol in zip(exchange_values, frame["symbol"], strict=False):
+            symbol_text = str(symbol or "").strip().upper()
+            if not symbol_text:
+                continue
+            exchange_text = str(exchange or "NSE").strip().upper() or "NSE"
+            keys.add((exchange_text, symbol_text))
+
+    if not keys:
+        return pd.DataFrame(columns=["exchange", "symbol", *EMAX_DRAWDOWN_COLUMNS])
+
+    safe_as_of = re.sub(r"[^0-9A-Za-z_-]+", "_", str(as_of_date or "latest")).strip("_") or "latest"
+    cache_path = _emax_band_strategy_dir(data_root) / f"drawdown_metrics_{safe_as_of}.csv"
+    cached = _ema20_read_csv(cache_path)
+    if not cached.empty and {"exchange", "symbol"}.issubset(cached.columns):
+        for column in EMAX_DRAWDOWN_COLUMNS:
+            if column not in cached.columns:
+                cached[column] = np.nan
+        cached["exchange"] = cached["exchange"].fillna("NSE").astype(str).str.strip().str.upper()
+        cached["symbol"] = cached["symbol"].fillna("").astype(str).str.strip().str.upper()
+        cached = cached.drop_duplicates(subset=["exchange", "symbol"], keep="last")
+    else:
+        cached = pd.DataFrame(columns=["exchange", "symbol", *EMAX_DRAWDOWN_COLUMNS])
+
+    cached_keys = set(zip(cached["exchange"], cached["symbol"], strict=False)) if not cached.empty else set()
+    missing_keys = keys - cached_keys
+    if not missing_keys:
+        return cached[cached.apply(lambda row: (row["exchange"], row["symbol"]) in keys, axis=1)].copy()
+
+    storage = Storage(data_root)
+    rows: list[dict[str, Any]] = []
+    for exchange, symbol in sorted(missing_keys):
+        metrics = _emax_drawdown_metrics_from_candles(storage.load_candles(exchange, symbol, "1D"), as_of_date)
+        if not metrics:
+            continue
+        rows.append({"exchange": exchange, "symbol": symbol, **metrics})
+    new_metrics = pd.DataFrame(rows, columns=["exchange", "symbol", *EMAX_DRAWDOWN_COLUMNS])
+    if cached.empty:
+        metrics = new_metrics
+    elif new_metrics.empty:
+        metrics = cached
+    else:
+        metrics = pd.concat([cached, new_metrics], ignore_index=True)
+    if not metrics.empty:
+        metrics["exchange"] = metrics["exchange"].fillna("NSE").astype(str).str.strip().str.upper()
+        metrics["symbol"] = metrics["symbol"].fillna("").astype(str).str.strip().str.upper()
+        metrics = metrics.drop_duplicates(subset=["exchange", "symbol"], keep="last").sort_values(["exchange", "symbol"])
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp")
+        try:
+            metrics.to_csv(temporary, index=False)
+            temporary.replace(cache_path)
+        finally:
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+    if metrics.empty:
+        return pd.DataFrame(columns=["exchange", "symbol", *EMAX_DRAWDOWN_COLUMNS])
+    return metrics[metrics.apply(lambda row: (row["exchange"], row["symbol"]) in keys, axis=1)].copy()
+
+
+def _merge_emax_drawdown_metrics(frame: pd.DataFrame, metrics: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or metrics.empty:
+        return frame.copy()
+    result = frame.drop(columns=list(EMAX_DRAWDOWN_COLUMNS), errors="ignore").copy()
+    result["_drawdown_exchange"] = (
+        result["exchange"].fillna("NSE").astype(str).str.strip().str.upper()
+        if "exchange" in result.columns
+        else "NSE"
+    )
+    result["_drawdown_symbol"] = result["symbol"].fillna("").astype(str).str.strip().str.upper()
+    prepared = metrics.copy()
+    prepared["_drawdown_exchange"] = prepared["exchange"].fillna("NSE").astype(str).str.strip().str.upper()
+    prepared["_drawdown_symbol"] = prepared["symbol"].fillna("").astype(str).str.strip().str.upper()
+    prepared = prepared.drop(columns=["exchange", "symbol"], errors="ignore")
+    result = result.merge(
+        prepared,
+        on=["_drawdown_exchange", "_drawdown_symbol"],
+        how="left",
+    )
+    return result.drop(columns=["_drawdown_exchange", "_drawdown_symbol"], errors="ignore")
+
+
+def _add_emax_drawdowns_to_outputs(
+    outputs: EmaBandOptimizationResult,
+    data_root: Path,
+) -> EmaBandOptimizationResult:
+    metrics = _emax_drawdown_metrics_for_rows(
+        data_root,
+        (outputs.best_by_stock, outputs.robust_best_by_stock, outputs.current_candidates),
+        _emax_drawdown_as_of(outputs.summary),
+    )
+    summary = dict(outputs.summary)
+    summary["drawdown_metrics_stocks"] = int(len(metrics))
+    summary["drawdown_metrics_as_of_date"] = _emax_drawdown_as_of(outputs.summary)
+    return EmaBandOptimizationResult(
+        summary=summary,
+        best_by_stock=_merge_emax_drawdown_metrics(outputs.best_by_stock, metrics),
+        robust_best_by_stock=_merge_emax_drawdown_metrics(outputs.robust_best_by_stock, metrics),
+        ema_stats=outputs.ema_stats,
+        current_candidates=_merge_emax_drawdown_metrics(outputs.current_candidates, metrics),
+        trades=outputs.trades,
+    )
+
+
+def _emax_analysis_as_of_date(outputs: EmaBandOptimizationResult, requested_as_of_date: str) -> str:
+    try:
+        requested_ts = pd.Timestamp(requested_as_of_date).normalize()
+    except (TypeError, ValueError):
+        requested_ts = pd.Timestamp(date.today()).normalize()
+    try:
+        optimized_ts = pd.Timestamp(outputs.summary.get("as_of_date") or requested_as_of_date).normalize()
+    except (TypeError, ValueError):
+        optimized_ts = requested_ts
+    return min(requested_ts, optimized_ts).date().isoformat()
+
+
+def _float_matches_saved(value: Any, expected: float) -> bool:
+    try:
+        return abs(float(value) - float(expected)) <= 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _emax_saved_result_matches_request(
+    outputs: EmaBandOptimizationResult,
+    requested_as_of_date: str,
+    current_signal_lookback_sessions: int,
+    profit_target_pct: float,
+    stop_loss_pct: float,
+    stop_buffer_pct: float,
+    entry_price_mode: str,
+) -> bool:
+    if outputs.best_by_stock.empty or outputs.current_candidates.empty:
+        return False
+    summary = outputs.summary
+    analysis_as_of_date = _emax_analysis_as_of_date(outputs, requested_as_of_date)
+    try:
+        saved_lookback = int(summary.get("current_signal_lookback_sessions"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        str(summary.get("emax_current_as_of_date") or "") == analysis_as_of_date
+        and saved_lookback == int(current_signal_lookback_sessions)
+        and _float_matches_saved(summary.get("profit_target_pct"), profit_target_pct)
+        and _float_matches_saved(summary.get("stop_loss_pct"), stop_loss_pct)
+        and _float_matches_saved(summary.get("stop_buffer_pct"), stop_buffer_pct)
+        and str(summary.get("entry_price_mode") or "next_open").strip().lower() == entry_price_mode
+    )
+
+
+def _enrich_emax_candidates(candidates: pd.DataFrame, data_root: Path, summary: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+    enriched, confirmation_summary = _enrich_ema20_candidates_with_confirmations(candidates, data_root)
+    enriched = enrich_ema20_candidates_with_research_agents(
+        enriched,
+        stock_stats=pd.DataFrame(),
+        trades=pd.DataFrame(),
+        storage=Storage(data_root),
+        as_of_date=summary.get("emax_current_as_of_date") or summary.get("as_of_date"),
+    )
+    updated_summary = dict(summary)
+    updated_summary.update(confirmation_summary)
+    updated_summary["current_candidates"] = int(len(enriched))
+    if "robust_best_ema" in enriched.columns:
+        updated_summary["robust_current_candidates"] = int(_ema20_bool_series(enriched["robust_best_ema"]).sum())
+    else:
+        updated_summary["robust_current_candidates"] = 0
+    if "agent_grade" in enriched.columns:
+        grade_counts = enriched["agent_grade"].fillna("").astype(str).value_counts()
+        updated_summary["agent_top_research_candidates"] = int(grade_counts.get("A+", 0))
+        updated_summary["agent_research_candidates"] = int(grade_counts.get("A", 0))
+        updated_summary["agent_watchlist_candidates"] = int(grade_counts.get("B", 0))
+    else:
+        updated_summary["agent_top_research_candidates"] = 0
+        updated_summary["agent_research_candidates"] = 0
+        updated_summary["agent_watchlist_candidates"] = 0
+    if "operator_activity_score" in enriched.columns:
+        operator_scores = pd.to_numeric(enriched["operator_activity_score"], errors="coerce")
+        operator_labels = enriched.get("operator_activity_label", pd.Series("", index=enriched.index)).fillna("").astype(str)
+        updated_summary["operator_activity_watch_candidates"] = int((operator_scores >= 60.0).sum())
+        updated_summary["operator_activity_strong_candidates"] = int((operator_scores >= 75.0).sum())
+        updated_summary["operator_distribution_watch_candidates"] = int(operator_labels.str.lower().str.contains("distribution|churn", regex=True).sum())
+    else:
+        updated_summary["operator_activity_watch_candidates"] = 0
+        updated_summary["operator_activity_strong_candidates"] = 0
+        updated_summary["operator_distribution_watch_candidates"] = 0
+    return enriched, updated_summary
+
+
+def _apply_emax_candidate_filters(candidates: pd.DataFrame, request: Request) -> pd.DataFrame:
+    if candidates.empty:
+        return candidates
+    stock_search = request.query_params.get("stock_search", "").strip()
+    pattern_filter = request.query_params.get("pattern", "").strip()
+    strategy_filter = request.query_params.get("strategy", "").strip()
+    confirmation_filter = request.query_params.get("confirmation", "").strip().lower()
+    robust_only = _truthy_param(request.query_params.get("robust_only", ""), default=False)
+    candidates = _apply_stock_search(candidates, stock_search)
+    if robust_only and "robust_best_ema" in candidates.columns:
+        candidates = candidates[_ema20_bool_series(candidates["robust_best_ema"])].copy()
+    if pattern_filter and "pattern" in candidates.columns:
+        candidates = candidates[candidates["pattern"].astype(str).eq(pattern_filter)].copy()
+    if strategy_filter and "optimized_strategy" in candidates.columns:
+        candidates = candidates[candidates["optimized_strategy"].astype(str).eq(strategy_filter)].copy()
+    candidates = _apply_ema20_confirmation_filter(candidates, confirmation_filter)
+    sort_cols = [
+        column
+        for column in (
+            "robust_best_ema",
+            "daily_prediction_score",
+            "confirmation_count",
+            "candidate_score",
+            "sessions_since_signal",
+            "symbol",
+        )
+        if column in candidates.columns
+    ]
+    if sort_cols:
+        ascending = [False, False, False, False, True, True][: len(sort_cols)]
+        candidates = candidates.sort_values(sort_cols, ascending=ascending, na_position="last")
+    return candidates
+
+
+def _emax_candidates_download_href(request: Request) -> str:
+    params: list[str] = []
+    for key in ("token", "stock_search", "pattern", "strategy", "confirmation", "robust_only"):
+        value = request.query_params.get(key, "").strip()
+        if value:
+            params.append(f"{key}={quote(value)}")
+    return "/emax-band-strategy/candidates.csv" + (f"?{'&'.join(params)}" if params else "")
+
+
+def _run_emax_band_strategy_job(
+    job_id: str,
+    data_root: Path,
+    query_suffix: str,
+    as_of_date: str,
+    current_signal_lookback_sessions: int,
+    profit_target_pct: float,
+    stop_loss_pct: float,
+    stop_buffer_pct: float,
+    entry_price_mode: str,
+) -> None:
+    def progress(payload: dict[str, Any]) -> None:
+        total = int(payload.get("total") or 0)
+        completed = int(payload.get("completed") or 0)
+        percent = int((completed / total) * 100) if total else 0
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase=payload.get("phase", "Running EMAX screener"),
+            completed=completed,
+            total=total,
+            percent=max(0, min(percent, 100)),
+            current_symbol=payload.get("current_symbol", ""),
+            current_exchange=payload.get("current_exchange", ""),
+        )
+
+    try:
+        outputs = _load_emax_band_outputs(data_root, include_trades=False)
+        if outputs.best_by_stock.empty:
+            raise RuntimeError("Run the EMAX optimization first; best_by_stock.csv is missing or empty.")
+        requested_ts = pd.Timestamp(as_of_date).normalize()
+        optimized_ts = pd.Timestamp(outputs.summary.get("as_of_date") or as_of_date).normalize()
+        analysis_as_of_date = min(requested_ts, optimized_ts).date().isoformat()
+        candidates = build_emax_current_candidates(
+            Storage(data_root),
+            outputs.best_by_stock,
+            as_of_date=analysis_as_of_date,
+            robust_best_by_stock=outputs.robust_best_by_stock,
+            lookback_sessions=current_signal_lookback_sessions,
+            profit_target_pct=profit_target_pct,
+            stop_loss_pct=stop_loss_pct,
+            stop_buffer_pct=stop_buffer_pct,
+            entry_price_mode=entry_price_mode,
+            required_latest_date=analysis_as_of_date,
+            progress_callback=progress,
+        )
+        summary_updates = {
+            "requested_emax_as_of_date": as_of_date,
+            "emax_current_as_of_date": analysis_as_of_date,
+            "current_signal_lookback_sessions": int(current_signal_lookback_sessions),
+            "profit_target_pct": float(profit_target_pct),
+            "stop_loss_pct": float(stop_loss_pct),
+            "stop_buffer_pct": float(stop_buffer_pct),
+            "entry_price_mode": entry_price_mode,
+            "current_candidates": int(len(candidates)),
+            "robust_current_candidates": int(_ema20_bool_series(candidates["robust_best_ema"]).sum()) if "robust_best_ema" in candidates.columns else 0,
+        }
+        _save_emax_daily_candidates(data_root, candidates, summary_updates)
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=int(len(outputs.best_by_stock)),
+            total=int(len(outputs.best_by_stock)),
+            percent=100,
+            current_symbol="",
+            current_exchange="",
+            summary=summary_updates,
+            redirect_url=f"/emax-band-strategy?study_ran=1{query_suffix}",
+        )
+    except Exception as exc:
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/emax-band-strategy?study_error={quote(str(exc)[:500])}{query_suffix}",
+        )
+
+
 def _run_ema20_band_strategy_job(
     job_id: str,
     data_root: Path,
@@ -6251,6 +7829,7 @@ def _run_ema20_band_strategy_job(
         result.summary["universe_label"] = str(universe_meta["universe_label"])
         result.summary["constituent_source_url"] = ", ".join(universe_meta["source_urls"])
         result.summary["constituent_source_file"] = ", ".join(universe_meta["source_files"])
+        result = _enrich_ema20_band_result_with_confirmations(result, data_root)
         save_ema20_band_strategy_outputs(result, _ema20_band_strategy_dir(data_root))
         _set_scan_job(
             job_id,
@@ -7348,6 +8927,111 @@ def _knox_envelope_dir(data_root: Path) -> Path:
     return path
 
 
+def _order_block_retest_dir(data_root: Path) -> Path:
+    path = data_root / "order_block_retest"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _order_block_candidate_display(
+    candidates: pd.DataFrame,
+    events: pd.DataFrame,
+    *,
+    require_active_zone: bool = True,
+) -> pd.DataFrame:
+    display = candidates.copy()
+    if display.empty:
+        return display
+
+    side = display.get("side", pd.Series("", index=display.index)).astype(str).str.upper()
+    display["signal_match"] = np.where(
+        side.eq("BULLISH"),
+        "Green tick + green block",
+        "Red tick + red block",
+    )
+    if "tick_date" not in display.columns:
+        display["tick_date"] = display.get("retest_date", "")
+    if "confirmation_date" not in display.columns:
+        display["confirmation_date"] = display.get("event_date", "")
+    if "block_bos_date" not in display.columns:
+        display["block_bos_date"] = ""
+
+    missing_bos = display["block_bos_date"].fillna("").astype(str).str.strip().eq("")
+    if events.empty:
+        return display
+
+    retests = events[
+        events.get("event_type", pd.Series("", index=events.index))
+        .astype(str)
+        .isin({"BULLISH_RETEST", "BEARISH_RETEST"})
+    ].copy()
+    required = {"symbol", "side", "event_date", "observation_date", "bos_date"}
+    if retests.empty or not required.issubset(retests.columns):
+        return display
+    if require_active_zone and "active" in retests.columns:
+        retests = retests[_truthy_series(retests["active"])]
+    if retests.empty:
+        display.attrs["alignment_excluded_count"] = len(display)
+        return display.iloc[0:0].copy()
+
+    def date_text(series: pd.Series) -> pd.Series:
+        return (
+            pd.to_datetime(series, errors="coerce", format="mixed")
+            .dt.strftime("%Y-%m-%d")
+            .fillna("")
+        )
+
+    retests["_key"] = list(
+        zip(
+            retests["symbol"].astype(str).str.upper(),
+            retests["side"].astype(str).str.upper(),
+            date_text(retests["event_date"]),
+            date_text(retests["observation_date"]),
+        )
+    )
+    if "block_id" in retests.columns:
+        retests = retests.sort_values("block_id")
+    retests = retests.drop_duplicates("_key", keep="last")
+    bos_lookup = dict(zip(retests["_key"], date_text(retests["bos_date"])))
+    event_index_lookup = dict(zip(retests["_key"], retests["event_index"]))
+
+    candidate_keys = list(
+        zip(
+            display.get("symbol", pd.Series("", index=display.index)).astype(str).str.upper(),
+            side,
+            date_text(display["confirmation_date"]),
+            date_text(display["tick_date"]),
+        )
+    )
+    resolved = pd.Series(
+        [bos_lookup.get(key, "") for key in candidate_keys],
+        index=display.index,
+    )
+    display.loc[missing_bos, "block_bos_date"] = resolved[missing_bos]
+
+    retests["event_index"] = pd.to_numeric(retests["event_index"], errors="coerce")
+    latest_event_index = retests.groupby("symbol")["event_index"].max().to_dict()
+    latest_rows = retests[
+        retests["event_index"].eq(retests["symbol"].map(latest_event_index))
+    ]
+    latest_sides = (
+        latest_rows.groupby("symbol")["side"]
+        .agg(lambda values: frozenset(values.astype(str).str.upper()))
+        .to_dict()
+    )
+    aligned = pd.Series(
+        [
+            event_index_lookup.get(key) == latest_event_index.get(str(symbol))
+            and latest_sides.get(str(symbol), frozenset()) == frozenset({str(row_side).upper()})
+            for key, symbol, row_side in zip(candidate_keys, display["symbol"], side)
+        ],
+        index=display.index,
+    )
+    filtered = display[aligned].copy()
+    filtered.attrs["alignment_excluded_count"] = int((~aligned).sum())
+    return filtered
+
+
 def _knox_recovery_dir(data_root: Path) -> Path:
     path = data_root / "knox_recovery"
     path.mkdir(parents=True, exist_ok=True)
@@ -7506,6 +9190,106 @@ def _load_latest_backtest(data_root: Path) -> dict[str, Any]:
     }
 
 
+def _summary_int(summary: dict[str, Any], key: str, default: int) -> int:
+    try:
+        value = int(float(summary.get(key, default)))
+    except (TypeError, ValueError):
+        return default
+    return value
+
+
+def _summary_float(summary: dict[str, Any], key: str, default: float) -> float:
+    try:
+        return float(summary.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _request_bounded_float(
+    request: Request,
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = request.query_params.get(name, "").strip()
+    if not value:
+        parsed = default
+    else:
+        try:
+            parsed = float(value)
+        except ValueError:
+            parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _bounded_int_from_form(
+    form: Any,
+    name: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    value = str(form.get(name, "")).strip()
+    try:
+        parsed = int(value) if value else default
+    except ValueError:
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _bounded_float_from_form(
+    form: Any,
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = str(form.get(name, "")).strip()
+    try:
+        parsed = float(value) if value else default
+    except ValueError:
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _format_backtest_table_dates(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    formatted = frame.copy()
+    for column in (
+        "buy_date",
+        "sell_date",
+        "latest_date",
+        "max_gain_date",
+        "max_drawdown_peak_date",
+        "max_drawdown_trough_date",
+        "max_drawdown_recovery_date",
+    ):
+        if column in formatted.columns:
+            formatted[column] = pd.to_datetime(formatted[column], errors="coerce").dt.strftime("%Y-%m-%d")
+            formatted[column] = formatted[column].fillna("")
+    return formatted
+
+
 def _fetch_and_store_big_bull_deals(dashboard_token: str = "", sensitivity: str = "") -> RedirectResponse:
     params: list[str] = []
     try:
@@ -7545,6 +9329,117 @@ def fetch_big_bull_deals_get(request: Request) -> RedirectResponse:
 @app.get("/health", response_class=PlainTextResponse)
 def health() -> str:
     return "ok"
+
+
+@app.get("/morningstar-fair-value", response_class=HTMLResponse)
+def morningstar_fair_value_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    as_of_date = request.query_params.get("as_of_date", date.today().isoformat()).strip()
+    symbols_text = request.query_params.get("symbols", "").strip()
+    delay_seconds = _bounded_float_value(
+        request.query_params.get("delay_seconds", MORNINGSTAR_DEFAULT_DELAY_SECONDS),
+        MORNINGSTAR_DEFAULT_DELAY_SECONDS,
+    )
+    return templates.TemplateResponse(
+        "morningstar_fair_value.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", "").strip(),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "symbols_text": symbols_text,
+            "as_of_date": as_of_date,
+            "delay_seconds": delay_seconds,
+            "rows": [],
+            "qualified_rows": [],
+            "ran": False,
+            "error": "",
+            "success_count": 0,
+            "error_count": 0,
+            "qualified_count": 0,
+            "fetch_elapsed_seconds": None,
+            "fv_premium_threshold_pct": MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+            "fv_change_threshold_pct": MORNINGSTAR_MIN_FV_CHANGE_PCT,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/morningstar-fair-value", response_class=HTMLResponse)
+async def run_morningstar_fair_value_lookup(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    form = await request.form()
+    symbols_text = str(form.get("symbols", "")).strip()
+    as_of_text = str(form.get("as_of_date", "")).strip()
+    delay_seconds = _bounded_float_value(
+        form.get("delay_seconds", MORNINGSTAR_DEFAULT_DELAY_SECONDS),
+        MORNINGSTAR_DEFAULT_DELAY_SECONDS,
+    )
+    rows: list[dict[str, Any]] = []
+    error = ""
+    target_date = date.today()
+    fetch_elapsed_seconds: float | None = None
+    try:
+        target_date = _morningstar_target_date(as_of_text)
+        symbols = _parse_morningstar_symbols(symbols_text)
+        if not symbols:
+            raise MorningstarFairValueError("Enter at least one stock symbol.")
+        started_at = time.monotonic()
+        rows = _fetch_morningstar_fair_value_rows(
+            symbols,
+            as_of_date=target_date,
+            delay_seconds=delay_seconds,
+        )
+        fetch_elapsed_seconds = time.monotonic() - started_at
+    except MorningstarFairValueError as exc:
+        error = str(exc)
+
+    qualified_rows = _morningstar_qualified_rows(rows)
+    success_count = sum(1 for row in rows if row.get("status") == "OK")
+    error_count = sum(1 for row in rows if row.get("status") != "OK")
+    return templates.TemplateResponse(
+        "morningstar_fair_value.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", "").strip(),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "symbols_text": symbols_text,
+            "as_of_date": target_date.isoformat() if not error else as_of_text,
+            "delay_seconds": delay_seconds,
+            "rows": rows,
+            "qualified_rows": qualified_rows,
+            "ran": True,
+            "error": error,
+            "success_count": success_count,
+            "error_count": error_count,
+            "qualified_count": len(qualified_rows),
+            "fetch_elapsed_seconds": fetch_elapsed_seconds,
+            "fv_premium_threshold_pct": MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+            "fv_change_threshold_pct": MORNINGSTAR_MIN_FV_CHANGE_PCT,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
 
 
 @app.get("/ohlcv-download", response_class=HTMLResponse)
@@ -7692,17 +9587,194 @@ def _temporarily_removed_response(request: Request, page_name: str) -> HTMLRespo
 
 @app.get("/backtest", response_class=HTMLResponse)
 def backtest_page(request: Request) -> HTMLResponse:
-    return _temporarily_removed_response(request, "Backtest")
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    config, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    common_filter_context = _common_filter_context(request, selected_sensitivity, config, data_root)
+    latest = _load_latest_backtest(data_root)
+    summary = latest["summary"]
+
+    default_in_sample_years = _summary_int(summary, "in_sample_years", DEFAULT_IN_SAMPLE_YEARS)
+    default_out_sample_months = _summary_int(summary, "out_of_sample_months", DEFAULT_OUT_OF_SAMPLE_MONTHS)
+    default_min_sharpe = _summary_float(summary, "min_sharpe_ratio", DEFAULT_MIN_SHARPE_RATIO)
+    as_of_date = request.query_params.get("as_of_date", "").strip() or str(summary.get("requested_as_of_date", "") or "")
+    in_sample_years = _request_int(
+        request,
+        "in_sample_years",
+        default_in_sample_years,
+        minimum=1,
+        maximum=10,
+    )
+    out_of_sample_months = _request_int(
+        request,
+        "out_of_sample_months",
+        default_out_sample_months,
+        minimum=1,
+        maximum=24,
+    )
+    min_sharpe_ratio = _request_bounded_float(
+        request,
+        "min_sharpe_ratio",
+        default_min_sharpe,
+        minimum=0,
+        maximum=20,
+    )
+
+    stock_stats = latest["stock_stats"].copy()
+    if not stock_stats.empty:
+        if "meets_sharpe_gate" in stock_stats.columns:
+            stock_stats["meets_sharpe_gate"] = stock_stats["meets_sharpe_gate"].apply(_coerce_bool)
+        sort_columns = [
+            column
+            for column in (
+                "meets_sharpe_gate",
+                "out_of_sample_trades",
+                "out_of_sample_sharpe_ratio",
+                "in_sample_sharpe_ratio",
+                "max_drawdown_pct",
+                "closed_trades",
+            )
+            if column in stock_stats.columns
+        ]
+        if sort_columns:
+            stock_stats = stock_stats.sort_values(sort_columns, ascending=[False] * len(sort_columns))
+    trades = _format_backtest_table_dates(latest["trades"]).head(100)
+
+    return templates.TemplateResponse(
+        "backtest.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", "").strip(),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "fresh_weekly_signal_only": _truthy_param(request.query_params.getlist("fresh_weekly_signal_only"), default=False),
+            "as_of_date": as_of_date,
+            "in_sample_years": in_sample_years,
+            "out_of_sample_months": out_of_sample_months,
+            "min_sharpe_ratio": min_sharpe_ratio,
+            "summary": summary,
+            "stock_stats": _records(stock_stats.head(100)),
+            "trades": _records(trades),
+            "open_positions": _records(_format_backtest_table_dates(latest["open_positions"]).head(100)),
+            "workbook_exists": latest["workbook_exists"],
+            "backtest_ran": _truthy_param(request.query_params.getlist("backtest_ran"), default=False),
+            "backtest_error": request.query_params.get("backtest_error", "").strip(),
+            **common_filter_context,
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
 
 
 @app.post("/backtest/run")
 async def run_backtest_from_dashboard(request: Request) -> RedirectResponse:
-    raise HTTPException(status_code=404, detail="Backtest is temporarily removed from the workspace for now.")
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    form = await request.form()
+    config = load_config()
+    base_sensitivity = int(config.get("strategy", {}).get("sensitivity", 3))
+    selected_sensitivity = _parse_sensitivity_text(str(form.get("sensitivity", "")), default=base_sensitivity) or base_sensitivity
+    if selected_sensitivity != base_sensitivity:
+        config = deepcopy(config)
+        config.setdefault("strategy", {})["sensitivity"] = selected_sensitivity
+
+    in_sample_years = _bounded_int_from_form(form, "in_sample_years", DEFAULT_IN_SAMPLE_YEARS, minimum=1, maximum=10)
+    out_of_sample_months = _bounded_int_from_form(
+        form,
+        "out_of_sample_months",
+        DEFAULT_OUT_OF_SAMPLE_MONTHS,
+        minimum=1,
+        maximum=24,
+    )
+    min_sharpe_ratio = _bounded_float_from_form(
+        form,
+        "min_sharpe_ratio",
+        DEFAULT_MIN_SHARPE_RATIO,
+        minimum=0.0,
+        maximum=20.0,
+    )
+    as_of_date = str(form.get("as_of_date", "")).strip()
+    fresh_weekly_signal_only = _truthy_param(form.getlist("fresh_weekly_signal_only"), default=False)
+    dashboard_token = str(form.get("token", "")).strip()
+    data_root = get_data_root(config)
+    storage = Storage(data_root)
+
+    try:
+        symbols: set[str] | None = None
+        if fresh_weekly_signal_only and as_of_date:
+            raise ValueError(
+                "Historical as-of backtests cannot use the current fresh weekly signal-only filter. "
+                "Clear that checkbox to run a historical date."
+            )
+        if fresh_weekly_signal_only:
+            weekly_frame = _latest_weekly_buy_sell_frame(data_root)
+            symbols = _symbols_from_frame(weekly_frame)
+            if not symbols:
+                raise ValueError("No latest weekly BUY/SELL symbols were found. Run the Weekly BUY/SELL screener first.")
+        result = run_buy_sell_backtest_for_symbols(
+            config,
+            storage,
+            exchange="NSE",
+            symbols=symbols,
+            in_sample_years=in_sample_years,
+            out_of_sample_months=out_of_sample_months,
+            min_sharpe_ratio=min_sharpe_ratio,
+            as_of_date=as_of_date or None,
+        )
+        paths = save_backtest_outputs(result, _backtest_dir(data_root))
+        write_backtest_workbook(result, _latest_backtest_paths(data_root)["workbook"])
+        query_parts = [
+            "backtest_ran=1",
+            f"sensitivity={quote(str(selected_sensitivity))}",
+            f"in_sample_years={quote(str(in_sample_years))}",
+            f"out_of_sample_months={quote(str(out_of_sample_months))}",
+            f"min_sharpe_ratio={quote(str(min_sharpe_ratio))}",
+        ]
+        if as_of_date:
+            query_parts.append(f"as_of_date={quote(as_of_date)}")
+        if fresh_weekly_signal_only:
+            query_parts.append("fresh_weekly_signal_only=1")
+        if dashboard_token:
+            query_parts.append(f"token={quote(dashboard_token)}")
+        if paths:
+            query_parts.append("report=1")
+        return RedirectResponse(f"/backtest?{'&'.join(query_parts)}", status_code=303)
+    except Exception as exc:
+        query_parts = [
+            f"backtest_error={quote(str(exc)[:500])}",
+            f"sensitivity={quote(str(selected_sensitivity))}",
+            f"in_sample_years={quote(str(in_sample_years))}",
+            f"out_of_sample_months={quote(str(out_of_sample_months))}",
+            f"min_sharpe_ratio={quote(str(min_sharpe_ratio))}",
+        ]
+        if as_of_date:
+            query_parts.append(f"as_of_date={quote(as_of_date)}")
+        if fresh_weekly_signal_only:
+            query_parts.append("fresh_weekly_signal_only=1")
+        if dashboard_token:
+            query_parts.append(f"token={quote(dashboard_token)}")
+        return RedirectResponse(f"/backtest?{'&'.join(query_parts)}", status_code=303)
 
 
 @app.get("/backtest/report")
 def download_backtest_report() -> FileResponse:
-    raise HTTPException(status_code=404, detail="Backtest is temporarily removed from the workspace for now.")
+    path = _latest_backtest_paths(get_data_root(load_config()))["workbook"]
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the BUY-to-SELL backtest first.")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="buy_sell_backtest_report.xlsx",
+    )
 
 
 @app.get("/gtt-gain-study", response_class=HTMLResponse)
@@ -9370,6 +11442,7 @@ def ema20_band_strategy_page(request: Request) -> HTMLResponse:
     _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
     data_root = get_data_root(config)
     latest = load_ema20_band_strategy_outputs(_ema20_band_strategy_dir(data_root))
+    latest = _enrich_ema20_band_result_with_confirmations(latest, data_root)
     summary = dict(latest.summary)
     default_as_of = str(summary.get("requested_as_of_date") or _latest_completed_nse_calendar_date().isoformat())
     as_of_date = _as_of_date_input(request, summary) or default_as_of
@@ -9437,15 +11510,27 @@ def ema20_band_strategy_page(request: Request) -> HTMLResponse:
     stock_search = request.query_params.get("stock_search", "").strip()
     pattern_filter = request.query_params.get("pattern", "").strip()
     strategy_filter = request.query_params.get("strategy", "").strip()
+    confirmation_filter = request.query_params.get("confirmation", "").strip().lower()
 
-    candidates = latest.candidates.copy()
-    if not candidates.empty:
-        candidates = _apply_stock_search(candidates, stock_search)
-        if pattern_filter and "pattern" in candidates.columns:
-            candidates = candidates[candidates["pattern"].astype(str).eq(pattern_filter)].copy()
-        sort_cols = [column for column in ("candidate_score", "sessions_since_signal", "symbol") if column in candidates.columns]
-        if sort_cols:
-            candidates = candidates.sort_values(sort_cols, ascending=[False, True, True][: len(sort_cols)], na_position="last")
+    candidates = _ema20_current_candidates_for_request(latest, request)
+    candidate_download_href = _ema20_current_candidates_download_href(
+        request,
+        stock_search=stock_search,
+        pattern_filter=pattern_filter,
+        confirmation_filter=confirmation_filter,
+    )
+    agent_shortlist = pd.DataFrame()
+    if not candidates.empty and "agent_total_score" in candidates.columns:
+        agent_shortlist = candidates.copy()
+        if "agent_grade" in agent_shortlist.columns:
+            priority = agent_shortlist["agent_grade"].fillna("").astype(str).isin(["A+", "A", "B"])
+            if priority.any():
+                agent_shortlist = agent_shortlist[priority].copy()
+        agent_shortlist = agent_shortlist.sort_values(
+            [column for column in ("agent_total_score", "confirmation_count", "candidate_score", "symbol") if column in agent_shortlist.columns],
+            ascending=[False, False, False, True][: len([column for column in ("agent_total_score", "confirmation_count", "candidate_score", "symbol") if column in agent_shortlist.columns])],
+            na_position="last",
+        ).head(25)
 
     strategy_stats = latest.strategy_stats.copy()
     yearly_stats = latest.yearly_stats.copy()
@@ -9483,18 +11568,27 @@ def ema20_band_strategy_page(request: Request) -> HTMLResponse:
             "candidates": _records(candidates.head(500)),
             "candidates_count": len(candidates),
             "candidate_symbols_csv": _comma_separated_symbols(candidates),
+            "candidate_download_href": candidate_download_href,
+            "agent_shortlist": _records(agent_shortlist),
+            "agent_shortlist_count": len(agent_shortlist),
             "strategy_stats": _records(strategy_stats),
             "yearly_stats": _records(yearly_stats.head(100)),
             "stock_stats": _records(stock_stats.head(300)),
             "trades": _records(trades.head(500)),
             "stock_search": stock_search,
             "pattern_filter": pattern_filter,
-            "pattern_options": ["Bullish Inside Bar", "Bullish Engulfing", "Inside + Engulfing"],
+            "confirmation_filter": confirmation_filter,
+            "confirmation_options": [
+                {"value": value, "label": label}
+                for value, label in EMA20_CONFIRMATION_FILTER_OPTIONS
+            ],
+            "confirmation_sources": summary.get("confirmation_sources", []),
+            "pattern_options": ["Bullish Inside Bar", "Bullish Engulfing Bar", "Inside + Engulfing"],
             "strategy_filter": strategy_filter,
             "strategy_options": [
                 "Any EMA20 Band Bullish Pattern",
                 "Bullish Inside Bar Below EMA20 Band",
-                "Bullish Engulfing Below EMA20 Band",
+                "Bullish Engulfing Bar Below EMA20 Band",
             ],
             "start_date": start_date,
             "as_of_date": as_of_date,
@@ -9642,13 +11736,22 @@ async def run_ema20_band_strategy_from_dashboard(request: Request) -> RedirectRe
 
 
 @app.get("/ema20-band-strategy/candidates.csv")
-def download_ema20_band_candidates(request: Request) -> FileResponse:
+def download_ema20_band_candidates(request: Request) -> StreamingResponse:
     if not _is_allowed(request):
         raise HTTPException(status_code=401, detail="Not authorized")
-    path = _ema20_band_strategy_dir(get_data_root(load_config())) / "latest_candidates.csv"
-    if not path.exists():
+    data_root = get_data_root(load_config())
+    output_dir = _ema20_band_strategy_dir(data_root)
+    result = load_ema20_band_strategy_outputs(output_dir)
+    if not result.summary and result.candidates.empty:
         raise HTTPException(status_code=404, detail="Run the EMA20 band strategy first")
-    return FileResponse(path, media_type="text/csv", filename="ema20_band_current_candidates.csv")
+    result = _enrich_ema20_band_result_with_confirmations(result, data_root)
+    candidates = _ema20_current_candidates_for_request(result, request)
+    csv_payload = candidates.to_csv(index=False)
+    return StreamingResponse(
+        iter([csv_payload]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="ema20_band_current_candidates.csv"'},
+    )
 
 
 @app.get("/ema20-band-strategy/trades.csv")
@@ -9670,12 +11773,298 @@ def download_ema20_band_report(request: Request) -> FileResponse:
     result = load_ema20_band_strategy_outputs(output_dir)
     if not result.summary and result.candidates.empty and result.trades.empty:
         raise HTTPException(status_code=404, detail="Run the EMA20 band strategy first")
+    result = _enrich_ema20_band_result_with_confirmations(result, data_root)
     workbook_path = output_dir / "ema20_band_strategy_report.xlsx"
     write_ema20_band_strategy_workbook(result, workbook_path)
     return FileResponse(
         workbook_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename="ema20_band_strategy_report.xlsx",
+    )
+
+
+@app.get("/emax-band-strategy", response_class=HTMLResponse)
+def emax_band_strategy_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
+    data_root = get_data_root(config)
+    outputs = _load_emax_band_outputs(data_root, include_trades=False)
+    outputs = _add_emax_drawdowns_to_outputs(outputs, data_root)
+    summary = dict(outputs.summary)
+    candidates, summary = _enrich_emax_candidates(outputs.current_candidates, data_root, summary)
+
+    default_as_of = str(
+        summary.get("emax_current_as_of_date")
+        or summary.get("as_of_date")
+        or _latest_completed_nse_calendar_date().isoformat()
+    )
+    as_of_date = str(request.query_params.get("as_of_date", default_as_of) or default_as_of).strip()
+    current_signal_lookback_sessions = _int_query_param(
+        request,
+        summary,
+        "current_signal_lookback_sessions",
+        EMA20_BAND_DEFAULT_CURRENT_LOOKBACK,
+        minimum=1,
+        maximum=60,
+    )
+    profit_target_pct = _float_query_param(request, summary, "profit_target_pct", EMA20_BAND_DEFAULT_TARGET_PCT, minimum=0.0, maximum=100.0)
+    stop_loss_pct = _float_query_param(request, summary, "stop_loss_pct", EMA20_BAND_DEFAULT_STOP_PCT, minimum=0.1, maximum=50.0)
+    stop_buffer_pct = _float_query_param(request, summary, "stop_buffer_pct", EMA20_BAND_DEFAULT_STOP_BUFFER_PCT, minimum=0.0, maximum=10.0)
+    entry_price_mode = str(request.query_params.get("entry_price_mode", summary.get("entry_price_mode", "next_open")) or "next_open").strip().lower()
+    if entry_price_mode not in {"next_open", "next_close"}:
+        entry_price_mode = "next_open"
+
+    filtered_candidates = _apply_emax_candidate_filters(candidates, request)
+    stock_search = request.query_params.get("stock_search", "").strip()
+    pattern_filter = request.query_params.get("pattern", "").strip()
+    strategy_filter = request.query_params.get("strategy", "").strip()
+    confirmation_filter = request.query_params.get("confirmation", "").strip().lower()
+    robust_only = _truthy_param(request.query_params.get("robust_only", ""), default=False)
+
+    agent_shortlist = pd.DataFrame()
+    if not filtered_candidates.empty and "agent_total_score" in filtered_candidates.columns:
+        agent_shortlist = filtered_candidates.copy()
+        if "agent_grade" in agent_shortlist.columns:
+            priority = agent_shortlist["agent_grade"].fillna("").astype(str).isin(["A+", "A", "B"])
+            if priority.any():
+                agent_shortlist = agent_shortlist[priority].copy()
+        sort_cols = [column for column in ("agent_total_score", "daily_prediction_score", "confirmation_count", "candidate_score", "symbol") if column in agent_shortlist.columns]
+        if sort_cols:
+            agent_shortlist = agent_shortlist.sort_values(
+                sort_cols,
+                ascending=[False, False, False, False, True][: len(sort_cols)],
+                na_position="last",
+            )
+        agent_shortlist = agent_shortlist.head(25)
+
+    robust_best = outputs.robust_best_by_stock.copy()
+    if not robust_best.empty:
+        robust_best = _apply_stock_search(robust_best, stock_search)
+        robust_best = robust_best.sort_values(
+            [column for column in ("robust_rank", "edge_score", "validation_avg_return_pct", "symbol") if column in robust_best.columns],
+            ascending=[True, False, False, True][: len([column for column in ("robust_rank", "edge_score", "validation_avg_return_pct", "symbol") if column in robust_best.columns])],
+            na_position="last",
+        )
+
+    strategy_options = sorted(outputs.best_by_stock["strategy"].dropna().astype(str).unique().tolist()) if "strategy" in outputs.best_by_stock.columns else []
+    return templates.TemplateResponse(
+        "emax_band_strategy.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "selected_sensitivity": selected_sensitivity,
+            "default_sensitivity": base_sensitivity,
+            "summary": summary,
+            "candidates": _records(filtered_candidates.head(500)),
+            "candidates_count": len(filtered_candidates),
+            "candidate_symbols_csv": _comma_separated_symbols(filtered_candidates),
+            "candidate_download_href": _emax_candidates_download_href(request),
+            "agent_shortlist": _records(agent_shortlist),
+            "robust_best": _records(robust_best.head(200)),
+            "stock_search": stock_search,
+            "pattern_filter": pattern_filter,
+            "strategy_filter": strategy_filter,
+            "confirmation_filter": confirmation_filter,
+            "robust_only": robust_only,
+            "confirmation_options": [
+                {"value": value, "label": label}
+                for value, label in EMA20_CONFIRMATION_FILTER_OPTIONS
+            ],
+            "confirmation_sources": summary.get("confirmation_sources", []),
+            "pattern_options": ["Bullish Inside Bar", "Bullish Engulfing Bar", "Inside + Engulfing"],
+            "strategy_options": strategy_options,
+            "as_of_date": as_of_date,
+            "current_signal_lookback_sessions": current_signal_lookback_sessions,
+            "profit_target_pct": profit_target_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "stop_buffer_pct": stop_buffer_pct,
+            "entry_price_mode": entry_price_mode,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/emax-band-strategy/run")
+async def run_emax_band_strategy_from_dashboard(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+    dashboard_token = str(form.get("token", "")).strip()
+    outputs = _load_emax_band_outputs(data_root, include_trades=False)
+    summary = dict(outputs.summary)
+    default_as_of = str(summary.get("emax_current_as_of_date") or summary.get("as_of_date") or _latest_completed_nse_calendar_date().isoformat())
+    as_of_date = str(form.get("as_of_date", default_as_of)).strip() or default_as_of
+    try:
+        pd.Timestamp(as_of_date)
+    except (TypeError, ValueError):
+        as_of_date = default_as_of
+
+    def form_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    def form_float(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(str(form.get(name, default)).strip() or default)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(value, minimum), maximum)
+
+    current_signal_lookback_sessions = form_int("current_signal_lookback_sessions", EMA20_BAND_DEFAULT_CURRENT_LOOKBACK, 1, 60)
+    profit_target_pct = form_float("profit_target_pct", EMA20_BAND_DEFAULT_TARGET_PCT, 0.0, 100.0)
+    stop_loss_pct = form_float("stop_loss_pct", EMA20_BAND_DEFAULT_STOP_PCT, 0.1, 50.0)
+    stop_buffer_pct = form_float("stop_buffer_pct", EMA20_BAND_DEFAULT_STOP_BUFFER_PCT, 0.0, 10.0)
+    entry_price_mode = str(form.get("entry_price_mode", "next_open")).strip().lower()
+    if entry_price_mode not in {"next_open", "next_close"}:
+        entry_price_mode = "next_open"
+
+    params = [
+        f"as_of_date={quote(as_of_date)}",
+        f"current_signal_lookback_sessions={current_signal_lookback_sessions}",
+        f"profit_target_pct={quote(str(profit_target_pct))}",
+        f"stop_loss_pct={quote(str(stop_loss_pct))}",
+        f"stop_buffer_pct={quote(str(stop_buffer_pct))}",
+        f"entry_price_mode={quote(entry_price_mode)}",
+    ]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+    if _emax_saved_result_matches_request(
+        outputs,
+        as_of_date,
+        current_signal_lookback_sessions,
+        profit_target_pct,
+        stop_loss_pct,
+        stop_buffer_pct,
+        entry_price_mode,
+    ):
+        return RedirectResponse(f"/emax-band-strategy?study_ran=1{query_suffix}", status_code=303)
+
+    try:
+        job_id = uuid4().hex
+        _submit_scan_job(
+            job_id,
+            "EMAX Band Strategy",
+            _run_emax_band_strategy_job,
+            data_root,
+            query_suffix,
+            as_of_date,
+            current_signal_lookback_sessions,
+            profit_target_pct,
+            stop_loss_pct,
+            stop_buffer_pct,
+            entry_price_mode,
+        )
+        redirect_url = f"/emax-band-strategy?study_job={job_id}{query_suffix}"
+    except Exception as exc:
+        redirect_url = f"/emax-band-strategy?study_error={quote(str(exc)[:500])}{query_suffix}"
+    return RedirectResponse(redirect_url, status_code=303)
+
+
+@app.get("/emax-band-strategy/candidates.csv")
+def download_emax_band_candidates(request: Request) -> StreamingResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    data_root = get_data_root(load_config())
+    outputs = _load_emax_band_outputs(data_root, include_trades=False)
+    outputs = _add_emax_drawdowns_to_outputs(outputs, data_root)
+    if outputs.current_candidates.empty:
+        raise HTTPException(status_code=404, detail="Run the EMAX band strategy first")
+    candidates, _summary = _enrich_emax_candidates(outputs.current_candidates, data_root, outputs.summary)
+    candidates = _apply_emax_candidate_filters(candidates, request)
+    csv_payload = candidates.to_csv(index=False)
+    return StreamingResponse(
+        iter([csv_payload]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="emax_band_current_candidates.csv"'},
+    )
+
+
+@app.get("/emax-band-strategy/best-by-stock.csv")
+def download_emax_best_by_stock(request: Request) -> StreamingResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    data_root = get_data_root(load_config())
+    outputs = _add_emax_drawdowns_to_outputs(_load_emax_band_outputs(data_root, include_trades=False), data_root)
+    if outputs.best_by_stock.empty:
+        raise HTTPException(status_code=404, detail="Run the EMAX optimization first")
+    return StreamingResponse(
+        iter([outputs.best_by_stock.to_csv(index=False)]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="emax_best_by_stock.csv"'},
+    )
+
+
+@app.get("/emax-band-strategy/robust-best-by-stock.csv")
+def download_emax_robust_best_by_stock(request: Request) -> StreamingResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    data_root = get_data_root(load_config())
+    outputs = _add_emax_drawdowns_to_outputs(_load_emax_band_outputs(data_root, include_trades=False), data_root)
+    if outputs.robust_best_by_stock.empty:
+        raise HTTPException(status_code=404, detail="Run the EMAX optimization first")
+    return StreamingResponse(
+        iter([outputs.robust_best_by_stock.to_csv(index=False)]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="emax_robust_best_by_stock.csv"'},
+    )
+
+
+@app.get("/emax-band-strategy/trades.csv")
+def download_emax_trades(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    path = _emax_band_strategy_dir(get_data_root(load_config())) / "trades.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the EMAX optimization first")
+    return FileResponse(path, media_type="text/csv", filename="emax_backtest_trades.csv")
+
+
+@app.get("/emax-band-strategy/report.xlsx")
+def download_emax_report(request: Request) -> FileResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Not authorized")
+    data_root = get_data_root(load_config())
+    output_dir = _emax_band_strategy_dir(data_root)
+    workbook_path = output_dir / "emax_band_strategy_report.xlsx"
+    outputs = _add_emax_drawdowns_to_outputs(_load_emax_band_outputs(data_root, include_trades=False), data_root)
+    if outputs.best_by_stock.empty and outputs.current_candidates.empty:
+        raise HTTPException(status_code=404, detail="Run the EMAX optimization first")
+    trades_path = output_dir / "trades.csv"
+    trades = pd.DataFrame()
+    if trades_path.exists():
+        try:
+            trades = pd.read_csv(trades_path, nrows=5_000)
+        except (pd.errors.EmptyDataError, OSError):
+            trades = pd.DataFrame()
+    outputs = EmaBandOptimizationResult(
+        summary=outputs.summary,
+        best_by_stock=outputs.best_by_stock,
+        robust_best_by_stock=outputs.robust_best_by_stock,
+        ema_stats=outputs.ema_stats,
+        current_candidates=outputs.current_candidates,
+        trades=trades,
+    )
+    write_ema_band_optimization_workbook(outputs, workbook_path, max_trade_rows=5_000)
+    return FileResponse(
+        workbook_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="emax_band_strategy_report.xlsx",
     )
 
 
@@ -11419,6 +13808,269 @@ async def run_knox_envelope_from_dashboard(request: Request) -> RedirectResponse
     return RedirectResponse(f"/knox-envelope?study_job={job_id}{query_suffix}", status_code=303)
 
 
+@app.get("/order-block-retest", response_class=HTMLResponse)
+def order_block_retest_page(request: Request) -> HTMLResponse:
+    if not _is_allowed(request):
+        return templates.TemplateResponse(
+            "locked.html",
+            {"request": request, "app_name": "Investment Screener"},
+            status_code=401,
+        )
+
+    config = load_config()
+    data_root = get_data_root(config)
+    latest = load_order_block_retest_outputs(_order_block_retest_dir(data_root))
+    saved_logic_is_current = (
+        latest.summary.get("logic_version") in ORDER_BLOCK_COMPATIBLE_LOGIC_VERSIONS
+    )
+    summary = latest.summary if saved_logic_is_current else {}
+
+    def int_param(name: str, default: int, minimum: int = 0) -> int:
+        try:
+            return max(int(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def float_param(name: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(float(request.query_params.get(name, summary.get(name, default)) or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    default_start_date = (pd.Timestamp.today().normalize() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+    start_date = str(request.query_params.get("start_date", summary.get("start_date", default_start_date)) or default_start_date)
+    as_of_date = _as_of_date_input(request, summary)
+    symbols_text = str(
+        request.query_params.get("symbols", summary.get("requested_symbols", "")) or ""
+    ).strip()
+    swing_length = int_param("swing_length", ORDER_BLOCK_DEFAULT_SWING_LENGTH, 1)
+    poc_bins = int_param("poc_bins", ORDER_BLOCK_DEFAULT_POC_BINS, 2)
+    recent_signal_bars = int_param("recent_signal_bars", ORDER_BLOCK_DEFAULT_RECENT_SIGNAL_BARS, 1)
+    holding_sessions = int_param("holding_sessions", ORDER_BLOCK_DEFAULT_HOLDING_SESSIONS, 1)
+    min_historical_samples = int_param(
+        "min_historical_samples",
+        ORDER_BLOCK_DEFAULT_MIN_HISTORICAL_SAMPLES,
+        0,
+    )
+    profit_target_pct = float_param("profit_target_pct", ORDER_BLOCK_DEFAULT_PROFIT_TARGET_PCT, 0.01)
+    max_stop_loss_pct = float_param("max_stop_loss_pct", ORDER_BLOCK_DEFAULT_MAX_STOP_LOSS_PCT, 0.01)
+    stop_buffer_pct = float_param("stop_buffer_pct", ORDER_BLOCK_DEFAULT_STOP_BUFFER_PCT, 0.0)
+    round_trip_cost_pct = float_param(
+        "round_trip_cost_pct",
+        ORDER_BLOCK_DEFAULT_ROUND_TRIP_COST_PCT,
+        0.0,
+    )
+    invalidation_method = str(
+        request.query_params.get(
+            "invalidation_method",
+            summary.get("invalidation_method", ORDER_BLOCK_DEFAULT_INVALIDATION_METHOD),
+        )
+        or ORDER_BLOCK_DEFAULT_INVALIDATION_METHOD
+    ).lower()
+    if invalidation_method not in ORDER_BLOCK_INVALIDATION_METHODS:
+        invalidation_method = ORDER_BLOCK_DEFAULT_INVALIDATION_METHOD
+    signal_direction = str(
+        request.query_params.get(
+            "signal_direction",
+            summary.get("signal_direction", ORDER_BLOCK_DEFAULT_SIGNAL_DIRECTION),
+        )
+        or ORDER_BLOCK_DEFAULT_SIGNAL_DIRECTION
+    ).lower()
+    if signal_direction not in ORDER_BLOCK_SIGNAL_DIRECTIONS:
+        signal_direction = ORDER_BLOCK_DEFAULT_SIGNAL_DIRECTION
+    require_active_zone = _truthy_param(
+        request.query_params.getlist("require_active_zone"),
+        default=_truthy_param(summary.get("require_active_zone"), default=True),
+    )
+
+    candidates = latest.candidates.copy() if saved_logic_is_current else pd.DataFrame()
+    trades = latest.trades.copy() if saved_logic_is_current else pd.DataFrame()
+    backtest_stats = latest.backtest_stats.copy() if saved_logic_is_current else pd.DataFrame()
+    candidates = _order_block_candidate_display(
+        candidates,
+        latest.events,
+        require_active_zone=require_active_zone,
+    )
+    alignment_excluded_count = int(candidates.attrs.get("alignment_excluded_count", 0))
+    for frame in (candidates, trades):
+        for column in (
+            "block_bos_date", "tick_date", "confirmation_date", "event_date",
+            "retest_date", "latest_date", "entry_date", "signal_date", "exit_date",
+        ):
+            if column in frame.columns:
+                frame[column] = pd.to_datetime(frame[column], errors="coerce").dt.strftime("%Y-%m-%d")
+    if not candidates.empty and "zone_active" in candidates.columns:
+        candidates["zone_active"] = _truthy_series(candidates["zone_active"])
+    if not trades.empty:
+        if "won" in trades.columns:
+            trades["won"] = _truthy_series(trades["won"])
+        trades = trades.head(100)
+
+    return templates.TemplateResponse(
+        "order_block_retest.html",
+        {
+            "request": request,
+            "app_name": config.get("app", {}).get("name", "Investment Screener"),
+            "dashboard_token": request.query_params.get("token", ""),
+            "summary": summary,
+            "candidates": _records(candidates),
+            "candidate_count": len(candidates),
+            "alignment_excluded_count": alignment_excluded_count,
+            "green_tick_count": int(
+                candidates.get("side", pd.Series(dtype="object"))
+                .astype(str)
+                .str.upper()
+                .eq("BULLISH")
+                .sum()
+            ),
+            "candidate_symbols_csv": _comma_separated_symbols(candidates),
+            "backtest_stats": _records(backtest_stats),
+            "trades": _records(trades),
+            "symbols_text": symbols_text,
+            "start_date": start_date,
+            "as_of_date": as_of_date,
+            "swing_length": swing_length,
+            "poc_bins": poc_bins,
+            "recent_signal_bars": recent_signal_bars,
+            "holding_sessions": holding_sessions,
+            "profit_target_pct": profit_target_pct,
+            "max_stop_loss_pct": max_stop_loss_pct,
+            "stop_buffer_pct": stop_buffer_pct,
+            "round_trip_cost_pct": round_trip_cost_pct,
+            "min_historical_samples": min_historical_samples,
+            "invalidation_method": invalidation_method,
+            "signal_direction": signal_direction,
+            "require_active_zone": require_active_zone,
+            "study_job": request.query_params.get("study_job", ""),
+            "study_ran": request.query_params.get("study_ran", ""),
+            "study_error": request.query_params.get("study_error", ""),
+            "show_shared_filter_form": False,
+            "show_shared_filter_status": False,
+        },
+    )
+
+
+@app.post("/order-block-retest/run")
+async def run_order_block_retest_from_dashboard(request: Request) -> RedirectResponse:
+    config = load_config()
+    data_root = get_data_root(config)
+    form = await request.form()
+
+    def form_int(name: str, default: int, minimum: int = 0) -> int:
+        try:
+            return max(int(str(form.get(name, default)).strip() or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    def form_float(name: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(float(str(form.get(name, default)).strip() or default), minimum)
+        except (TypeError, ValueError):
+            return default
+
+    default_start_date = (pd.Timestamp.today().normalize() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+    start_date = str(form.get("start_date", default_start_date)).strip() or default_start_date
+    as_of_date = str(form.get("as_of_date", "")).strip()
+    symbols_text = str(form.get("symbols", "")).strip().upper()
+    symbols = sorted({value for value in re.split(r"[\s,;]+", symbols_text) if value}) or None
+    swing_length = form_int("swing_length", ORDER_BLOCK_DEFAULT_SWING_LENGTH, 1)
+    poc_bins = form_int("poc_bins", ORDER_BLOCK_DEFAULT_POC_BINS, 2)
+    recent_signal_bars = form_int("recent_signal_bars", ORDER_BLOCK_DEFAULT_RECENT_SIGNAL_BARS, 1)
+    holding_sessions = form_int("holding_sessions", ORDER_BLOCK_DEFAULT_HOLDING_SESSIONS, 1)
+    min_historical_samples = form_int(
+        "min_historical_samples",
+        ORDER_BLOCK_DEFAULT_MIN_HISTORICAL_SAMPLES,
+        0,
+    )
+    profit_target_pct = form_float("profit_target_pct", ORDER_BLOCK_DEFAULT_PROFIT_TARGET_PCT, 0.01)
+    max_stop_loss_pct = form_float("max_stop_loss_pct", ORDER_BLOCK_DEFAULT_MAX_STOP_LOSS_PCT, 0.01)
+    stop_buffer_pct = form_float("stop_buffer_pct", ORDER_BLOCK_DEFAULT_STOP_BUFFER_PCT, 0.0)
+    round_trip_cost_pct = form_float(
+        "round_trip_cost_pct",
+        ORDER_BLOCK_DEFAULT_ROUND_TRIP_COST_PCT,
+        0.0,
+    )
+    invalidation_method = str(
+        form.get("invalidation_method", ORDER_BLOCK_DEFAULT_INVALIDATION_METHOD)
+    ).strip().lower()
+    if invalidation_method not in ORDER_BLOCK_INVALIDATION_METHODS:
+        invalidation_method = ORDER_BLOCK_DEFAULT_INVALIDATION_METHOD
+    signal_direction = str(
+        form.get("signal_direction", ORDER_BLOCK_DEFAULT_SIGNAL_DIRECTION)
+    ).strip().lower()
+    if signal_direction not in ORDER_BLOCK_SIGNAL_DIRECTIONS:
+        signal_direction = ORDER_BLOCK_DEFAULT_SIGNAL_DIRECTION
+    require_active_zone = _truthy_param(form.get("require_active_zone"), default=False)
+    dashboard_token = str(form.get("token", "")).strip()
+
+    params = [
+        f"start_date={quote(start_date)}",
+        f"swing_length={swing_length}",
+        f"poc_bins={poc_bins}",
+        f"recent_signal_bars={recent_signal_bars}",
+        f"holding_sessions={holding_sessions}",
+        f"profit_target_pct={quote(str(profit_target_pct))}",
+        f"max_stop_loss_pct={quote(str(max_stop_loss_pct))}",
+        f"stop_buffer_pct={quote(str(stop_buffer_pct))}",
+        f"round_trip_cost_pct={quote(str(round_trip_cost_pct))}",
+        f"min_historical_samples={min_historical_samples}",
+        f"invalidation_method={quote(invalidation_method)}",
+        f"signal_direction={quote(signal_direction)}",
+        f"require_active_zone={1 if require_active_zone else 0}",
+    ]
+    if as_of_date:
+        params.append(f"as_of_date={quote(as_of_date)}")
+    if symbols_text:
+        params.append(f"symbols={quote(symbols_text)}")
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    query_suffix = "&" + "&".join(params)
+
+    job_id = uuid4().hex
+    _submit_scan_job(
+        job_id,
+        "Order Block Retest",
+        _run_order_block_retest_job,
+        data_root,
+        query_suffix,
+        symbols,
+        start_date,
+        as_of_date,
+        swing_length,
+        poc_bins,
+        invalidation_method,
+        signal_direction,
+        recent_signal_bars,
+        require_active_zone,
+        holding_sessions,
+        profit_target_pct,
+        max_stop_loss_pct,
+        stop_buffer_pct,
+        round_trip_cost_pct,
+        min_historical_samples,
+    )
+    return RedirectResponse(
+        f"/order-block-retest?study_job={job_id}{query_suffix}",
+        status_code=303,
+    )
+
+
+@app.get("/order-block-retest/candidates.csv")
+def download_order_block_candidates() -> FileResponse:
+    path = _order_block_retest_dir(get_data_root(load_config())) / "latest_candidates.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the order-block retest screener first.")
+    return FileResponse(path, media_type="text/csv", filename="order_block_retest_candidates.csv")
+
+
+@app.get("/order-block-retest/trades.csv")
+def download_order_block_trades() -> FileResponse:
+    path = _order_block_retest_dir(get_data_root(load_config())) / "trades.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run the order-block retest backtest first.")
+    return FileResponse(path, media_type="text/csv", filename="order_block_retest_trades.csv")
+
+
 @app.get("/knox-recovery", response_class=HTMLResponse)
 def knox_recovery_page(request: Request) -> HTMLResponse:
     if not _is_allowed(request):
@@ -12413,6 +15065,25 @@ def download_signal_outcome_study_report() -> FileResponse:
     raise HTTPException(status_code=404, detail="Signal Outcome is temporarily removed from the workspace for now.")
 
 
+@app.post("/promoter-holdings/refresh")
+async def refresh_promoter_holdings(request: Request) -> RedirectResponse:
+    if not _is_allowed(request):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    form = await request.form()
+    return_query = str(form.get("return_query", "")).strip().lstrip("?")
+    dashboard_token = str(form.get("token", "")).strip()
+    try:
+        result = _fetch_and_store_promoter_holdings_from_nse(get_data_root(load_config()))
+        params = [f"promoter_refreshed=1", f"promoter_rows={quote(str(result.get('rows', 0)))}"]
+    except Exception as exc:
+        params = [f"promoter_error={quote(str(exc)[:500])}"]
+    if dashboard_token and "token=" not in return_query:
+        params.append(f"token={quote(dashboard_token)}")
+    if return_query:
+        return RedirectResponse(f"/?{return_query}&{'&'.join(params)}", status_code=303)
+    return RedirectResponse(f"/?{'&'.join(params)}", status_code=303)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     if not _is_allowed(request):
@@ -12433,6 +15104,7 @@ def dashboard(request: Request) -> HTMLResponse:
     raw = _filter_weekly_screener_stock_rows(storage.load_signals("latest_raw_signals.csv"))
     scan_details = _filter_weekly_screener_stock_rows(storage.load_signals("latest_scan_details.csv"))
     metadata = _combined_symbol_metadata(config, storage)
+    promoter_holdings = _load_promoter_holdings(data_root)
     stock_search = request.query_params.get("stock_search", "").strip()
     selected_market_cap_bucket = request.query_params.get("market_cap_bucket", "").strip()
     min_market_cap = _request_float(request, "min_market_cap_cr")
@@ -12551,6 +15223,10 @@ def dashboard(request: Request) -> HTMLResponse:
     )
     large_deals = _load_big_bull_deals(data_root)
     filtered = _apply_large_deal_markers(filtered, large_deals)
+    weekly_buy_research = _weekly_buy_research_frame(filtered, promoter_holdings)
+    promoter_missing_count = 0
+    if not weekly_buy_research.empty and "promoter_holding_pct" in weekly_buy_research.columns:
+        promoter_missing_count = int(pd.to_numeric(weekly_buy_research["promoter_holding_pct"], errors="coerce").isna().sum())
 
     raw_symbol_column = _symbol_column(raw)
     filtered_symbol_column = _symbol_column(filtered)
@@ -12669,6 +15345,14 @@ def dashboard(request: Request) -> HTMLResponse:
             "scan_details": _records(scan_details),
             "scan_details_count": len(scan_details),
             "filtered_symbols": _records(filtered_symbols.drop(columns=["date_sort"], errors="ignore")),
+            "weekly_buy_research": _records(weekly_buy_research),
+            "weekly_buy_research_count": len(weekly_buy_research),
+            "promoter_holdings_available": not promoter_holdings.empty,
+            "promoter_holdings_missing_count": promoter_missing_count,
+            "promoter_holdings_path": str(_promoter_holdings_path(data_root)),
+            "promoter_refreshed": request.query_params.get("promoter_refreshed", ""),
+            "promoter_rows": request.query_params.get("promoter_rows", ""),
+            "promoter_error": request.query_params.get("promoter_error", ""),
             "dashboard_token": request.query_params.get("token", ""),
             "filter_link_suffix": filter_link_suffix,
             "selected_exchange": selected_exchange or "",
