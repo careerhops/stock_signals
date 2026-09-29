@@ -170,6 +170,7 @@ from stock_screener.knox_recovery_study import (
 from stock_screener.order_block_retest_study import (
     DEFAULT_HOLDING_SESSIONS as ORDER_BLOCK_DEFAULT_HOLDING_SESSIONS,
     DEFAULT_INVALIDATION_METHOD as ORDER_BLOCK_DEFAULT_INVALIDATION_METHOD,
+    DEFAULT_MIN_BULL_VOLUME_PCT as ORDER_BLOCK_DEFAULT_MIN_BULL_VOLUME_PCT,
     DEFAULT_MAX_STOP_LOSS_PCT as ORDER_BLOCK_DEFAULT_MAX_STOP_LOSS_PCT,
     DEFAULT_MIN_HISTORICAL_SAMPLES as ORDER_BLOCK_DEFAULT_MIN_HISTORICAL_SAMPLES,
     DEFAULT_POC_BINS as ORDER_BLOCK_DEFAULT_POC_BINS,
@@ -6123,6 +6124,7 @@ def _run_order_block_retest_job(
     stop_buffer_pct: float,
     round_trip_cost_pct: float,
     min_historical_samples: int,
+    min_bull_volume_pct: float,
 ) -> None:
     storage = Storage(data_root)
     _set_scan_job(
@@ -6203,6 +6205,7 @@ def _run_order_block_retest_job(
             stop_buffer_pct=stop_buffer_pct,
             round_trip_cost_pct=round_trip_cost_pct,
             min_historical_samples=min_historical_samples,
+            min_bull_volume_pct=min_bull_volume_pct,
             progress_callback=study_progress,
         )
         result.summary.update(refresh_audit)
@@ -8938,12 +8941,28 @@ def _order_block_candidate_display(
     events: pd.DataFrame,
     *,
     require_active_zone: bool = True,
+    min_bull_volume_pct: float = ORDER_BLOCK_DEFAULT_MIN_BULL_VOLUME_PCT,
 ) -> pd.DataFrame:
     display = candidates.copy()
     if display.empty:
         return display
 
     side = display.get("side", pd.Series("", index=display.index)).astype(str).str.upper()
+    try:
+        min_bull_volume_pct = min(max(float(min_bull_volume_pct), 0.0), 100.0)
+    except (TypeError, ValueError):
+        min_bull_volume_pct = ORDER_BLOCK_DEFAULT_MIN_BULL_VOLUME_PCT
+    if min_bull_volume_pct > 0.0:
+        bull_volume = pd.to_numeric(
+            display.get("bull_volume_pct", pd.Series(np.nan, index=display.index)),
+            errors="coerce",
+        )
+        display = display[~side.eq("BULLISH") | bull_volume.ge(min_bull_volume_pct)].copy()
+        side = display.get("side", pd.Series("", index=display.index)).astype(str).str.upper()
+        if display.empty:
+            display.attrs["alignment_excluded_count"] = 0
+            return display
+
     display["signal_match"] = np.where(
         side.eq("BULLISH"),
         "Green tick + green block",
@@ -13852,6 +13871,10 @@ def order_block_retest_page(request: Request) -> HTMLResponse:
         ORDER_BLOCK_DEFAULT_MIN_HISTORICAL_SAMPLES,
         0,
     )
+    min_bull_volume_pct = min(
+        float_param("min_bull_volume_pct", ORDER_BLOCK_DEFAULT_MIN_BULL_VOLUME_PCT, 0.0),
+        100.0,
+    )
     profit_target_pct = float_param("profit_target_pct", ORDER_BLOCK_DEFAULT_PROFIT_TARGET_PCT, 0.01)
     max_stop_loss_pct = float_param("max_stop_loss_pct", ORDER_BLOCK_DEFAULT_MAX_STOP_LOSS_PCT, 0.01)
     stop_buffer_pct = float_param("stop_buffer_pct", ORDER_BLOCK_DEFAULT_STOP_BUFFER_PCT, 0.0)
@@ -13890,6 +13913,7 @@ def order_block_retest_page(request: Request) -> HTMLResponse:
         candidates,
         latest.events,
         require_active_zone=require_active_zone,
+        min_bull_volume_pct=min_bull_volume_pct,
     )
     alignment_excluded_count = int(candidates.attrs.get("alignment_excluded_count", 0))
     for frame in (candidates, trades):
@@ -13938,6 +13962,7 @@ def order_block_retest_page(request: Request) -> HTMLResponse:
             "stop_buffer_pct": stop_buffer_pct,
             "round_trip_cost_pct": round_trip_cost_pct,
             "min_historical_samples": min_historical_samples,
+            "min_bull_volume_pct": min_bull_volume_pct,
             "invalidation_method": invalidation_method,
             "signal_direction": signal_direction,
             "require_active_zone": require_active_zone,
@@ -13982,6 +14007,10 @@ async def run_order_block_retest_from_dashboard(request: Request) -> RedirectRes
         ORDER_BLOCK_DEFAULT_MIN_HISTORICAL_SAMPLES,
         0,
     )
+    min_bull_volume_pct = min(
+        form_float("min_bull_volume_pct", ORDER_BLOCK_DEFAULT_MIN_BULL_VOLUME_PCT, 0.0),
+        100.0,
+    )
     profit_target_pct = form_float("profit_target_pct", ORDER_BLOCK_DEFAULT_PROFIT_TARGET_PCT, 0.01)
     max_stop_loss_pct = form_float("max_stop_loss_pct", ORDER_BLOCK_DEFAULT_MAX_STOP_LOSS_PCT, 0.01)
     stop_buffer_pct = form_float("stop_buffer_pct", ORDER_BLOCK_DEFAULT_STOP_BUFFER_PCT, 0.0)
@@ -14014,6 +14043,7 @@ async def run_order_block_retest_from_dashboard(request: Request) -> RedirectRes
         f"stop_buffer_pct={quote(str(stop_buffer_pct))}",
         f"round_trip_cost_pct={quote(str(round_trip_cost_pct))}",
         f"min_historical_samples={min_historical_samples}",
+        f"min_bull_volume_pct={quote(str(min_bull_volume_pct))}",
         f"invalidation_method={quote(invalidation_method)}",
         f"signal_direction={quote(signal_direction)}",
         f"require_active_zone={1 if require_active_zone else 0}",
@@ -14048,6 +14078,7 @@ async def run_order_block_retest_from_dashboard(request: Request) -> RedirectRes
         stop_buffer_pct,
         round_trip_cost_pct,
         min_historical_samples,
+        min_bull_volume_pct,
     )
     return RedirectResponse(
         f"/order-block-retest?study_job={job_id}{query_suffix}",

@@ -29,6 +29,7 @@ DEFAULT_MAX_STOP_LOSS_PCT = 5.0
 DEFAULT_STOP_BUFFER_PCT = 0.25
 DEFAULT_ROUND_TRIP_COST_PCT = 0.20
 DEFAULT_MIN_HISTORICAL_SAMPLES = 0
+DEFAULT_MIN_BULL_VOLUME_PCT = 60.0
 DEFAULT_INVALIDATION_METHOD = "wick"
 DEFAULT_SIGNAL_DIRECTION = "bullish"
 ORDER_BLOCK_LOGIC_VERSION = "flux_poc_order_block_retest_daily_v2"
@@ -355,6 +356,7 @@ def run_order_block_retest_study(
     stop_buffer_pct: float = DEFAULT_STOP_BUFFER_PCT,
     round_trip_cost_pct: float = DEFAULT_ROUND_TRIP_COST_PCT,
     min_historical_samples: int = DEFAULT_MIN_HISTORICAL_SAMPLES,
+    min_bull_volume_pct: float = DEFAULT_MIN_BULL_VOLUME_PCT,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> OrderBlockRetestStudyResult:
     exchange = str(exchange or "NSE").upper()
@@ -383,6 +385,13 @@ def run_order_block_retest_study(
     stop_buffer_pct = max(float(stop_buffer_pct), 0.0)
     round_trip_cost_pct = max(float(round_trip_cost_pct), 0.0)
     min_historical_samples = max(int(min_historical_samples), 0)
+    try:
+        min_bull_volume_pct = float(min_bull_volume_pct)
+    except (TypeError, ValueError):
+        min_bull_volume_pct = DEFAULT_MIN_BULL_VOLUME_PCT
+    if not np.isfinite(min_bull_volume_pct):
+        min_bull_volume_pct = DEFAULT_MIN_BULL_VOLUME_PCT
+    min_bull_volume_pct = min(max(min_bull_volume_pct, 0.0), 100.0)
 
     if symbols is None:
         candidates = sorted(
@@ -475,6 +484,7 @@ def run_order_block_retest_study(
             max_stop_loss_pct=max_stop_loss_pct,
             stop_buffer_pct=stop_buffer_pct,
             min_historical_samples=min_historical_samples,
+            min_bull_volume_pct=min_bull_volume_pct,
         )
         if latest_candidate is not None:
             candidate_rows.append(latest_candidate)
@@ -514,6 +524,7 @@ def run_order_block_retest_study(
         stop_buffer_pct=stop_buffer_pct,
         round_trip_cost_pct=round_trip_cost_pct,
         min_historical_samples=min_historical_samples,
+        min_bull_volume_pct=min_bull_volume_pct,
     )
     return OrderBlockRetestStudyResult(
         summary=summary,
@@ -929,6 +940,7 @@ def _latest_candidate(
     max_stop_loss_pct: float,
     stop_buffer_pct: float,
     min_historical_samples: int,
+    min_bull_volume_pct: float,
 ) -> dict[str, Any] | None:
     visible_retests = _selected_retests(events, "either")
     if require_active_zone:
@@ -959,6 +971,11 @@ def _latest_candidate(
     entry_price = _finite_float(frame.iloc[entry_index].get("open")) if entry_index < len(frame) else None
     latest_close = _finite_float(frame.iloc[-1].get("close"))
     is_bull = str(event["side"]).upper() == "BULLISH"
+    event_bull_volume_pct = _finite_float(event.get("bull_volume_pct"))
+    if is_bull and min_bull_volume_pct > 0.0 and (
+        event_bull_volume_pct is None or event_bull_volume_pct < float(min_bull_volume_pct)
+    ):
+        return None
     planning_price = entry_price if entry_price is not None else latest_close
     stop_price = np.nan
     target_price = np.nan

@@ -53,6 +53,10 @@
         Recent Signal Bars
         <input type="number" name="recent_signal_bars" min="1" value="{{ recent_signal_bars }}">
       </label>
+      <label>
+        Minimum Green Bar %
+        <input type="number" name="min_bull_volume_pct" min="0" max="100" step="1" value="{{ min_bull_volume_pct|number(0) }}">
+      </label>
       <label class="inline-checkbox">
         <input type="checkbox" name="require_active_zone" value="1" {% if require_active_zone %}checked{% endif %}>
         Active zones only
@@ -153,6 +157,7 @@
   <section class="stats-grid">
     <article class="stat-card"><span>Aligned Matches</span><strong>{{ candidate_count }}</strong></article>
     <article class="stat-card"><span>Green Tick Matches</span><strong>{{ green_tick_count }}</strong></article>
+    <article class="stat-card"><span>Minimum Green Bar</span><strong>{{ min_bull_volume_pct|number(0) }}%</strong></article>
     <article class="stat-card"><span>Historical Retests</span><strong>{{ summary.get("historical_retests", 0) }}</strong></article>
     <article class="stat-card"><span>Backtest Trades</span><strong>{{ summary.get("backtest_trades", 0) }}</strong></article>
     <article class="stat-card"><span>Win Rate</span><strong>{% if summary.get("win_rate_pct") is not none %}{{ summary.get("win_rate_pct")|number }}%{% else %}-{% endif %}</strong></article>
@@ -165,7 +170,7 @@
       <summary><strong>How to use this screener</strong></summary>
       <ol>
         <li>Leave Symbols blank for the NSE universe, or enter a focused list for a faster run.</li>
-        <li>Start with Bullish, Swing Length 5, Wick invalidation, and the 10% target.</li>
+        <li>Start with Bullish, Minimum Green Bar 60%, Swing Length 5, Wick invalidation, and the 10% target.</li>
         <li>Prior Samples, Target Rate, and Average Return show how the same stock and side behaved before the current signal.</li>
       </ol>
       <p>The Pine alert is confirmed one bar after the wick retest, so the backtest enters at the following session's open. Daily candle-direction volume is used because lower-timeframe volume is not present in the stored OHLCV.</p>
@@ -175,7 +180,7 @@
   <section class="panel">
     <div class="copy-symbols-panel">
       <div class="copy-symbols-heading">
-        <div><h2>Current Candidates</h2><p>Recent retests ranked by the stock's earlier matching outcomes.</p></div>
+        <div><h2>Current Candidates</h2><p>Recent green-tick retests ranked by the stock's earlier matching outcomes.</p></div>
         <button class="button secondary" type="button" data-copy-target="order-block-symbols">Copy Symbols</button>
       </div>
       <textarea id="order-block-symbols" readonly rows="3">{{ candidate_symbols_csv }}</textarea>
@@ -185,7 +190,7 @@
         <thead>
           <tr>
             <th>Rank</th><th>Symbol</th><th>Match</th><th>Block BOS</th><th>Tick Date</th><th>Confirmed</th><th>Age</th>
-            <th>CMP</th><th>Zone</th><th>From Zone %</th><th>Bull Vol %</th><th>Delta %</th>
+            <th>CMP</th><th>Zone</th><th>From Zone %</th><th>Green Bar %</th><th>Delta %</th>
             <th>Prior Samples</th><th>Win Rate %</th><th>Target Rate %</th><th>Avg Return %</th>
             <th>Entry</th><th>Stop</th><th>Target</th>
           </tr>
