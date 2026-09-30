@@ -383,6 +383,7 @@ STOCK_SIGNATURE_UNIVERSE_DEFINITIONS = {
 STOCK_SIGNATURE_DEFAULT_UNIVERSES = ("nifty100",)
 ROI_JOURNAL_SYMBOL_MIN_LOOKBACK_MONTHS = 8
 MORNINGSTAR_MAX_DELAY_SECONDS = 30.0
+MORNINGSTAR_MAX_FILTER_THRESHOLD_PCT = 1000.0
 MORNINGSTAR_MIN_FV_PREMIUM_PCT = 30.0
 MORNINGSTAR_MIN_FV_CHANGE_PCT = 40.0
 
@@ -895,18 +896,28 @@ def _is_allowed(request: Request) -> bool:
 
 
 def _parse_morningstar_symbols(symbols_text: str) -> list[str]:
-    symbols: list[str] = []
-    seen: set[str] = set()
+    symbols, _, _ = _parse_morningstar_symbols_with_counts(symbols_text)
+    return symbols
+
+
+def _parse_morningstar_symbols_with_counts(symbols_text: str) -> tuple[list[str], int, int]:
+    normalized: list[str] = []
     for raw_value in re.split(r"[\s,;]+", str(symbols_text or "")):
         symbol = raw_value.strip().upper()
         if not symbol:
             continue
         if ":" in symbol and not symbol.startswith(("HTTP://", "HTTPS://")):
             symbol = symbol.rsplit(":", 1)[-1].strip()
-        if symbol and symbol not in seen:
+        if symbol:
+            normalized.append(symbol)
+
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for symbol in normalized:
+        if symbol not in seen:
             symbols.append(symbol)
             seen.add(symbol)
-    return symbols
+    return symbols, len(normalized), max(0, len(normalized) - len(symbols))
 
 
 def _morningstar_target_date(value: str) -> date:
@@ -932,7 +943,36 @@ def _morningstar_row_float(row: dict[str, Any], key: str) -> float | None:
     return numeric
 
 
-def _morningstar_qualified_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _morningstar_threshold_value(value: Any, default: float) -> float:
+    return _bounded_float_value(
+        value,
+        default,
+        minimum=0.0,
+        maximum=MORNINGSTAR_MAX_FILTER_THRESHOLD_PCT,
+    )
+
+
+def _morningstar_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _morningstar_qualified_rows(
+    rows: list[dict[str, Any]],
+    *,
+    fv_premium_threshold_pct: float = MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+    fv_change_threshold_pct: float = MORNINGSTAR_MIN_FV_CHANGE_PCT,
+) -> list[dict[str, Any]]:
+    fv_premium_threshold_pct = _morningstar_threshold_value(
+        fv_premium_threshold_pct,
+        MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+    )
+    fv_change_threshold_pct = _morningstar_threshold_value(
+        fv_change_threshold_pct,
+        MORNINGSTAR_MIN_FV_CHANGE_PCT,
+    )
     qualified: list[dict[str, Any]] = []
     for row in rows:
         if row.get("status") != "OK":
@@ -942,8 +982,8 @@ def _morningstar_qualified_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
         if premium_pct is None or fair_value_change_pct is None:
             continue
         if (
-            premium_pct >= MORNINGSTAR_MIN_FV_PREMIUM_PCT
-            and fair_value_change_pct >= MORNINGSTAR_MIN_FV_CHANGE_PCT
+            premium_pct >= fv_premium_threshold_pct
+            and fair_value_change_pct >= fv_change_threshold_pct
         ):
             qualified.append(row)
     return sorted(
@@ -962,6 +1002,7 @@ def _fetch_morningstar_fair_value_rows(
     as_of_date: date,
     delay_seconds: float = MORNINGSTAR_DEFAULT_DELAY_SECONDS,
     jitter_seconds: float = MORNINGSTAR_DEFAULT_JITTER_SECONDS,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     delay_seconds = _bounded_float_value(delay_seconds, MORNINGSTAR_DEFAULT_DELAY_SECONDS)
@@ -993,9 +1034,188 @@ def _fetch_morningstar_fair_value_rows(
             except Exception as exc:
                 row.update(status="ERROR", error=f"Unexpected error: {exc}")
             rows.append(row)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "completed": index + 1,
+                        "total": len(symbols),
+                        "current_symbol": symbol,
+                        "status": row.get("status", ""),
+                    }
+                )
             if index < len(symbols) - 1 and (delay_seconds > 0 or jitter_seconds > 0):
                 time.sleep(delay_seconds + random.uniform(0, jitter_seconds))
     return rows
+
+
+def _morningstar_template_context(
+    request: Request,
+    config: dict,
+    *,
+    base_sensitivity: int,
+    selected_sensitivity: int,
+    symbols_text: str = "",
+    as_of_date: str = "",
+    delay_seconds: float = MORNINGSTAR_DEFAULT_DELAY_SECONDS,
+    rows: list[dict[str, Any]] | None = None,
+    ran: bool = False,
+    error: str = "",
+    fetch_elapsed_seconds: float | None = None,
+    fv_premium_threshold_pct: float = MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+    fv_change_threshold_pct: float = MORNINGSTAR_MIN_FV_CHANGE_PCT,
+    morningstar_job: str = "",
+    morningstar_job_status: str = "",
+    requested_count: int | None = None,
+    duplicate_count: int | None = None,
+) -> dict[str, Any]:
+    rows = rows or []
+    _, parsed_count, parsed_duplicate_count = _parse_morningstar_symbols_with_counts(symbols_text)
+    requested_count = parsed_count if requested_count is None else _morningstar_int(requested_count)
+    duplicate_count = (
+        parsed_duplicate_count if duplicate_count is None else _morningstar_int(duplicate_count)
+    )
+    processing_count = max(0, requested_count - duplicate_count)
+    fv_premium_threshold_pct = _morningstar_threshold_value(
+        fv_premium_threshold_pct,
+        MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+    )
+    fv_change_threshold_pct = _morningstar_threshold_value(
+        fv_change_threshold_pct,
+        MORNINGSTAR_MIN_FV_CHANGE_PCT,
+    )
+    qualified_rows = _morningstar_qualified_rows(
+        rows,
+        fv_premium_threshold_pct=fv_premium_threshold_pct,
+        fv_change_threshold_pct=fv_change_threshold_pct,
+    )
+    success_count = sum(1 for row in rows if row.get("status") == "OK")
+    error_count = sum(1 for row in rows if row.get("status") != "OK")
+    return {
+        "request": request,
+        "app_name": config.get("app", {}).get("name", "Investment Screener"),
+        "dashboard_token": request.query_params.get("token", "").strip(),
+        "selected_sensitivity": selected_sensitivity,
+        "default_sensitivity": base_sensitivity,
+        "symbols_text": symbols_text,
+        "as_of_date": as_of_date or date.today().isoformat(),
+        "delay_seconds": delay_seconds,
+        "rows": rows,
+        "qualified_rows": qualified_rows,
+        "ran": ran,
+        "error": error,
+        "success_count": success_count,
+        "error_count": error_count,
+        "qualified_count": len(qualified_rows),
+        "fetch_elapsed_seconds": fetch_elapsed_seconds,
+        "fv_premium_threshold_pct": fv_premium_threshold_pct,
+        "fv_change_threshold_pct": fv_change_threshold_pct,
+        "requested_count": requested_count,
+        "processing_count": processing_count,
+        "duplicate_count": duplicate_count,
+        "morningstar_job": morningstar_job,
+        "morningstar_job_status": morningstar_job_status,
+        "show_shared_filter_form": False,
+        "show_shared_filter_status": False,
+    }
+
+
+def _run_morningstar_fair_value_job(
+    job_id: str,
+    symbols: list[str],
+    symbols_text: str,
+    total_symbol_count: int,
+    duplicate_symbol_count: int,
+    as_of_text: str,
+    delay_seconds: float,
+    jitter_seconds: float,
+    fv_premium_threshold_pct: float,
+    fv_change_threshold_pct: float,
+    dashboard_token: str,
+) -> None:
+    redirect_params = [f"morningstar_job={quote(job_id)}", "ran=1"]
+    if dashboard_token:
+        redirect_params.append(f"token={quote(dashboard_token)}")
+    redirect_url = f"/morningstar-fair-value?{'&'.join(redirect_params)}"
+    try:
+        target_date = _morningstar_target_date(as_of_text)
+        total = len(symbols)
+        _set_scan_job(
+            job_id,
+            status="running",
+            phase="Fetching Morningstar fair values",
+            completed=0,
+            total=total,
+            percent=0,
+            current_symbol="",
+            symbols_text=symbols_text,
+            as_of_date=target_date.isoformat(),
+            delay_seconds=delay_seconds,
+            fv_premium_threshold_pct=fv_premium_threshold_pct,
+            fv_change_threshold_pct=fv_change_threshold_pct,
+            requested_count=total_symbol_count,
+            duplicate_count=duplicate_symbol_count,
+            processing_count=total,
+        )
+
+        started_at = time.monotonic()
+
+        def progress(payload: dict[str, Any]) -> None:
+            completed = int(payload.get("completed") or 0)
+            percent = int((completed / total) * 100) if total else 100
+            _set_scan_job(
+                job_id,
+                status="running",
+                phase="Fetching Morningstar fair values",
+                completed=completed,
+                total=total,
+                percent=max(0, min(percent, 100)),
+                current_symbol=payload.get("current_symbol", ""),
+            )
+
+        rows = _fetch_morningstar_fair_value_rows(
+            symbols,
+            as_of_date=target_date,
+            delay_seconds=delay_seconds,
+            jitter_seconds=jitter_seconds,
+            progress_callback=progress,
+        )
+        fetch_elapsed_seconds = time.monotonic() - started_at
+        qualified_rows = _morningstar_qualified_rows(
+            rows,
+            fv_premium_threshold_pct=fv_premium_threshold_pct,
+            fv_change_threshold_pct=fv_change_threshold_pct,
+        )
+        success_count = sum(1 for row in rows if row.get("status") == "OK")
+        error_count = sum(1 for row in rows if row.get("status") != "OK")
+        _set_scan_job(
+            job_id,
+            status="completed",
+            phase="Complete",
+            completed=total,
+            total=total,
+            percent=100,
+            current_symbol="",
+            rows=rows,
+            success_count=success_count,
+            error_count=error_count,
+            qualified_count=len(qualified_rows),
+            fetch_elapsed_seconds=fetch_elapsed_seconds,
+            redirect_url=redirect_url,
+        )
+    except Exception as exc:
+        failed_params = [
+            f"morningstar_job={quote(job_id)}",
+            f"error={quote(str(exc)[:500])}",
+        ]
+        if dashboard_token:
+            failed_params.append(f"token={quote(dashboard_token)}")
+        _set_scan_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            error=str(exc),
+            redirect_url=f"/morningstar-fair-value?{'&'.join(failed_params)}",
+        )
 
 
 def _load_symbol_metadata(config: dict) -> pd.DataFrame:
@@ -9361,41 +9581,72 @@ def morningstar_fair_value_page(request: Request) -> HTMLResponse:
 
     config = load_config()
     _, base_sensitivity, selected_sensitivity = _apply_request_sensitivity(config, request)
-    as_of_date = request.query_params.get("as_of_date", date.today().isoformat()).strip()
-    symbols_text = request.query_params.get("symbols", "").strip()
+    morningstar_job = request.query_params.get("morningstar_job", "").strip()
+    job = _get_scan_job(morningstar_job) if morningstar_job else {}
+    job_status = str(job.get("status") or "").lower()
+    as_of_date = str(
+        request.query_params.get("as_of_date")
+        or job.get("as_of_date")
+        or date.today().isoformat()
+    ).strip()
+    symbols_text = str(
+        request.query_params.get("symbols")
+        or job.get("symbols_text")
+        or ""
+    ).strip()
     delay_seconds = _bounded_float_value(
-        request.query_params.get("delay_seconds", MORNINGSTAR_DEFAULT_DELAY_SECONDS),
+        request.query_params.get(
+            "delay_seconds",
+            job.get("delay_seconds", MORNINGSTAR_DEFAULT_DELAY_SECONDS),
+        ),
         MORNINGSTAR_DEFAULT_DELAY_SECONDS,
     )
+    fv_premium_threshold_pct = _morningstar_threshold_value(
+        request.query_params.get(
+            "fv_premium_threshold_pct",
+            job.get("fv_premium_threshold_pct", MORNINGSTAR_MIN_FV_PREMIUM_PCT),
+        ),
+        MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+    )
+    fv_change_threshold_pct = _morningstar_threshold_value(
+        request.query_params.get(
+            "fv_change_threshold_pct",
+            job.get("fv_change_threshold_pct", MORNINGSTAR_MIN_FV_CHANGE_PCT),
+        ),
+        MORNINGSTAR_MIN_FV_CHANGE_PCT,
+    )
+    rows = list(job.get("rows") or []) if job_status == "completed" else []
+    error = request.query_params.get("error", "").strip()
+    if not error and job_status == "failed":
+        error = str(job.get("error") or "Morningstar fair-value lookup failed.")
+    if morningstar_job and not job:
+        error = "Morningstar fair-value job was not found."
     return templates.TemplateResponse(
         "morningstar_fair_value.html",
-        {
-            "request": request,
-            "app_name": config.get("app", {}).get("name", "Investment Screener"),
-            "dashboard_token": request.query_params.get("token", "").strip(),
-            "selected_sensitivity": selected_sensitivity,
-            "default_sensitivity": base_sensitivity,
-            "symbols_text": symbols_text,
-            "as_of_date": as_of_date,
-            "delay_seconds": delay_seconds,
-            "rows": [],
-            "qualified_rows": [],
-            "ran": False,
-            "error": "",
-            "success_count": 0,
-            "error_count": 0,
-            "qualified_count": 0,
-            "fetch_elapsed_seconds": None,
-            "fv_premium_threshold_pct": MORNINGSTAR_MIN_FV_PREMIUM_PCT,
-            "fv_change_threshold_pct": MORNINGSTAR_MIN_FV_CHANGE_PCT,
-            "show_shared_filter_form": False,
-            "show_shared_filter_status": False,
-        },
+        _morningstar_template_context(
+            request,
+            config,
+            base_sensitivity=base_sensitivity,
+            selected_sensitivity=selected_sensitivity,
+            symbols_text=symbols_text,
+            as_of_date=as_of_date,
+            delay_seconds=delay_seconds,
+            rows=rows,
+            ran=bool(request.query_params.get("ran") or job_status in {"completed", "failed"}),
+            error=error,
+            fetch_elapsed_seconds=job.get("fetch_elapsed_seconds"),
+            fv_premium_threshold_pct=fv_premium_threshold_pct,
+            fv_change_threshold_pct=fv_change_threshold_pct,
+            morningstar_job=morningstar_job,
+            morningstar_job_status=job_status,
+            requested_count=job.get("requested_count") if job else None,
+            duplicate_count=job.get("duplicate_count") if job else None,
+        ),
     )
 
 
 @app.post("/morningstar-fair-value", response_class=HTMLResponse)
-async def run_morningstar_fair_value_lookup(request: Request) -> HTMLResponse:
+async def run_morningstar_fair_value_lookup(request: Request) -> Any:
     if not _is_allowed(request):
         return templates.TemplateResponse(
             "locked.html",
@@ -9412,53 +9663,71 @@ async def run_morningstar_fair_value_lookup(request: Request) -> HTMLResponse:
         form.get("delay_seconds", MORNINGSTAR_DEFAULT_DELAY_SECONDS),
         MORNINGSTAR_DEFAULT_DELAY_SECONDS,
     )
-    rows: list[dict[str, Any]] = []
-    error = ""
-    target_date = date.today()
-    fetch_elapsed_seconds: float | None = None
+    fv_premium_threshold_pct = _morningstar_threshold_value(
+        form.get("fv_premium_threshold_pct", MORNINGSTAR_MIN_FV_PREMIUM_PCT),
+        MORNINGSTAR_MIN_FV_PREMIUM_PCT,
+    )
+    fv_change_threshold_pct = _morningstar_threshold_value(
+        form.get("fv_change_threshold_pct", MORNINGSTAR_MIN_FV_CHANGE_PCT),
+        MORNINGSTAR_MIN_FV_CHANGE_PCT,
+    )
+    symbols, total_symbol_count, duplicate_symbol_count = _parse_morningstar_symbols_with_counts(symbols_text)
     try:
         target_date = _morningstar_target_date(as_of_text)
-        symbols = _parse_morningstar_symbols(symbols_text)
         if not symbols:
             raise MorningstarFairValueError("Enter at least one stock symbol.")
-        started_at = time.monotonic()
-        rows = _fetch_morningstar_fair_value_rows(
-            symbols,
-            as_of_date=target_date,
-            delay_seconds=delay_seconds,
-        )
-        fetch_elapsed_seconds = time.monotonic() - started_at
     except MorningstarFairValueError as exc:
-        error = str(exc)
+        return templates.TemplateResponse(
+            "morningstar_fair_value.html",
+            _morningstar_template_context(
+                request,
+                config,
+                base_sensitivity=base_sensitivity,
+                selected_sensitivity=selected_sensitivity,
+                symbols_text=symbols_text,
+                as_of_date=as_of_text,
+                delay_seconds=delay_seconds,
+                ran=True,
+                error=str(exc),
+                fv_premium_threshold_pct=fv_premium_threshold_pct,
+                fv_change_threshold_pct=fv_change_threshold_pct,
+                requested_count=total_symbol_count,
+                duplicate_count=duplicate_symbol_count,
+            ),
+        )
 
-    qualified_rows = _morningstar_qualified_rows(rows)
-    success_count = sum(1 for row in rows if row.get("status") == "OK")
-    error_count = sum(1 for row in rows if row.get("status") != "OK")
-    return templates.TemplateResponse(
-        "morningstar_fair_value.html",
-        {
-            "request": request,
-            "app_name": config.get("app", {}).get("name", "Investment Screener"),
-            "dashboard_token": request.query_params.get("token", "").strip(),
-            "selected_sensitivity": selected_sensitivity,
-            "default_sensitivity": base_sensitivity,
-            "symbols_text": symbols_text,
-            "as_of_date": target_date.isoformat() if not error else as_of_text,
-            "delay_seconds": delay_seconds,
-            "rows": rows,
-            "qualified_rows": qualified_rows,
-            "ran": True,
-            "error": error,
-            "success_count": success_count,
-            "error_count": error_count,
-            "qualified_count": len(qualified_rows),
-            "fetch_elapsed_seconds": fetch_elapsed_seconds,
-            "fv_premium_threshold_pct": MORNINGSTAR_MIN_FV_PREMIUM_PCT,
-            "fv_change_threshold_pct": MORNINGSTAR_MIN_FV_CHANGE_PCT,
-            "show_shared_filter_form": False,
-            "show_shared_filter_status": False,
-        },
+    dashboard_token = request.query_params.get("token", "").strip()
+    job_id = uuid4().hex
+    _submit_scan_job(
+        job_id,
+        "Morningstar Fair Value",
+        _run_morningstar_fair_value_job,
+        symbols,
+        symbols_text,
+        total_symbol_count,
+        duplicate_symbol_count,
+        target_date.isoformat(),
+        delay_seconds,
+        MORNINGSTAR_DEFAULT_JITTER_SECONDS,
+        fv_premium_threshold_pct,
+        fv_change_threshold_pct,
+        dashboard_token,
     )
+    _set_scan_job(
+        job_id,
+        symbols_text=symbols_text,
+        as_of_date=target_date.isoformat(),
+        delay_seconds=delay_seconds,
+        fv_premium_threshold_pct=fv_premium_threshold_pct,
+        fv_change_threshold_pct=fv_change_threshold_pct,
+        requested_count=total_symbol_count,
+        duplicate_count=duplicate_symbol_count,
+        processing_count=len(symbols),
+    )
+    params = [f"morningstar_job={quote(job_id)}"]
+    if dashboard_token:
+        params.append(f"token={quote(dashboard_token)}")
+    return RedirectResponse(f"/morningstar-fair-value?{'&'.join(params)}", status_code=303)
 
 
 @app.get("/ohlcv-download", response_class=HTMLResponse)

@@ -11,6 +11,7 @@
       <label class="wide-field">
         Symbols
         <textarea name="symbols" placeholder="TIPSFILMS, TCS, INFY">{{ symbols_text }}</textarea>
+        <small>Duplicates are removed before processing.</small>
       </label>
       <label>
         As of date
@@ -19,6 +20,14 @@
       <label>
         Delay / stock
         <input type="number" name="delay_seconds" min="0" max="30" step="0.5" value="{{ delay_seconds|number(1) }}">
+      </label>
+      <label>
+        FV - CMP % >=
+        <input type="number" name="fv_premium_threshold_pct" min="0" max="1000" step="1" value="{{ fv_premium_threshold_pct|number(0) }}">
+      </label>
+      <label>
+        FV Change % >=
+        <input type="number" name="fv_change_threshold_pct" min="0" max="1000" step="1" value="{{ fv_change_threshold_pct|number(0) }}">
       </label>
       <div class="filter-actions">
         <button class="button" type="submit">Fetch Fair Values</button>
@@ -30,8 +39,75 @@
     {% endif %}
   </section>
 
-  {% if ran and rows %}
+  {% if morningstar_job and morningstar_job_status in ["queued", "starting", "running"] %}
+    <section class="panel">
+      <div class="scan-progress" id="morningstar-progress" data-job-id="{{ morningstar_job }}">
+        <div class="scan-progress-header">
+          <strong id="morningstar-progress-title">Morningstar fair-value fetch is running</strong>
+          <span id="morningstar-progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="morningstar-progress-fill" style="width: 0%"></div>
+        </div>
+        <p id="morningstar-progress-detail">Preparing {{ processing_count }} unique stock{{ "" if processing_count == 1 else "s" }}.</p>
+      </div>
+    </section>
+
+    <script>
+      const morningstarProgressBox = document.getElementById("morningstar-progress");
+      const morningstarProgressTitle = document.getElementById("morningstar-progress-title");
+      const morningstarProgressPercent = document.getElementById("morningstar-progress-percent");
+      const morningstarProgressFill = document.getElementById("morningstar-progress-fill");
+      const morningstarProgressDetail = document.getElementById("morningstar-progress-detail");
+
+      async function pollMorningstarFairValue() {
+        if (!morningstarProgressBox) return;
+        try {
+          const response = await fetch(`/scan-status/${morningstarProgressBox.dataset.jobId}`, { cache: "no-store" });
+          const status = await response.json();
+          if (!response.ok) throw new Error(status.error || "Status unavailable");
+          const percent = Number(status.percent || 0);
+          const completed = Number(status.completed || 0);
+          const total = Number(status.total || 0);
+          morningstarProgressFill.style.width = `${percent}%`;
+          morningstarProgressPercent.textContent = `${percent}%`;
+          const current = status.current_symbol ? ` · ${status.current_symbol}` : "";
+          morningstarProgressDetail.textContent = `${status.phase || "Running"} · ${completed}/${total} stocks${current}`;
+          if (status.status === "completed") {
+            morningstarProgressTitle.textContent = "Morningstar fair-value fetch completed";
+            window.location.href = status.redirect_url || `/morningstar-fair-value?morningstar_job=${morningstarProgressBox.dataset.jobId}&ran=1`;
+            return;
+          }
+          if (status.status === "failed") {
+            morningstarProgressTitle.textContent = "Morningstar fair-value fetch failed";
+            morningstarProgressDetail.textContent = status.error || "The fetch could not complete.";
+            if (status.redirect_url) window.location.href = status.redirect_url;
+            return;
+          }
+        } catch (error) {
+          morningstarProgressTitle.textContent = "Waiting for Morningstar status";
+          morningstarProgressDetail.textContent = String(error.message || error);
+        }
+        window.setTimeout(pollMorningstarFairValue, 1000);
+      }
+      pollMorningstarFairValue();
+    </script>
+  {% endif %}
+
+  {% if ran or morningstar_job %}
     <section class="summary-grid">
+      <div class="metric">
+        <span>Submitted</span>
+        <strong>{{ requested_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>Processing</span>
+        <strong>{{ processing_count }}</strong>
+      </div>
+      <div class="metric">
+        <span>Duplicates Removed</span>
+        <strong>{{ duplicate_count }}</strong>
+      </div>
       <div class="metric">
         <span>Resolved</span>
         <strong>{{ success_count }}</strong>
@@ -57,11 +133,13 @@
         <strong>{% if fetch_elapsed_seconds is not none %}{{ fetch_elapsed_seconds|number(1) }}s{% endif %}</strong>
       </div>
     </section>
+  {% endif %}
 
+  {% if ran and rows %}
     <section class="panel">
       <div class="panel-heading">
         <h2>Fair Value Table</h2>
-        <p>{{ rows|length }} requested stock{{ "" if rows|length == 1 else "s" }}.</p>
+        <p>{{ rows|length }} processed stock{{ "" if rows|length == 1 else "s" }}.</p>
       </div>
 
       <div class="table-wrap">
